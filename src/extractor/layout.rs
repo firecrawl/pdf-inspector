@@ -3006,10 +3006,21 @@ fn is_roman_folio(text: &str) -> bool {
     index == bytes.len() && index > 0
 }
 
-/// The roman token is the right-hand page number of an entry, not a
-/// column word that merely shares the baseline.
-fn roman_folio_beside_entry(entry: &TextItem, entry_text: &str, folio: &TextItem) -> bool {
-    folio.x > entry.x
+/// Gap past which a right-hand roman token is a contents folio rather
+/// than the next column. The mixed-layout sample's column gutter is
+/// about 226pt; a preface line's folio sits further across the page.
+const FOLIO_LEADER_GAP: f32 = 300.0;
+
+/// The roman token is the right-hand page number of an entry across a
+/// leader gap. A column-sized void, even beside `iii`, is not a folio.
+fn roman_folio_beside_entry(
+    entry: &TextItem,
+    entry_text: &str,
+    folio: &TextItem,
+    gap: f32,
+) -> bool {
+    gap >= FOLIO_LEADER_GAP
+        && folio.x > entry.x
         && is_roman_folio(&folio.text)
         && !is_roman_folio(entry_text)
         && entry_text.chars().any(|c| c.is_alphabetic())
@@ -3144,9 +3155,11 @@ fn group_single_column(
                     // void apart. Table header cells on this scale are
                     // closer than 8em and 100pt. Digit page numbers never
                     // reach this branch. A front-matter folio stays only
-                    // when it is the right-hand numeral of this entry.
-                    let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
-                        || roman_folio_beside_entry(&item, item.text.trim(), last_item);
+                    // across a leader gap, so a column leftover beside
+                    // `iii` still splits.
+                    let folio_on_entry =
+                        roman_folio_beside_entry(last_item, &line_text, &item, gap)
+                            || roman_folio_beside_entry(&item, item.text.trim(), last_item, gap);
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
                         && !folio_on_entry
                     {
@@ -3740,6 +3753,23 @@ mod tests {
         assert!(!is_roman_folio("order."));
         assert!(!is_roman_folio("EN-22"));
         assert!(!is_roman_folio("mix"));
+    }
+
+    #[test]
+    fn roman_numeral_across_a_column_gutter_still_splits() {
+        // Same geometry as the wrapped column leftovers. `iii` is a
+        // numeral, but the void is a column gutter, not a contents leader.
+        let mut left = make_item(1, 42.0, 569.0, "checksum.");
+        left.font_size = 10.0;
+        left.width = 50.0;
+        let mut right = make_item(1, 318.0, 569.0, "iii");
+        right.font_size = 10.0;
+        right.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            2,
+            "a column gutter beside a roman token is not a folio"
+        );
     }
 
     #[test]
