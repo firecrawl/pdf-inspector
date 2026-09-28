@@ -1,4 +1,3 @@
-//! Integration tests for pdf-to-markdown library
 
 use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
@@ -10873,4 +10872,20 @@ fn test_renumbered_subset_collision_keeps_the_stale_reading_of_short_words_befor
         &lines,
     );
     assert_eq!(read, ["md", "rm", "gl", "gq"]);
+#[test]
+fn monospace_code_listing_preserves_linebreaks_and_indentation() {
+    let pdf = std::fs::read("tests/fixtures/monospace_code_listing.pdf").unwrap();
+    let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    let expected = "```
+# repro.py
+def outer(items):
+    total = 0
+    for item in items:
+        if item > 0:
+            total += item
+        else:
+            total -= item
+    return total
+```";
+    assert!(markdown.contains(expected), "{markdown:?}");
 }
