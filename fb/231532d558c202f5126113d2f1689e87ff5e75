@@ -1,0 +1,21 @@
+src/tounicode.rs
+  s_5968498a19b923::t_720dbc3695fdf2 1918-1946,1952-1960,1970-1972,1975,1981
+  s_5968498a19b923::t_bbb548b54a2ddf 5412-5430
+  s_5968498a19b923::t_6de1a1f62a4a12 5411
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb231532d558c202f5126113d2f1689e87ff5e75",
+  "prompts": {},
+  "sessions": {
+    "s_5968498a19b923": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6f5b19d-6e8a-4fbc-964f-4ccc02a0cc3e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
