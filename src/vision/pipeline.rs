@@ -206,6 +206,117 @@ pub fn process_pdf_with_ocr(
     process_pdf_with_ocr_mem(&bytes, options)
 }
 
+/// Pages the [`process_pdf_with_ocr_mem`] pipeline can route to OCR, decided
+/// from the native pass alone.
+///
+/// `pages_recommended` is the detector's list (the same `pages_needing_ocr`
+/// the native result reports). `pages_supplemental` are clean native pages
+/// carrying a substantial image region that `Auto` mode may still send to
+/// OCR after the pixel preflight. Anyone budgeting OCR work per request —
+/// batching, client-side chunking, page caps — must count `pages_planned`,
+/// the union in document order: the recommended list alone undercounts by
+/// every supplemental page, which is how a 12-page OCR budget turned into a
+/// 20-page request that outlived the edge timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrRoutePlan {
+    /// Total pages in the document.
+    pub page_count: u32,
+    /// 1-indexed pages the detector recommends for OCR (within the selection).
+    pub pages_recommended: Vec<u32>,
+    /// 1-indexed pages that may receive supplemental image-region OCR in `Auto`
+    /// mode; never overlaps `pages_recommended`.
+    pub pages_supplemental: Vec<u32>,
+    /// Every 1-indexed page the pipeline may OCR under the requested mode:
+    /// empty for `Off`, the whole selection for `Force`, the union of the two
+    /// lists above for `Auto`.
+    pub pages_planned: Vec<u32>,
+}
+
+/// Plans OCR routing for PDF bytes without rendering, model access, or
+/// inference: only the native extraction pass runs.
+///
+/// The plan is an upper bound. `Auto` mode later drops supplemental pages
+/// whose rendered region shows no document-like ink, so the pipeline's
+/// `pages_routed_to_ocr` is a subset of `pages_planned`, never a superset.
+pub fn plan_ocr_routes_mem(
+    buffer: &[u8],
+    options: &OcrPdfOptions,
+) -> Result<OcrRoutePlan, OcrPipelineError> {
+    if options
+        .page_numbers
+        .as_ref()
+        .is_some_and(|pages| pages.contains(&0))
+    {
+        return Err(OcrPipelineError::InvalidSelectedPage { page: 0 });
+    }
+    let selected_pages: Option<Vec<u32>> = options
+        .page_numbers
+        .as_ref()
+        .map(|pages| pages.iter().copied().collect());
+    let selected_pages_zero_indexed: Option<Vec<u32>> = selected_pages
+        .as_ref()
+        .map(|pages| pages.iter().map(|page| page - 1).collect());
+
+    let mut page_markdown_options = options.markdown.clone();
+    page_markdown_options.include_page_numbers = false;
+    let extraction = crate::extract_pages_markdown_mem_for_ocr(
+        buffer,
+        selected_pages_zero_indexed.as_deref(),
+        options.password.as_deref(),
+        &page_markdown_options,
+        // Planning never renders, so repaired bytes for the renderer are not needed.
+        false,
+    )?;
+    let page_count = extraction.page_count;
+    if let Some(invalid) = selected_pages
+        .as_ref()
+        .and_then(|pages| pages.iter().copied().find(|page| *page > page_count))
+    {
+        return Err(OcrPipelineError::InvalidSelectedPage { page: invalid });
+    }
+
+    let pages_recommended: Vec<u32> = extraction
+        .result
+        .pages_needing_ocr
+        .iter()
+        .copied()
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
+        .collect();
+    let pages_supplemental: Vec<u32> = match options.ocr.mode {
+        OcrMode::Auto => extraction
+            .supplemental_ocr_regions
+            .keys()
+            .copied()
+            .filter(|page| !pages_recommended.contains(page))
+            .collect(),
+        OcrMode::Off | OcrMode::Force => Vec::new(),
+    };
+    let pages_planned: Vec<u32> = match options.ocr.mode {
+        OcrMode::Off => Vec::new(),
+        OcrMode::Force => selected_pages
+            .clone()
+            .unwrap_or_else(|| (1..=page_count).collect())
+            .into_iter()
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .collect(),
+        OcrMode::Auto => pages_recommended
+            .iter()
+            .chain(pages_supplemental.iter())
+            .copied()
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .collect(),
+    };
+    Ok(OcrRoutePlan {
+        page_count,
+        pages_recommended,
+        pages_supplemental,
+        pages_planned,
+    })
+}
+
 /// Processes PDF bytes through native extraction and selective OCR.
 ///
 /// Native extraction always runs first. `Auto` initializes PDFium, downloads
@@ -1514,6 +1625,54 @@ mod tests {
             Err(OcrPipelineError::Fusion(
                 OcrFusionError::InvalidHostedConfidence { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn plan_counts_supplemental_image_pages_only_when_no_native_text_covers_them() {
+        // Image region below the text block: a plausible rasterized table → planned.
+        let beside = std::fs::read("tests/fixtures/image_table_beside_text.pdf").unwrap();
+        let plan = plan_ocr_routes_mem(&beside, &OcrPdfOptions::new().mode(OcrMode::Auto)).unwrap();
+        assert_eq!(plan.page_count, 1);
+        assert!(plan.pages_recommended.is_empty());
+        assert_eq!(plan.pages_supplemental, vec![1]);
+        assert_eq!(plan.pages_planned, vec![1]);
+
+        // Same image drawn over the body text (masked watermark): nothing for OCR to add.
+        let watermark = std::fs::read("tests/fixtures/watermark_over_text.pdf").unwrap();
+        let plan =
+            plan_ocr_routes_mem(&watermark, &OcrPdfOptions::new().mode(OcrMode::Auto)).unwrap();
+        assert!(plan.pages_supplemental.is_empty());
+        assert!(plan.pages_planned.is_empty());
+
+        // The plan mirrors the mode contract: Off plans nothing, Force plans the selection.
+        let off = plan_ocr_routes_mem(&beside, &OcrPdfOptions::new()).unwrap();
+        assert!(off.pages_planned.is_empty());
+        let force =
+            plan_ocr_routes_mem(&beside, &OcrPdfOptions::new().mode(OcrMode::Force)).unwrap();
+        assert_eq!(force.pages_planned, vec![1]);
+    }
+
+    #[test]
+    fn plan_matches_pipeline_recommendation_and_rejects_bad_selections() {
+        let bytes = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+        let plan = plan_ocr_routes_mem(&bytes, &OcrPdfOptions::new().mode(OcrMode::Auto)).unwrap();
+        let result = process_pdf_with_ocr_mem(&bytes, OcrPdfOptions::new()).unwrap();
+        assert_eq!(plan.page_count, result.page_count);
+        assert_eq!(plan.pages_recommended, result.pages_recommended_for_ocr);
+        for page in &plan.pages_supplemental {
+            assert!(!plan.pages_recommended.contains(page));
+        }
+
+        let zero = plan_ocr_routes_mem(&bytes, &OcrPdfOptions::new().page_numbers([0]));
+        assert!(matches!(
+            zero,
+            Err(OcrPipelineError::InvalidSelectedPage { page: 0 })
+        ));
+        let beyond = plan_ocr_routes_mem(&bytes, &OcrPdfOptions::new().page_numbers([9_999]));
+        assert!(matches!(
+            beyond,
+            Err(OcrPipelineError::InvalidSelectedPage { page: 9_999 })
         ));
     }
 }
