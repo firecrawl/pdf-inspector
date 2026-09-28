@@ -1,0 +1,29 @@
+src/lib.rs
+  s_5968498a19b923::t_bfbd520ead5a1b 4371-4376
+src/tounicode.rs
+  s_5968498a19b923::t_9ab192c3d3c240 562-569,571-572
+  s_5968498a19b923::t_b85f54b1aa86f1 497-502,511-530
+  s_5968498a19b923::t_cc1be4b6f9e7bb 1999,2024
+  s_5968498a19b923::t_75dbc899b95fcb 662-663,2167-2168
+  s_5968498a19b923::t_2a4cfc41f8c002 1925-1933,1937-1945,1952-1956
+  s_5968498a19b923::t_3876b84cdd518d 605-617
+  s_5968498a19b923::t_7ce2a6b6b6b327 5476-5479,5482-5508
+  s_5968498a19b923::t_7a272e51928e9a 672-674,5480-5481
+  s_5968498a19b923::t_8f72c78a051729 5475
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4475edbcbef12239aa8eae6dbac7a95c5c46bf7f",
+  "prompts": {},
+  "sessions": {
+    "s_5968498a19b923": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6f5b19d-6e8a-4fbc-964f-4ccc02a0cc3e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
