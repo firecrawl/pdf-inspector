@@ -7,6 +7,86 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [1.25.2] - 2026-09-28
+
+Changes since 1.25.1.
+
+### Fixed
+
+- A super- or subscript run is sized by its letters and digits. A sign
+  set from a symbol font a design size above them, as TeX sets the minus
+  of an exponent, took the run past the size a script may have, so an
+  exponent that reads its minus sign lost its `<sup>` markup. A run of
+  signs alone, and one whose signs are more than a quarter larger than
+  its letters and digits, are still sized by their largest glyph.
+  ([#603](https://github.com/firecrawl/pdf-inspector/pull/603))
+- The ToUnicode CMap of a subset font is no longer repaired where the font
+  shows it right as written. The repair through a `/CIDToGIDMap`, which
+  takes the CMap to be keyed by glyph index, is skipped when the CMap has
+  entries for more of the codes the map sends to other glyphs than for
+  those glyphs' indexes. A CMap keyed by code, as the specification has
+  it, was read through the map wherever the repair read a string better,
+  so a quoted word shown as one string read as other letters (`“me”` as
+  `yaYz`) and table cells lost their `%` and `$` signs. The renumbering of
+  a subset whose width array looks renumbered is skipped when the embedded
+  program, where it says what its glyphs are, reads more of the codes as
+  the CMap has them than as renumbered: a subset that kept its glyph
+  indexes read `(2)(4)` as `041061`.
+  ([#605](https://github.com/firecrawl/pdf-inspector/pull/605))
+
+## [1.25.1] - 2026-09-27
+
+Changes since 1.25.0.
+
+### Fixed
+
+- Simple fonts (Type1, TrueType, Type3) read one byte per code when their
+  ToUnicode CMap declares a two-byte codespace. A CMap written with
+  `<0000> <FFFF>` over one-byte entries, one of them spelled in four hex
+  digits (which kept the CMap two bytes wide), paired the bytes of each
+  even-length string into codes it has no entry for, so text shown as a
+  kerned run of short strings lost every two-byte string: `Income
+  Statement` read as `Iometatent`. The check for a stale ToUnicode CMap on
+  a Type1 font now judges a CMap declared this way too, and the page
+  detector counts such a font's text byte by byte as well. Composite
+  (Type0) fonts keep reading their codes as their CMap says.
+  ([#595](https://github.com/firecrawl/pdf-inspector/pull/595))
+- A Type1 font whose `/Encoding` names no base encoding (none at all, or
+  an encoding dictionary without `/BaseEncoding`) reads through the
+  built-in encoding of its embedded program, which PDF 32000-1:2008
+  (Table 114) makes the base of such a font. TeX's fonts carry their layout
+  in the program and have no `/Encoding`, so their ligatures (`efficiency`
+  read as `eciency`), curly quotes and dashes (`{` read for an en dash)
+  and math symbols (`2` read for `∈`, `f` and `g` for braces, nothing for a
+  minus sign) now read as the glyphs the program names. A ToUnicode CMap,
+  the `/Differences` and a base encoding the font names still come first.
+  A program whose encoding cannot be read, and a glyph name that does not
+  read or reads as a private code point or a lone combining mark, leave
+  their codes as they were read; a code the program leaves at `.notdef`,
+  other than the word space (code 32), has no glyph and reads as nothing,
+  except in a font where nothing else reads (no name that reads, no base
+  encoding, no blank glyphs), which reads as before.
+  ([#596](https://github.com/firecrawl/pdf-inspector/pull/596))
+- The base-14 width fallback (a standard font without `/Widths`) measures
+  the codes of a font the decoder reads without an encoding, one whose
+  `/Differences` or embedded program give only glyph names that do not
+  read (`/=`, `/;`) and that has neither a base encoding nor blank glyphs,
+  as the single-byte characters those codes read as, rather than giving
+  them no width.
+  ([#596](https://github.com/firecrawl/pdf-inspector/pull/596))
+- A string of one or two glyphs shown in a subset font whose ToUnicode
+  CMap has a repaired counterpart (rebuilt through the font's
+  `/CIDToGIDMap`, or renumbered for a renumbered subset) reads through the
+  repair, before the font's choice between the two, only when the repair
+  reads it better without counting short common words. Such a string is
+  too short for them to be evidence, and a wrong repair spells them by
+  chance: a glyph read as `a` where the CMap reads `m`, `-` or `—`, or a
+  pair read as `aT` where it reads `re`, took the repair (`engagement` read
+  as `engageaent`, `AND` as `ANa`, `Three` as `ThaTe`). Longer strings, and
+  the font's choice over its first strings, weigh every common word as
+  before.
+  ([#597](https://github.com/firecrawl/pdf-inspector/pull/597))
+
 ## [1.25.0] - 2026-09-25
 
 Changes since 1.24.0.
