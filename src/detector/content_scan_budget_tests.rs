@@ -3,8 +3,8 @@
 //! past them is refused before it is held.
 
 use super::super::{
-    analyze_page_content, detect_from_document, scan_xobjects_in_resources, DetectionConfig,
-    PdfType,
+    analyze_page_content, analyze_page_images, detect_from_document, scan_xobjects_in_resources,
+    DetectionConfig, PdfType,
 };
 use super::fixtures::*;
 use super::*;
@@ -360,6 +360,7 @@ fn page_content_inflating_past_the_byte_budget_is_skipped() {
          shows-only-a-hidden-text-layer verdict can rest on it"
     );
 }
+
 /// A bound form's Flate content that inflates past the walk's remaining
 /// byte budget is refused before it is held, and no bound form after it
 /// is read — as the executed-form budget refuses — while the forms the
@@ -432,6 +433,7 @@ fn bound_form_inflating_past_the_walk_budget_is_skipped() {
         &mut unique_chars,
         &mut used_font_ids,
         &mut font_map,
+        0,
         &mut bytes_left,
         &mut truncated,
     );
@@ -443,4 +445,189 @@ fn bound_form_inflating_past_the_walk_budget_is_skipped() {
         truncated,
         "the refused form leaves the walk's tallies incomplete, so no claim rests on them"
     );
+}
+
+/// A chain of bound Forms, each resource dictionary naming the next, goes
+/// only as deep as the walk's depth cap: the innermost form of a chain
+/// longer than the cap is never reached, while one well within it is.
+#[test]
+fn bound_form_chain_deeper_than_the_depth_cap_stops() {
+    use lopdf::dictionary;
+
+    fn chain(doc: &mut Document, depth: usize) -> ObjectId {
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        // The innermost form shows text; every form above it binds the
+        // one before it as `X0`, and nothing draws anything.
+        let mut next = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                },
+            },
+            b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET".to_vec(),
+        )));
+        for _ in 1..depth {
+            next = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                                   Object::Integer(612), Object::Integer(792)],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "X0" => Object::Reference(next) },
+                    },
+                },
+                Vec::new(),
+            )));
+        }
+        next
+    }
+
+    // Within the cap the chain is read whole; a form deeper than the cap
+    // is not reached — the first case on either side of it included.
+    for depth in [
+        10,
+        crate::MAX_XOBJECT_RESOURCE_DEPTH as usize,
+        crate::MAX_XOBJECT_RESOURCE_DEPTH as usize + 1,
+        70,
+    ] {
+        let expect_text_ops = if depth <= crate::MAX_XOBJECT_RESOURCE_DEPTH as usize {
+            1
+        } else {
+            0
+        };
+        let mut doc = Document::with_version("1.4");
+        let head = chain(&mut doc, depth);
+        let resources = dictionary! {
+            "XObject" => dictionary! { "X0" => Object::Reference(head) },
+        };
+        let page_id = page_of_streams(&mut doc, resources, vec![]);
+        let page_resources = doc
+            .get_object(page_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .get(b"Resources")
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+
+        let mut visited = HashSet::new();
+        let mut unique_chars = HashSet::new();
+        let mut used_font_ids = HashSet::new();
+        let mut font_map = HashMap::new();
+        let mut bytes_left = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
+        let mut truncated = false;
+        let counts = scan_xobjects_in_resources(
+            &doc,
+            &page_resources,
+            &mut visited,
+            &mut unique_chars,
+            &mut used_font_ids,
+            &mut font_map,
+            0,
+            &mut bytes_left,
+            &mut truncated,
+        );
+        assert_eq!(
+            counts.text_ops, expect_text_ops,
+            "a chain {depth} deep shows its innermost form's text only within the cap"
+        );
+        assert_eq!(
+            truncated,
+            depth > crate::MAX_XOBJECT_RESOURCE_DEPTH as usize,
+            "a chain past the cap leaves the walk's tallies incomplete, as a refusal past \
+             the byte budget does; one within it does not"
+        );
+    }
+}
+
+/// The image walk stops at the depth cap with a signal, as the bound-form
+/// walk refuses past its byte budget with one: a page whose image sits
+/// deeper than the cap shows `has_images` false with `walk_truncated`
+/// true, and one within it shows the image with no signal.
+///
+/// The image walk's boundary sits one shallower than the form walk's: a
+/// form's content is read at the form's own level, while the images it
+/// binds live one level deeper in its resources, so an image in the
+/// innermost form of a chain as deep as the cap is past it. The signal
+/// says so, and the cap protects the stack the same either way.
+#[test]
+fn image_walk_reports_a_cap_it_stops_at() {
+    use lopdf::dictionary;
+
+    fn image_in_form_chain(doc: &mut Document, depth: usize) -> ObjectId {
+        let image_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(2),
+                "Height" => Object::Integer(2),
+                "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+                "BitsPerComponent" => Object::Integer(8),
+            },
+            vec![128u8; 4],
+        )));
+        // The innermost form binds the image; every form above it binds
+        // the one before it as `X0`, and nothing draws anything.
+        let mut next = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+                },
+            },
+            Vec::new(),
+        )));
+        for _ in 1..depth {
+            next = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                                   Object::Integer(612), Object::Integer(792)],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "X0" => Object::Reference(next) },
+                    },
+                },
+                Vec::new(),
+            )));
+        }
+        next
+    }
+
+    // Either side of the image walk's boundary: one below the cap, at it,
+    // and past it.
+    for depth in [
+        10,
+        crate::MAX_XOBJECT_RESOURCE_DEPTH as usize - 1,
+        crate::MAX_XOBJECT_RESOURCE_DEPTH as usize,
+        crate::MAX_XOBJECT_RESOURCE_DEPTH as usize + 1,
+    ] {
+        let mut doc = Document::with_version("1.4");
+        let head = image_in_form_chain(&mut doc, depth);
+        let resources = dictionary! {
+            "XObject" => dictionary! { "X0" => Object::Reference(head) },
+        };
+        let page_id = page_of_streams(&mut doc, resources, vec![]);
+
+        let (has_images, _, _, truncated) = analyze_page_images(&doc, page_id);
+        let within = depth < crate::MAX_XOBJECT_RESOURCE_DEPTH as usize;
+        assert_eq!(
+            (has_images, truncated),
+            (within, !within),
+            "a chain {depth} deep shows its image only within the cap, and \
+             the walk stops past it with the truncation signal set"
+        );
+    }
 }

@@ -4383,6 +4383,15 @@ fn finish_loaded_document(
 /// turns into a load error instead of a silently wrong answer.
 pub(crate) const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 
+/// A Form XObject's resource dictionary naming another Form, whose
+/// dictionary names another, is a recursion a `visited` set does not
+/// bound: it stops cycles and re-reads, not depth. Real documents nest a
+/// handful of forms deep; past this many the resource walks — the
+/// detector's and tounicode's — stop, so a crafted deep chain cannot
+/// exhaust the stack, and the evidence they would have read deeper is
+/// incomplete, which a stack overflow would end far sooner.
+pub(crate) const MAX_XOBJECT_RESOURCE_DEPTH: u32 = 64;
+
 fn bounded_load_options() -> lopdf::LoadOptions {
     lopdf::LoadOptions {
         max_decompressed_size: Some(MAX_STREAM_DECOMPRESSED_BYTES),
