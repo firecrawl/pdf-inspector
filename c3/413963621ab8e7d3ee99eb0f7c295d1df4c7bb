@@ -1,0 +1,33 @@
+src/detector.rs
+  s_44a612cef2d4f4::t_9a35528480bb06 2211
+  s_44a612cef2d4f4::t_daabf52ecef2a5 1815-1828
+  s_44a612cef2d4f4::t_3317a2a44f4efc 966-969,973
+  s_44a612cef2d4f4::t_0d3e723cf34cb7 1844-1846
+  s_44a612cef2d4f4::t_10394a49261ad0 2191-2202
+  s_44a612cef2d4f4::t_4733edbe49ec0f 2231
+  s_44a612cef2d4f4::t_d8218806d2030e 1040-1043
+  s_44a612cef2d4f4::t_51cb5831725641 2273
+  s_44a612cef2d4f4::t_86877446383ecc 2203
+  s_44a612cef2d4f4::t_9f5fb85903534f 2291
+  s_44a612cef2d4f4::t_22709a3b2d410c 2388,2391-2397
+  s_44a612cef2d4f4::t_18dd543dc333d4 970-971
+  s_44a612cef2d4f4::t_6bd66c489d3748 2475
+src/detector/content_scan_budget_tests.rs
+  s_44a612cef2d4f4::t_2ed94b9a2c8176 545
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c3413963621ab8e7d3ee99eb0f7c295d1df4c7bb",
+  "prompts": {},
+  "sessions": {
+    "s_44a612cef2d4f4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f0bc0790dffeBdTh311e51F9ky",
+        "model": "z-ai/glm-5.3"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
