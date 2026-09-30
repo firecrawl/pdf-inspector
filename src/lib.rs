@@ -4405,9 +4405,12 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// empty password (owner-only encryption, the common "protected" case) when a
 /// non-empty password was supplied but rejected.
 ///
-/// `loaded` is the structural parse, when that parse succeeded. Owner-password
-/// recovery reads `/O` from it instead of parsing the file a second time. A
-/// load that failed before a document existed still parses once here.
+/// `loaded` is the structural parse, when that parse succeeded with
+/// `is_encrypted()` still true. Owner-password recovery reads `/O` from it.
+/// When the passwordless parse fails with an encryption error there is no
+/// structural document to recover from, and loading with `password` here would
+/// authenticate and strip `/Encrypt` before Algorithm 7 can run — so recovery
+/// is skipped and the supplied password is used as-is.
 fn decrypt_document_bytes(
     buf: &[u8],
     password: Option<&str>,
@@ -4420,7 +4423,7 @@ fn decrypt_document_bytes(
     // fixes this inside lopdf is not on crates.io yet (J-F-Liu/lopdf#573,
     // merged after 0.45.0), so resolve it here before handing the password
     // back to lopdf. A user password is left unchanged.
-    let resolved = file_key_password(buf, pw, loaded);
+    let resolved = file_key_password(pw, loaded);
     let with_password = |pw: &str| lopdf::LoadOptions {
         password: Some(pw.to_string()),
         ..bounded_load_options()
@@ -4434,20 +4437,19 @@ fn decrypt_document_bytes(
     }
 }
 
-fn file_key_password(buf: &[u8], password: &str, loaded: Option<&Document>) -> String {
+fn file_key_password(password: &str, loaded: Option<&Document>) -> String {
     if password.is_empty() {
         return String::new();
     }
-    let from_doc = |doc: &Document| {
-        owner_password::user_password_for_file_key(doc, password)
-            .unwrap_or_else(|| password.to_string())
-    };
-    if let Some(doc) = loaded {
-        return from_doc(doc);
-    }
-    match Document::load_mem_with_options(buf, bounded_load_options()) {
-        Ok(doc) => from_doc(&doc),
-        Err(_) => password.to_string(),
+    // Only the structural passwordless document still has `/Encrypt`. For the
+    // R2–R4 Standard files this recovery targets, that load succeeds with
+    // `is_encrypted()` true (see `load_document_bytes`). A second passwordless
+    // parse cannot succeed after the first already failed, and a passworded
+    // parse strips `/Encrypt`, so leave the supplied password unchanged.
+    match loaded {
+        Some(doc) => owner_password::user_password_for_file_key(doc, password)
+            .unwrap_or_else(|| password.to_string()),
+        None => password.to_string(),
     }
 }
 
