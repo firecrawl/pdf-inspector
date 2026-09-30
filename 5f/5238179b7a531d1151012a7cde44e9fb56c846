@@ -1,0 +1,22 @@
+src/detector/content_scan_budget_tests.rs
+  s_44a612cef2d4f4::t_c879652cd1a236 556-561
+  s_44a612cef2d4f4::t_6b989013f2f3f9 6-7
+  s_44a612cef2d4f4::t_f71323b34d99da 609-616,625
+  s_44a612cef2d4f4::t_a6484fc9cde6c2 551-555,562-608,617-624,626-633
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5f5238179b7a531d1151012a7cde44e9fb56c846",
+  "prompts": {},
+  "sessions": {
+    "s_44a612cef2d4f4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f0bc0790dffeBdTh311e51F9ky",
+        "model": "z-ai/glm-5.3"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
