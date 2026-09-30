@@ -2,7 +2,10 @@
 //! of form and pattern-cell content one page executes, and how a stream
 //! past them is refused before it is held.
 
-use super::super::{analyze_page_content, detect_from_document, DetectionConfig, PdfType};
+use super::super::{
+    analyze_page_content, detect_from_document, scan_xobjects_in_resources, DetectionConfig,
+    PdfType,
+};
 use super::fixtures::*;
 use super::*;
 
@@ -236,5 +239,281 @@ fn a_form_past_the_budget_is_refused_before_it_is_decoded() {
         assert!(close(state.covered_image_area(), PAGE_AREA));
         assert!(!state.incomplete);
         assert_eq!(state.executed_form_bytes, cell.len());
+    }
+}
+
+/// The page-content byte budget set for the test's thread, restored
+/// when dropped.
+struct PageBytesBudget(Option<usize>);
+
+impl PageBytesBudget {
+    fn set(bytes: usize) -> Self {
+        Self(PAGE_CONTENT_BYTES_OVERRIDE.with(|budget| budget.replace(Some(bytes))))
+    }
+}
+
+impl Drop for PageBytesBudget {
+    fn drop(&mut self) {
+        PAGE_CONTENT_BYTES_OVERRIDE.with(|budget| budget.set(self.0));
+    }
+}
+
+/// A Flate stream whose bytes inflate well past a small budget — a
+/// handful compressed, a thousand decoded — added to `doc` and returned
+/// by its object id.
+fn flate_bomb(doc: &mut Document, decoded: usize) -> ObjectId {
+    use lopdf::dictionary;
+    let id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        dictionary! {},
+        vec![b'0'; decoded],
+    )));
+    if let Object::Stream(stream) = doc.objects.get_mut(&id).unwrap() {
+        stream.compress().unwrap();
+    }
+    id
+}
+
+/// [`flate_bomb`] as a bound Form XObject: a page's resource walk reads
+/// the content of a `Do`-able form, invoked or not, so a form is the
+/// placement that reaches the walk's decode.
+fn flate_form_bomb(doc: &mut Document, decoded: usize) -> ObjectId {
+    use lopdf::dictionary;
+    let id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => Object::Name(b"Form".to_vec()),
+            "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                           Object::Integer(612), Object::Integer(792)],
+        },
+        vec![b'0'; decoded],
+    )));
+    if let Object::Stream(stream) = doc.objects.get_mut(&id).unwrap() {
+        stream.compress().unwrap();
+    }
+    id
+}
+
+/// A page bound to `resources`, its `Contents` the object ids given in
+/// order, each already a stream object.
+fn page_of_streams(
+    doc: &mut Document,
+    resources: lopdf::Dictionary,
+    contents: Vec<ObjectId>,
+) -> ObjectId {
+    use lopdf::dictionary;
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+            "Resources" => Object::Dictionary(resources),
+            "Contents" => contents
+                .into_iter()
+                .map(Object::Reference)
+                .collect::<Vec<_>>(),
+        }),
+    );
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => Object::Integer(1),
+        }),
+    );
+    page_id
+}
+
+/// A page's own Flate stream that inflates past the byte budget is
+/// refused before it is held, and no content stream after it is read:
+/// the budget bounds all of the page's streams together, whatever their
+/// number, and from the stream that would pass it on none is read — the
+/// streams before the bomb are scanned whole.
+#[test]
+fn page_content_inflating_past_the_byte_budget_is_skipped() {
+    use lopdf::dictionary;
+    let mut doc = Document::with_version("1.4");
+    let text = doc.add_object(Object::Stream(lopdf::Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET".to_vec(),
+    )));
+    let bomb = flate_bomb(&mut doc, 1000);
+    let after = doc.add_object(Object::Stream(lopdf::Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 72 700 Td (Yo) Tj ET".to_vec(),
+    )));
+    let page_id = page_of_streams(&mut doc, dictionary! {}, vec![text, bomb, after]);
+
+    let _budget = PageBytesBudget::set(200);
+    let (_, counts) = scan_page_content(&doc, page_id, &mut HashSet::new(), &mut HashSet::new());
+    assert_eq!(
+        counts.text_ops, 1,
+        "the stream before the bomb is scanned; the bomb and the stream after it are not"
+    );
+}
+
+/// A bound form's Flate content that inflates past the walk's remaining
+/// byte budget is refused before it is held, and no bound form after it
+/// is read — as the executed-form budget refuses — while the forms the
+/// budget still admits before it are scanned whole.
+#[test]
+fn bound_form_inflating_past_the_walk_budget_is_skipped() {
+    use lopdf::dictionary;
+    let mut doc = Document::with_version("1.4");
+    let text_form = {
+        let id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+            },
+            b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET".to_vec(),
+        )));
+        id
+    };
+    let bomb = flate_form_bomb(&mut doc, 1000);
+    let after_form = {
+        let id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+            },
+            b"BT /F1 12 Tf 72 700 Td (Yo) Tj ET".to_vec(),
+        )));
+        id
+    };
+    let resources = dictionary! {
+        "Font" => dictionary! {
+            "F1" => Object::Reference(
+                doc.add_object(dictionary! {
+                    "Type" => "Font",
+                    "Subtype" => Object::Name(b"Type1".to_vec()),
+                    "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+                })
+            ),
+        },
+        "XObject" => dictionary! {
+            "FmA" => Object::Reference(text_form),
+            "FmZ" => Object::Reference(bomb),
+            "FmZz" => Object::Reference(after_form),
+        },
+    };
+    let page_id = page_of_streams(&mut doc, resources, vec![]);
+    let page_resources = doc
+        .get_object(page_id)
+        .and_then(Object::as_dict)
+        .unwrap()
+        .get(b"Resources")
+        .and_then(Object::as_dict)
+        .unwrap()
+        .clone();
+
+    let mut visited = HashSet::new();
+    let mut unique_chars = HashSet::new();
+    let mut used_font_ids = HashSet::new();
+    let mut font_map = HashMap::new();
+    let mut bytes_left = 200usize;
+    let counts = scan_xobjects_in_resources(
+        &doc,
+        &page_resources,
+        &mut visited,
+        &mut unique_chars,
+        &mut used_font_ids,
+        &mut font_map,
+        0,
+        &mut bytes_left,
+    );
+    assert_eq!(
+        counts.text_ops, 1,
+        "the form before the bomb is read; the bomb and the form after it are not"
+    );
+}
+
+/// A chain of bound Forms, each resource dictionary naming the next, goes
+/// only as deep as the walk's depth cap: the innermost form of a chain
+/// longer than the cap is never reached, while one well within it is.
+#[test]
+fn bound_form_chain_deeper_than_the_depth_cap_stops() {
+    use lopdf::dictionary;
+
+    fn chain(doc: &mut Document, depth: usize) -> ObjectId {
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+        });
+        // The innermost form shows text; every form above it binds the
+        // one before it as `X0`, and nothing draws anything.
+        let mut next = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                },
+            },
+            b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET".to_vec(),
+        )));
+        for _ in 1..depth {
+            next = doc.add_object(Object::Stream(lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "BBox" => vec![Object::Integer(0), Object::Integer(0),
+                                   Object::Integer(612), Object::Integer(792)],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "X0" => Object::Reference(next) },
+                    },
+                },
+                Vec::new(),
+            )));
+        }
+        next
+    }
+
+    for (depth, expect_text_ops) in [(10, 1), (70, 0)] {
+        let mut doc = Document::with_version("1.4");
+        let head = chain(&mut doc, depth);
+        let resources = dictionary! {
+            "XObject" => dictionary! { "X0" => Object::Reference(head) },
+        };
+        let page_id = page_of_streams(&mut doc, resources, vec![]);
+        let page_resources = doc
+            .get_object(page_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .get(b"Resources")
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+
+        let mut visited = HashSet::new();
+        let mut unique_chars = HashSet::new();
+        let mut used_font_ids = HashSet::new();
+        let mut font_map = HashMap::new();
+        let mut bytes_left = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
+        let counts = scan_xobjects_in_resources(
+            &doc,
+            &page_resources,
+            &mut visited,
+            &mut unique_chars,
+            &mut used_font_ids,
+            &mut font_map,
+            0,
+            &mut bytes_left,
+        );
+        assert_eq!(
+            counts.text_ops, expect_text_ops,
+            "a chain {depth} deep shows its innermost form's text only within the cap"
+        );
     }
 }

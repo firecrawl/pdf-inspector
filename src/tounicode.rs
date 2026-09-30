@@ -3671,14 +3671,21 @@ impl FontCMaps {
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited, 0);
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited, 0);
             }
         }
     }
+
+    /// A Form XObject's resource dictionary naming another Form, whose
+    /// dictionary names another, is a recursion the `visited` set does not
+    /// bound: it stops cycles and re-reads, not depth. Real documents nest a
+    /// handful of forms deep; past this many the walk stops, so a crafted
+    /// deep chain cannot exhaust the stack.
+    const MAX_XOBJECT_RESOURCE_DEPTH: u32 = 64;
 
     /// Recursively collect font CMaps from XObjects in a resource dictionary.
     fn walk_xobject_fonts(
@@ -3686,7 +3693,11 @@ impl FontCMaps {
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
+        depth: u32,
     ) {
+        if depth >= Self::MAX_XOBJECT_RESOURCE_DEPTH {
+            return;
+        }
         let xobject_dict = match resources.get(b"XObject") {
             Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
             Ok(Object::Dictionary(dict)) => Some(dict),
@@ -3740,7 +3751,7 @@ impl FontCMaps {
                     Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
                 }
                 // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited, depth + 1);
             }
         }
     }
