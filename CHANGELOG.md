@@ -7,6 +7,40 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## Unreleased
+
+### Added
+
+- `OcrEngine::recognize_regions` reads the text inside given rectangles of
+  a rendered page. The default recognizes the whole page and joins the
+  spans lying mostly inside each rectangle; `OarOcrEngine` crops each
+  rectangle and runs recognition alone. `ImageRect` describes a
+  rectangle in pixel space.
+
+### Fixed
+
+- Text shown in an Identity-H or Identity-V font that nothing decodes (no
+  ToUnicode, a program without a usable cmap or glyph names, no
+  predefined collection) is marked with one U+FFFD per CID instead of
+  being read as single bytes. A glyph-indexed subset's small CIDs used to
+  come out as a stray character or nothing at all, so header lines,
+  stamps and single words drawn in such a font disappeared without the
+  page being flagged. Empty strings still draw nothing.
+- The CID-as-Unicode reading of such a font is refused when the font
+  contradicts it. This happens when a `CIDFontType2` with an Identity
+  `CIDToGIDMap` embeds a program that holds every code its `/W` array
+  lists as a glyph. It also happens when advance widths contradict the
+  scripts the codes would fall in, or when the codes include ones running
+  text does not use. The glyph indices of a large font used to be read as
+  plausible but wrong text in other scripts.
+- A run of such text stays its own item when lines are merged, and with
+  OCR in `Auto` mode a page whose only damage is such runs has just those
+  runs read. The pipeline crops each run from the rendered page for
+  recognition and renders the page's Markdown again with the readings in
+  place, instead of replacing every line the extractor read exactly with
+  a full-page OCR. PDFium's recovery of a page is no longer taken as
+  credible when its text carries control characters.
+
 ## [1.25.2] - 2026-09-28
 
 Changes since 1.25.1.

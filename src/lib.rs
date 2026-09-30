@@ -555,6 +555,10 @@ pub(crate) struct InternalPagesExtraction {
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+    /// Pages whose only damage is runs their fonts cannot decode, keyed by
+    /// 1-indexed page; collected only when the caller asked for them.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) span_repairs: BTreeMap<u32, PageSpanRepair>,
     /// The document written back out for the renderer when form XObjects
     /// were repaired at load (see `form_bbox_repair`); `None` when the
     /// original bytes render as loaded.
@@ -592,6 +596,7 @@ pub fn extract_pages_markdown_mem(
         false,
         false,
         false,
+        false,
     )
     .map(|extraction| extraction.result)
 }
@@ -599,13 +604,17 @@ pub fn extract_pages_markdown_mem(
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 /// `render_repairs` asks for the repaired document to be written back out
 /// for the renderer when the loader changed it (see `form_bbox_repair`);
-/// a caller that will not render leaves it off.
+/// a caller that will not render leaves it off. `collect_span_repairs` keeps,
+/// for each page whose only damage is runs its fonts cannot decode, what the
+/// OCR pipeline needs to read those runs and render the page again (see
+/// [`PageSpanRepair`]); a caller that will not run OCR leaves it off.
 pub(crate) fn extract_pages_markdown_mem_for_ocr(
     buffer: &[u8],
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
     render_repairs: bool,
+    collect_span_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
@@ -615,9 +624,11 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         markdown_options.strip_headers_footers,
         true,
         render_repairs,
+        collect_span_repairs,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_pages_markdown_mem_impl(
     buffer: &[u8],
     pages: Option<&[u32]>,
@@ -626,13 +637,14 @@ fn extract_pages_markdown_mem_impl(
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
     render_repairs: bool,
+    collect_span_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut doc = doc;
     #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
-    let _ = (repairs, render_repairs);
+    let _ = (repairs, render_repairs, collect_span_repairs);
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -644,7 +656,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, page_rotations, _) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -654,6 +666,9 @@ fn extract_pages_markdown_mem_impl(
         } else {
             extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
         };
+    // Only the span repair (OCR builds) reads the page frames.
+    #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
+    let _ = &page_rotations;
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -696,6 +711,8 @@ fn extract_pages_markdown_mem_impl(
     let mut ocr_reasons_by_page = BTreeMap::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut span_repairs = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
@@ -783,6 +800,31 @@ fn extract_pages_markdown_mem_impl(
             ..markdown_options.clone()
         };
 
+        // A page whose only damage is runs its fonts cannot decode keeps what
+        // the OCR pipeline needs to read just those runs and render the page
+        // again, rather than trading its native text for a full-page OCR.
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        let span_repair = (collect_span_repairs
+            && !has_gid
+            && !has_template_image
+            && !has_vector_text
+            && !has_invisible_text_layer
+            && page_suits_span_repair(
+                &doc,
+                lopdf_pages.get(&page_1idx).copied(),
+                page_rotations.get(&page_1idx).copied(),
+            ))
+        .then(|| span_repair_runs(&page_items))
+        .flatten()
+        .map(|found| {
+            (
+                found,
+                page_items.clone(),
+                page_number_removal_mask.clone(),
+                options.clone(),
+            )
+        });
+
         let md = if has_text_quality_issue {
             String::new()
         } else {
@@ -844,6 +886,43 @@ fn extract_pages_markdown_mem_impl(
             pages_needing_ocr.push(page_1idx);
         }
 
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        if let Some((SpanRepairRuns { runs, blanks }, items, removal_mask, options)) = span_repair {
+            let only_garbled =
+                ocr_reasons_by_page
+                    .get(&page_1idx)
+                    .is_some_and(|reasons: &Vec<String>| {
+                        reasons
+                            .iter()
+                            .all(|reason| reason == OCR_REASON_SUSPECTED_GARBLED_TEXT)
+                    });
+            if needs_ocr && only_garbled {
+                span_repairs.insert(
+                    page_1idx,
+                    PageSpanRepair {
+                        regions: runs.iter().map(|&run| span_region(&items[run])).collect(),
+                        runs,
+                        blanks,
+                        items,
+                        removal_mask,
+                        rects: page_rects,
+                        lines: page_lines,
+                        options,
+                        page_thresholds: page_thresholds
+                            .get(&page_1idx)
+                            .map(|&threshold| HashMap::from([(page_1idx, threshold)]))
+                            .unwrap_or_default(),
+                        removed_page_number_pages: removed_page_number_pages.clone(),
+                        chart_regions: chart_regions
+                            .get(&page_1idx)
+                            .map(|regions| HashMap::from([(page_1idx, regions.clone())]))
+                            .unwrap_or_default(),
+                        page_count,
+                    },
+                );
+            }
+        }
+
         results.push(PageMarkdown {
             page: page_0idx,
             // The public native extractor continues to suppress unreliable
@@ -873,6 +952,8 @@ fn extract_pages_markdown_mem_impl(
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         supplemental_ocr_regions,
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        span_repairs,
         // A renderer reading the original bytes would clip a repaired form
         // to nothing, so the OCR pipeline renders the repaired document.
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -891,6 +972,243 @@ fn extract_pages_markdown_mem_impl(
             None
         },
     })
+}
+
+/// Most runs of undecodable text read for one page before the page is left
+/// to a full-page OCR instead: past this many, a page is rarely "native text
+/// with a few damaged runs", and recognition per run stops being cheap.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+const MAX_SPAN_REPAIRS_PER_PAGE: usize = 48;
+
+/// A native page whose only damage is runs drawn in a font the extractor
+/// cannot decode (text that came out as U+FFFD), with what the OCR pipeline
+/// needs to read just those runs and render the page's Markdown again.
+///
+/// Such runs are often the only text a page loses — a court stamp, a header
+/// line, a name set in a fallback CJK font — and replacing the whole page
+/// with OCR to recover them would degrade every other line the extractor
+/// read exactly.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) struct PageSpanRepair {
+    /// Page-space area of each damaged run, in run order: the run's advance
+    /// and em box, padded for descenders and side bearings.
+    pub(crate) regions: Vec<PdfRect>,
+    /// Index into `items` of each damaged run.
+    runs: Vec<usize>,
+    /// Index into `items` of each U+FFFD-only item with no advance: nothing
+    /// visible to read, dropped when the page is rendered again.
+    blanks: Vec<usize>,
+    items: Vec<TextItem>,
+    removal_mask: Vec<bool>,
+    rects: Vec<PdfRect>,
+    lines: Vec<types::PdfLine>,
+    options: MarkdownOptions,
+    page_thresholds: HashMap<u32, f32>,
+    removed_page_number_pages: HashSet<u32>,
+    chart_regions: markdown::PageChartRegions,
+    page_count: u32,
+}
+
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+impl PageSpanRepair {
+    /// The page's Markdown with run `i` reading `readings[i]`, rendered from
+    /// the same items and document context as the page's native Markdown. A
+    /// run without a reading is dropped rather than left as U+FFFD.
+    pub(crate) fn render(&self, readings: &[Option<String>]) -> String {
+        let reading_of: HashMap<usize, Option<&str>> = self
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(run, &item)| {
+                let reading = readings
+                    .get(run)
+                    .and_then(|reading| reading.as_deref())
+                    .map(str::trim)
+                    .filter(|reading| !reading.is_empty());
+                (item, reading)
+            })
+            .chain(self.blanks.iter().map(|&item| (item, None)))
+            .collect();
+        let mut items = Vec::with_capacity(self.items.len());
+        let mut removal_mask = Vec::with_capacity(self.removal_mask.len());
+        for (index, (item, &removed)) in self.items.iter().zip(&self.removal_mask).enumerate() {
+            match reading_of.get(&index) {
+                Some(Some(reading)) => {
+                    // The word spaces the extractor attached to the run stay
+                    // with the reading, so it does not run into its neighbours.
+                    let text = &item.text;
+                    let lead = &text[..text.len() - text.trim_start().len()];
+                    let trail = &text[text.trim_end().len()..];
+                    let mut item = item.clone();
+                    item.text = format!("{lead}{reading}{trail}");
+                    items.push(item);
+                }
+                Some(None) => continue,
+                None => items.push(item.clone()),
+            }
+            removal_mask.push(removed);
+        }
+        markdown::to_markdown_from_items_with_rects_and_lines(
+            items,
+            self.options.clone(),
+            &self.rects,
+            &self.lines,
+            markdown::MarkdownDocumentContext {
+                page_thresholds: &self.page_thresholds,
+                struct_roles: None,
+                struct_tables: &[],
+                page_count: self.page_count,
+                prefiltered_page_number_pages: Some(&self.removed_page_number_pages),
+                prefiltered_page_number_mask: Some(&removal_mask),
+                precomputed_chart_regions: Some(&self.chart_regions),
+            },
+        )
+    }
+}
+
+/// The runs of a page a span repair can read with OCR, and its blanks.
+///
+/// A run is a horizontal item of U+FFFD alone with a known extent: the
+/// extractor keeps a run a font could not decode apart from decoded text
+/// (see `merge_text_items_with_clips`), so its box is the crop. A blank is a
+/// U+FFFD-only item with no advance, which shows nothing to read. `None` when
+/// the page has no run, when a run cannot be cropped (rotated), when an item
+/// mixes decoded text with U+FFFD (damage the runs do not account for), when
+/// the damage is not confined to few runs over a sound native text layer, or
+/// when the rest of the page shows other decoding problems — those pages keep
+/// the full-page OCR route.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+fn span_repair_runs(items: &[TextItem]) -> Option<SpanRepairRuns> {
+    let mut runs = Vec::new();
+    let mut blanks = Vec::new();
+    let mut damaged_chars = 0usize;
+    let mut clean = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if !matches!(item.item_type, types::ItemType::Text) {
+            continue;
+        }
+        if item.text.contains('\u{FFFD}') {
+            if !item.text.trim().chars().all(|ch| ch == '\u{FFFD}') {
+                return None;
+            }
+            let has_extent = item.width.is_finite()
+                && item.height.is_finite()
+                && item.width > 0.0
+                && item.height > 0.0;
+            if !has_extent {
+                blanks.push(index);
+                continue;
+            }
+            if item.rotation != 0.0 {
+                return None;
+            }
+            damaged_chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
+            runs.push(index);
+        } else {
+            if region_items_have_decoding_issue(std::slice::from_ref(item)) {
+                return None;
+            }
+            clean.push_str(&item.text);
+            clean.push(' ');
+        }
+    }
+    if runs.is_empty() || runs.len() > MAX_SPAN_REPAIRS_PER_PAGE {
+        return None;
+    }
+    // A native text layer worth keeping must remain, and the damage must not
+    // outweigh it: a page mostly drawn in undecodable fonts reads better as
+    // a whole-page OCR, which also recovers its layout.
+    let clean_chars = clean.chars().filter(|ch| !ch.is_whitespace()).count();
+    if clean_chars < 20 || damaged_chars > clean_chars {
+        return None;
+    }
+    if is_garbage_text(&clean) || is_cid_garbage(&clean) || detect_encoding_issues(&clean) {
+        return None;
+    }
+    Some(SpanRepairRuns { runs, blanks })
+}
+
+/// What `span_repair_runs` found on a page.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+struct SpanRepairRuns {
+    runs: Vec<usize>,
+    blanks: Vec<usize>,
+}
+
+#[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
+impl PageSpanRepair {
+    /// A repair over `items` alone, without document context, as the
+    /// extractor builds one for a page whose only damage is its U+FFFD runs.
+    pub(crate) fn from_page_items(items: Vec<TextItem>) -> Option<Self> {
+        let SpanRepairRuns { runs, blanks } = span_repair_runs(&items)?;
+        Some(Self {
+            regions: runs.iter().map(|&run| span_region(&items[run])).collect(),
+            runs,
+            blanks,
+            removal_mask: vec![false; items.len()],
+            items,
+            rects: Vec::new(),
+            lines: Vec::new(),
+            options: MarkdownOptions::default(),
+            page_thresholds: HashMap::new(),
+            removed_page_number_pages: HashSet::new(),
+            chart_regions: HashMap::new(),
+            page_count: 1,
+        })
+    }
+}
+
+/// Whether a damaged run's box maps straight onto a horizontal crop of the
+/// rendered page: no `/Rotate`, no text frame the extractor turned to read
+/// a rotated page, no vertical-writing font (whose runs the extractor lays
+/// out along x although their glyphs stack down the page). Other pages keep
+/// the full-page OCR route, whose detection finds rotated lines itself.
+/// Only the page's own font resources are read: a vertical font used only
+/// inside a Form XObject, or vertical writing set by an embedded CMap, is
+/// not seen here.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+fn page_suits_span_repair(
+    doc: &lopdf::Document,
+    page_id: Option<lopdf::ObjectId>,
+    rotation: Option<extractor::geometry::PageRotation>,
+) -> bool {
+    let Some(page_id) = page_id else {
+        return false;
+    };
+    if !rotation.is_none_or(|rotation| rotation == extractor::geometry::PageRotation::Upright) {
+        return false;
+    }
+    if extractor::display_frame::page_rotate(doc, page_id)
+        != extractor::display_frame::PageRotate::Rotate0
+    {
+        return false;
+    }
+    let vertical = |font: &lopdf::Dictionary| {
+        font.get(b"Encoding")
+            .ok()
+            .and_then(|encoding| encoding.as_name().ok())
+            .is_some_and(|name| name.ends_with(b"-V"))
+    };
+    !doc.get_page_fonts(page_id)
+        .unwrap_or_default()
+        .values()
+        .any(|font| vertical(font))
+}
+
+/// The page-space area a damaged horizontal run occupies: its advance by
+/// its em box, dropped below the baseline for descenders and padded at the
+/// sides for bearings, so a crop of it holds the whole run.
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+fn span_region(item: &TextItem) -> PdfRect {
+    let em = item.height;
+    let side = em * 0.15;
+    PdfRect {
+        x: item.x - side,
+        y: item.y - em * 0.3,
+        width: item.width + 2.0 * side,
+        height: em * 1.3,
+        page: item.page,
+    }
 }
 
 /// Image regions large enough to plausibly contain rasterized document
@@ -8639,5 +8957,176 @@ mod rotated_run_region_tests {
         let tokens = split_item_into_token_subitems(&unknown);
         assert_eq!(tokens.len(), 2);
         assert!(tokens[1].x > tokens[0].x + 15.0, "{tokens:?}");
+    }
+}
+
+#[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
+mod span_repair_tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
+            baseline_shift: 0.0,
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: 11.0,
+            rotation: 0.0,
+            advance_known: true,
+            font: "Helvetica".to_string(),
+            font_tag: "F1".to_string(),
+            legacy_symbol_rewrite: false,
+            font_size: 11.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    /// A header line and one word inside a body line drawn in a font
+    /// nothing decodes, over a sound native text layer.
+    pub(crate) fn page() -> Vec<TextItem> {
+        vec![
+            item(&"\u{FFFD}".repeat(12), 72.0, 740.0, 160.0),
+            item(
+                "The committee reviewed the quarterly report and the attached schedules.",
+                72.0,
+                700.0,
+                400.0,
+            ),
+            item("The auditors marked the plan", 72.0, 682.0, 150.0),
+            item(&"\u{FFFD}".repeat(8), 226.0, 682.0, 60.0),
+            item("and noted no material weakness.", 290.0, 682.0, 160.0),
+        ]
+    }
+
+    #[test]
+    fn undecodable_runs_are_read_in_place_of_the_page() {
+        let repair = PageSpanRepair::from_page_items(page()).unwrap();
+        assert_eq!(repair.runs, vec![0, 3]);
+        // The crop covers the run's advance and em box, below the baseline too.
+        let region = &repair.regions[1];
+        assert!(region.x < 226.0 && region.x + region.width > 286.0);
+        assert!(region.y < 682.0 && region.y + region.height >= 693.0);
+
+        let markdown = repair.render(&[Some("CONFIDENTIAL".into()), Some("APPROVED".into())]);
+        assert!(!markdown.contains('\u{FFFD}'), "{markdown}");
+        assert!(markdown.contains("CONFIDENTIAL"), "{markdown}");
+        let plan = markdown.find("marked the plan").unwrap();
+        let word = markdown.find("APPROVED").unwrap();
+        let tail = markdown.find("and noted").unwrap();
+        assert!(plan < word && word < tail, "{markdown}");
+        assert!(markdown.contains("quarterly report"), "{markdown}");
+
+        // A run OCR could not read is dropped, not left as U+FFFD.
+        let markdown = repair.render(&[None, Some("APPROVED".into())]);
+        assert!(!markdown.contains('\u{FFFD}') && !markdown.contains("CONFIDENTIAL"));
+        assert!(markdown.contains("APPROVED"));
+    }
+
+    /// A one-page document whose page carries `rotate` and one font `F1`
+    /// declaring `encoding`.
+    fn one_page_doc(rotate: i64, encoding: &str) -> (lopdf::Document, lopdf::ObjectId) {
+        use lopdf::{dictionary, Object};
+        let mut doc = lopdf::Document::with_version("1.5");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "F",
+            "Encoding" => encoding,
+        });
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+            "Rotate" => rotate,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        });
+        let pages = doc.add_object(dictionary! {
+            "Type" => "Pages", "Count" => 1, "Kids" => vec![Object::Reference(page)],
+        });
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Parent", pages);
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        doc.trailer.set("Root", catalog);
+        (doc, page)
+    }
+
+    #[test]
+    fn span_repair_needs_an_upright_horizontal_page() {
+        use crate::extractor::geometry::PageRotation;
+        let (doc, page) = one_page_doc(0, "Identity-H");
+        assert!(page_suits_span_repair(&doc, Some(page), None));
+        assert!(page_suits_span_repair(
+            &doc,
+            Some(page),
+            Some(PageRotation::Upright)
+        ));
+        // The extractor turned the page frame to read rotated text.
+        assert!(!page_suits_span_repair(
+            &doc,
+            Some(page),
+            Some(PageRotation::Ccw)
+        ));
+        // The renderer turns a /Rotate page; a run's box would not be a
+        // horizontal crop of it.
+        let (doc, page) = one_page_doc(90, "Identity-H");
+        assert!(!page_suits_span_repair(&doc, Some(page), None));
+        // Vertical writing stacks a run's glyphs down the page.
+        let (doc, page) = one_page_doc(0, "Identity-V");
+        assert!(!page_suits_span_repair(&doc, Some(page), None));
+        assert!(!page_suits_span_repair(&doc, None, None));
+    }
+
+    #[test]
+    fn pages_the_runs_do_not_explain_keep_the_full_page_route() {
+        // Nothing to repair.
+        assert!(span_repair_runs(&page()[1..3]).is_none());
+        // Damage outweighing the native text reads better as a page OCR.
+        let mut heavy = page();
+        heavy.push(item(&"\u{FFFD}".repeat(300), 72.0, 600.0, 400.0));
+        assert!(span_repair_runs(&heavy).is_none());
+        // A rotated run cannot be cropped as a text line.
+        let mut rotated = page();
+        rotated[3].rotation = 90.0;
+        assert!(span_repair_runs(&rotated).is_none());
+        // Decoded text and U+FFFD in one item: damage the runs do not explain.
+        let mut mixed = page();
+        mixed[2].text = "The auditors marked the \u{FFFD}lan".into();
+        assert!(span_repair_runs(&mixed).is_none());
+        // Past the per-page cap the page is not "a few damaged runs".
+        let mut many = page();
+        for i in 0..MAX_SPAN_REPAIRS_PER_PAGE {
+            many.push(item("\u{FFFD}", 72.0 + i as f32 * 6.0, 500.0, 5.0));
+        }
+        assert!(span_repair_runs(&many).is_none());
+        // Other decoding damage in the native text keeps the page whole.
+        let mut private_use = page();
+        private_use[1].text = "\u{E000}\u{E001}\u{E002}\u{E003}\u{E004} quarterly".into();
+        assert!(span_repair_runs(&private_use).is_none());
+        // A U+FFFD-only item with no advance shows nothing: it is dropped
+        // rather than cropped, and does not stop the repair.
+        let mut blank = page();
+        blank.push(item("\u{FFFD}", 300.0, 700.0, 0.0));
+        let repair = PageSpanRepair::from_page_items(blank).unwrap();
+        assert_eq!(
+            (repair.runs.clone(), repair.blanks.clone()),
+            (vec![0, 3], vec![5])
+        );
+        let markdown = repair.render(&[Some("CONFIDENTIAL".into()), Some("APPROVED".into())]);
+        assert!(!markdown.contains('\u{FFFD}'), "{markdown}");
+        // Too little native text to keep.
+        assert!(span_repair_runs(&[item("Page", 72.0, 700.0, 30.0), page()[3].clone()]).is_none());
     }
 }

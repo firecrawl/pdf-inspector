@@ -1497,14 +1497,7 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
         _ => return false,
     };
 
-    // Fallback 1: W array CIDs look like Unicode codepoints → passthrough works.
-    // Many PDF generators (Chromium, wkhtmltopdf) use Identity-H where CID = Unicode.
-    if crate::tounicode::cid_values_look_like_unicode(cid_font_dict) {
-        return true;
-    }
-
-    // Fallback 2: Embedded TrueType/OpenType font has a usable cmap table.
-    if let Some(font_descriptor) = cid_font_dict
+    let font_file_ref = cid_font_dict
         .get(b"FontDescriptor")
         .ok()
         .and_then(|o| match o {
@@ -1512,52 +1505,51 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
             Object::Dictionary(d) => Some(d),
             _ => None,
         })
-    {
-        let font_file_ref = font_descriptor
-            .get(b"FontFile2")
+        .and_then(|font_descriptor| {
+            font_descriptor
+                .get(b"FontFile2")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+                .or_else(|| {
+                    font_descriptor
+                        .get(b"FontFile3")
+                        .ok()
+                        .and_then(|o| o.as_reference().ok())
+                })
+        });
+    // The program is decompressed once for all three checks.
+    let font_data: Option<Vec<u8>> = font_file_ref.and_then(|ff_ref| {
+        doc.get_object(ff_ref)
+            .and_then(Object::as_stream)
             .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                font_descriptor
-                    .get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            });
-        if let Some(ff_ref) = font_file_ref {
-            if embedded_font_has_cmap(doc, ff_ref) {
-                return true;
-            }
-            // Fallback 3: no cmap, but the glyph order is the standard
-            // Macintosh one and the metrics corroborate it (see
-            // `mac_glyph_order`); extraction decodes it.
-            if crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc)
-                && doc
-                    .get_object(ff_ref)
-                    .and_then(Object::as_stream)
-                    .ok()
-                    .and_then(|stream| stream.decompressed_content().ok())
-                    .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
-            {
-                return true;
-            }
-        }
-    }
+            .and_then(|stream| stream.decompressed_content().ok())
+    });
 
-    false
+    // Fallback 1: Embedded TrueType/OpenType font has a usable cmap table.
+    if font_data.as_deref().is_some_and(embedded_font_has_cmap) {
+        return true;
+    }
+    // Fallback 2: no cmap, but the glyph order is the standard Macintosh one
+    // and the metrics corroborate it (see `mac_glyph_order`); extraction
+    // decodes it.
+    if crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc)
+        && font_data
+            .as_deref()
+            .is_some_and(crate::mac_glyph_order::font_file_follows_mac_order)
+    {
+        return true;
+    }
+    // Fallback 3: W array CIDs look like Unicode codepoints → passthrough
+    // works. Many PDF generators (Chromium, wkhtmltopdf) use Identity-H where
+    // CID = Unicode; extraction applies the same plausibility checks before
+    // it trusts them.
+    crate::tounicode::cid_passthrough_is_plausible(cid_font_dict, doc, font_data.as_deref())
 }
 
 /// Quick check whether an embedded TrueType/OpenType font has a cmap table
 /// that can map GIDs to Unicode codepoints.
-fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
-    let stream = match doc.get_object(font_ref).and_then(Object::as_stream) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let data = match stream.decompressed_content() {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    let face = match ttf_parser::Face::parse(&data, 0) {
+fn embedded_font_has_cmap(data: &[u8]) -> bool {
+    let face = match ttf_parser::Face::parse(data, 0) {
         Ok(f) => f,
         Err(_) => return false,
     };

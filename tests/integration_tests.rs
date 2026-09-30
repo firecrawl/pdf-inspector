@@ -11060,3 +11060,51 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+#[test]
+fn test_undecodable_identity_runs_are_marked_not_dropped() {
+    // A header line (page 1) and one word inside a body line (page 2) drawn
+    // in a Type0 Identity-H subset nothing decodes: no ToUnicode, the
+    // subset's cmap and glyph names removed, glyph-indexed CIDs below 0x80.
+    // Read as text, those codes used to drop out as control characters, so
+    // the header and the word silently vanished and nothing was flagged.
+    let buf = std::fs::read("tests/fixtures/undecodable_cid_runs.pdf").unwrap();
+
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let marked: Vec<&str> = items
+        .iter()
+        .filter(|item| item.text.contains('\u{FFFD}'))
+        .map(|item| item.text.as_str())
+        .collect();
+    assert_eq!(marked.len(), 2, "one marked run per page: {marked:?}");
+    // Each run is an item of its own (its box is what OCR crops), holding
+    // one marker per CID and at most the word space taken at its edge.
+    assert!(marked
+        .iter()
+        .all(|text| text.trim().chars().all(|ch| ch == '\u{FFFD}')));
+    assert_eq!(
+        marked[0].trim().chars().count(),
+        "CONFIDENTIAL REVIEW COPY".len()
+    );
+    assert_eq!(marked[1].trim().chars().count(), "APPROVED".len());
+
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+    assert!(result.has_encoding_issues);
+
+    let pages = pdf_inspector::extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages.iter().all(|page| page.needs_ocr));
+    assert_eq!(pages.pages_needing_ocr, vec![1, 2]);
+}
+
+#[test]
+fn test_empty_strings_in_identity_fonts_stay_empty() {
+    // upstage_key_functions.pdf shows `()` 41 times in Identity-H fonts with
+    // complete ToUnicode maps: an empty string draws nothing and must not
+    // turn into a U+FFFD marker (which would flag the page for OCR).
+    let buf = std::fs::read("tests/fixtures/upstage_key_functions.pdf").unwrap();
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+    assert!(!result.has_encoding_issues);
+    assert!(!result.markdown.unwrap_or_default().contains('\u{FFFD}'));
+    let pages = pdf_inspector::extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages_needing_ocr.is_empty());
+}

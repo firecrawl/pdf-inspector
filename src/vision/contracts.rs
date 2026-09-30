@@ -244,6 +244,109 @@ pub trait OcrEngine: Send + Sync {
     fn preferred_page_concurrency(&self) -> usize {
         1
     }
+
+    /// Reads the text inside each of `regions` — rectangles in `page`'s
+    /// pixel space — in input order: one span per region, `None` where
+    /// nothing legible was read. The pipeline uses it for short runs of
+    /// native text a PDF font cannot decode, so it can read them without
+    /// replacing the rest of the page's native text.
+    ///
+    /// The default recognizes the whole page and joins, left to right, the
+    /// spans whose centres fall inside each region. An engine that can run
+    /// recognition on a crop should override it: a text line that only
+    /// partly lies in a region is then read for just that part.
+    fn recognize_regions(
+        &self,
+        page: &RenderedPage,
+        regions: &[ImageRect],
+        options: &OcrOptions,
+    ) -> Result<Vec<Option<OcrSpan>>, Self::Error> {
+        let spans = self
+            .recognize(std::slice::from_ref(page), options)?
+            .into_iter()
+            .next()
+            .map(|page| page.spans)
+            .unwrap_or_default();
+        Ok(regions.iter().map(|region| region.gather(&spans)).collect())
+    }
+}
+
+/// An axis-aligned rectangle in a rendered page's pixel space, top-left
+/// origin with `y` growing downward.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageRect {
+    /// Left edge.
+    pub left: f32,
+    /// Top edge.
+    pub top: f32,
+    /// Right edge.
+    pub right: f32,
+    /// Bottom edge.
+    pub bottom: f32,
+}
+
+impl ImageRect {
+    /// Creates a rectangle from its edges.
+    pub fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// The rectangle as a clockwise quad from its top-left corner.
+    pub fn to_quad(self) -> ImageQuad {
+        ImageQuad::new([
+            ImagePoint::new(self.left, self.top),
+            ImagePoint::new(self.right, self.top),
+            ImagePoint::new(self.right, self.bottom),
+            ImagePoint::new(self.left, self.bottom),
+        ])
+    }
+
+    /// The spans of a whole-page reading lying mostly inside this rectangle
+    /// (at least half of each span's box), joined left to right into one
+    /// span over the rectangle; `None` when there are none. A line that
+    /// only passes through the rectangle is not taken whole for it.
+    pub(crate) fn gather(&self, spans: &[OcrSpan]) -> Option<OcrSpan> {
+        let mut inside: Vec<(f32, &OcrSpan)> = spans
+            .iter()
+            .filter_map(|span| {
+                let points = &span.polygon.points;
+                let left = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                let right = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                let top = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                let bottom = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+                let area = (right - left) * (bottom - top);
+                let overlap = (right.min(self.right) - left.max(self.left)).max(0.0)
+                    * (bottom.min(self.bottom) - top.max(self.top)).max(0.0);
+                (area > 0.0 && overlap * 2.0 >= area).then_some((left, span))
+            })
+            .collect();
+        if inside.is_empty() {
+            return None;
+        }
+        inside.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let text = inside
+            .iter()
+            .map(|(_, span)| span.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() {
+            return None;
+        }
+        let confidence =
+            inside.iter().map(|(_, span)| span.confidence).sum::<f32>() / inside.len() as f32;
+        Some(OcrSpan {
+            text,
+            polygon: self.to_quad(),
+            confidence,
+            orientation_degrees: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +371,42 @@ mod tests {
             options.model_directory,
             Some(PathBuf::from("/models/pp-ocr"))
         );
+    }
+
+    #[test]
+    fn a_region_gathers_whole_page_spans_left_to_right() {
+        let span = |text: &str, x: f32| OcrSpan {
+            text: text.to_string(),
+            polygon: ImageRect::new(x, 10.0, x + 20.0, 20.0).to_quad(),
+            confidence: 0.8,
+            orientation_degrees: None,
+        };
+        let spans = vec![
+            span("world", 50.0),
+            span("hello", 10.0),
+            span("elsewhere", 300.0),
+        ];
+        let gathered = ImageRect::new(0.0, 0.0, 100.0, 40.0)
+            .gather(&spans)
+            .unwrap();
+        assert_eq!(gathered.text, "hello world");
+        assert_eq!(
+            gathered.polygon,
+            ImageRect::new(0.0, 0.0, 100.0, 40.0).to_quad()
+        );
+        assert!(ImageRect::new(0.0, 100.0, 10.0, 110.0)
+            .gather(&spans)
+            .is_none());
+        // A whole line whose centre happens to fall in a word-sized region is
+        // not taken for that word.
+        let line = OcrSpan {
+            text: "The auditors marked the plan APPROVED and noted".to_string(),
+            polygon: ImageRect::new(0.0, 10.0, 400.0, 20.0).to_quad(),
+            confidence: 0.9,
+            orientation_degrees: None,
+        };
+        assert!(ImageRect::new(180.0, 5.0, 240.0, 25.0)
+            .gather(std::slice::from_ref(&line))
+            .is_none());
     }
 }

@@ -24,9 +24,10 @@ use super::oar::onnx_runtime_library_path;
 use super::pdfium::PdfiumTextPage;
 use super::{
     route_ocr_pages, run_ocr_pages, FusedPageMarkdown, FusedPages, HttpModelDownloadError,
-    HttpModelDownloader, ModelAcquireError, ModelStore, ModelStoreError, OarOcrEngine, OarOcrError,
-    OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions, OcrRoutingError, OcrRun,
-    OcrRunError, PageRenderer, PdfiumRenderer, RenderError, RenderOptions, PP_OCR_V6_SMALL,
+    HttpModelDownloader, ImageRect, ModelAcquireError, ModelIdentity, ModelStore, ModelStoreError,
+    OarOcrEngine, OarOcrError, OcrEngine, OcrFusionError, OcrFusionOptions, OcrMode, OcrOptions,
+    OcrRoutingError, OcrRun, OcrRunError, PageContentSource, PageRenderer, PdfiumRenderer,
+    RenderError, RenderOptions, PP_OCR_V6_SMALL,
 };
 
 /// Bounds live rendered-page memory while preserving small OCR batches.
@@ -251,10 +252,15 @@ pub fn process_pdf_with_ocr_mem(
         options.password.as_deref(),
         &page_markdown_options,
         options.ocr.mode != OcrMode::Off,
+        options.ocr.mode == OcrMode::Auto,
     )?;
     let mut native = extraction.result;
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
+    // Collected in Auto mode only: pages whose only damage is runs their
+    // fonts cannot decode. They have just those runs read (see
+    // `repair_undecodable_spans`) instead of being routed whole.
+    let span_repairs = extraction.span_repairs;
     // The renderer reads the document as the loader repaired it, when it
     // had to (a decrypted copy, when the document is encrypted; a copy that
     // cannot be written fails the extraction above); otherwise the caller's
@@ -268,12 +274,19 @@ pub fn process_pdf_with_ocr_mem(
         return Err(OcrPipelineError::InvalidSelectedPage { page: invalid });
     }
 
-    let initially_routed = route_ocr_pages(
+    let mut initially_routed = route_ocr_pages(
         options.ocr.mode,
         page_count,
         &native.pages_needing_ocr,
         selected_pages.as_deref(),
     )?;
+    // Neither whole-page route suits a page whose native layer is sound but
+    // for a few undecodable runs. A full-page OCR would re-read every line
+    // the extractor read exactly. PDFium's recovery of the page reads those
+    // runs no better — as control codes, or glyph indices taken for code
+    // points — and the rest of the page as well as the extractor already
+    // did, while such a reading can still pass the credibility checks.
+    initially_routed.retain(|page| !span_repairs.contains_key(page));
 
     // The OCR extractor retains clean native fragments on pages that still
     // require OCR. Remove them from the ordinary native result now so Off mode
@@ -377,6 +390,28 @@ pub fn process_pdf_with_ocr_mem(
         }
     }
 
+    let span_repair_outcomes = if span_repairs.is_empty() {
+        BTreeMap::new()
+    } else {
+        let native_renderer = match renderer {
+            Some(renderer) => renderer,
+            None => PdfiumRenderer::load()?,
+        };
+        let engine = cached_ocr_engine(&options.ocr)?;
+        let outcomes = repair_undecodable_spans(
+            &native_renderer,
+            engine.as_ref(),
+            render_buffer,
+            &span_repairs,
+            options.password.as_deref(),
+            &options.render,
+            &options.ocr,
+            &mut native.pages,
+        )?;
+        renderer = Some(native_renderer);
+        outcomes
+    };
+
     let supplemental_preflight_ms = if options.ocr.mode == OcrMode::Auto
         && fusion_routes
             .values()
@@ -451,7 +486,45 @@ pub fn process_pdf_with_ocr_mem(
                 .warnings
                 .push("recovered a credible positioned native text layer before OCR".to_string());
         }
+        if let Some(outcome) = span_repair_outcomes.get(&page.page_number) {
+            let provenance = &mut page.provenance;
+            if outcome.read > 0 {
+                provenance.source = PageContentSource::Fused;
+            }
+            provenance
+                .ocr_model
+                .get_or_insert_with(|| outcome.model.clone());
+            if provenance.ocr_confidence.is_none() {
+                provenance.ocr_confidence = outcome.mean_confidence;
+            }
+            provenance.render_dpi.get_or_insert(options.render.dpi);
+            provenance.timings.render_ms = provenance
+                .timings
+                .render_ms
+                .saturating_add(outcome.render_ms);
+            provenance.timings.ocr_ms = provenance.timings.ocr_ms.saturating_add(outcome.ocr_ms);
+            provenance.warnings.push(format!(
+                "read {} of {} text runs its fonts could not decode with OCR",
+                outcome.read, outcome.runs
+            ));
+            if outcome.read < outcome.runs {
+                provenance.warnings.push(format!(
+                    "dropped {} undecodable text runs OCR could not read",
+                    outcome.runs - outcome.read
+                ));
+                // Text is missing from the page: a stronger reader should see it.
+                provenance.hosted_recommended = true;
+            }
+        }
     }
+    for outcome in span_repair_outcomes.values() {
+        fused.render_time_ms = fused.render_time_ms.saturating_add(outcome.render_ms);
+        fused.ocr_time_ms = fused.ocr_time_ms.saturating_add(outcome.ocr_ms);
+    }
+    let mut pages_routed_to_ocr = routed;
+    pages_routed_to_ocr.extend(span_repair_outcomes.keys().copied());
+    pages_routed_to_ocr.sort_unstable();
+    pages_routed_to_ocr.dedup();
     let pages_recommending_hosted = fused
         .pages
         .iter()
@@ -473,7 +546,7 @@ pub fn process_pdf_with_ocr_mem(
         pages: fused.pages,
         page_count,
         pages_recommended_for_ocr: native.pages_needing_ocr,
-        pages_routed_to_ocr: routed,
+        pages_routed_to_ocr,
         pages_recommending_hosted,
         ocr_reasons_by_page: native.ocr_reasons_by_page,
         pages_with_tables: pages_with_tables.clone(),
@@ -533,6 +606,126 @@ fn filter_supplemental_routes_by_pixels(
         !matches!(route, OcrFusionRoute::SupplementalRegions(regions) if regions.is_empty())
     });
     Ok(elapsed_ms(started))
+}
+
+/// Confidence below which an OCR reading of an undecodable run is not
+/// trusted: the run is dropped rather than replaced with a guess. Crops go
+/// to recognition without a detection pass to vouch for them, so the bar
+/// sits above what a full-page reading would accept.
+const SPAN_REPAIR_MIN_CONFIDENCE: f32 = 0.7;
+
+/// What reading one page's undecodable runs produced.
+#[derive(Debug, Clone)]
+struct SpanRepairOutcome {
+    runs: usize,
+    read: usize,
+    mean_confidence: Option<f32>,
+    model: ModelIdentity,
+    render_ms: u64,
+    ocr_ms: u64,
+}
+
+/// Reads the runs of each page its fonts could not decode with recognition
+/// on crops of those runs alone, then renders the page's Markdown again from
+/// its own native items with the readings in place (see
+/// [`crate::PageSpanRepair`]). The page keeps every line the extractor read
+/// exactly and stops needing OCR. A run with no confident reading is dropped
+/// rather than left as U+FFFD. Pages are rendered a chunk at a time so only
+/// a few bitmaps are held at once.
+#[allow(clippy::too_many_arguments)]
+fn repair_undecodable_spans<R, O>(
+    renderer: &R,
+    engine: &O,
+    pdf_bytes: &[u8],
+    repairs: &BTreeMap<u32, crate::PageSpanRepair>,
+    password: Option<&str>,
+    render_options: &RenderOptions,
+    ocr_options: &OcrOptions,
+    native_pages: &mut [PageMarkdown],
+) -> Result<BTreeMap<u32, SpanRepairOutcome>, OcrRunError>
+where
+    R: PageRenderer,
+    O: OcrEngine,
+{
+    let minimum_confidence = SPAN_REPAIR_MIN_CONFIDENCE.max(ocr_options.minimum_confidence);
+    let pages: Vec<u32> = repairs.keys().copied().collect();
+    let mut outcomes = BTreeMap::new();
+    for chunk in pages.chunks(OCR_PAGE_CHUNK_SIZE) {
+        let render_started = Instant::now();
+        let rendered = renderer
+            .render_pages(pdf_bytes, chunk, password, render_options)
+            .map_err(|source| OcrRunError::Render {
+                source: Box::new(source),
+            })?;
+        let render_ms = elapsed_ms(render_started) / chunk.len().max(1) as u64;
+        let returned: Vec<u32> = rendered.iter().map(|page| page.page()).collect();
+        if returned != chunk {
+            return Err(OcrRunError::PageOrderMismatch {
+                stage: "renderer",
+                expected: chunk.to_vec(),
+                actual: returned,
+            });
+        }
+        for page in &rendered {
+            let Some(repair) = repairs.get(&page.page()) else {
+                continue;
+            };
+            let regions: Vec<ImageRect> = repair
+                .regions
+                .iter()
+                .map(|region| {
+                    let (x, y, width, height) = page.pdf_rect_to_pixel(region);
+                    ImageRect::new(x as f32, y as f32, (x + width) as f32, (y + height) as f32)
+                })
+                .collect();
+            let ocr_started = Instant::now();
+            let spans = engine
+                .recognize_regions(page, &regions, ocr_options)
+                .map_err(|source| OcrRunError::Ocr {
+                    source: Box::new(source),
+                })?;
+            let ocr_ms = elapsed_ms(ocr_started);
+            let accepted: Vec<Option<(String, f32)>> = (0..regions.len())
+                .map(|run| {
+                    spans
+                        .get(run)
+                        .and_then(Option::as_ref)
+                        .filter(|span| span.confidence >= minimum_confidence)
+                        .map(|span| (span.text.clone(), span.confidence))
+                })
+                .collect();
+            let readings: Vec<Option<String>> = accepted
+                .iter()
+                .map(|reading| reading.as_ref().map(|(text, _)| text.clone()))
+                .collect();
+            let confidences: Vec<f32> = accepted
+                .iter()
+                .flatten()
+                .map(|(_, confidence)| *confidence)
+                .collect();
+            if let Some(native) = native_pages
+                .iter_mut()
+                .find(|native| native.page + 1 == page.page())
+            {
+                native.markdown = repair.render(&readings);
+                native.needs_ocr = false;
+            }
+            outcomes.insert(
+                page.page(),
+                SpanRepairOutcome {
+                    runs: regions.len(),
+                    read: confidences.len(),
+                    mean_confidence: (!confidences.is_empty())
+                        .then(|| confidences.iter().sum::<f32>() / confidences.len() as f32),
+                    model: engine.model().clone(),
+                    render_ms,
+                    ocr_ms,
+                },
+            );
+        }
+        // The chunk's bitmaps are released before the next chunk renders.
+    }
+    Ok(outcomes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,6 +970,18 @@ fn credible_native_recovery(
         .collect::<Vec<_>>()
         .join(" ");
     if is_garbage_text(&text) || is_cid_garbage(&text) {
+        return None;
+    }
+    // Control codes in a text layer are glyphs read as characters they cannot
+    // be — codes of a font nothing decodes, taken for code points — however
+    // well the rest of the page reads.
+    let visible = text.chars().filter(|ch| !ch.is_whitespace()).count();
+    // PDFium reports a line-end hyphen it generated as U+0002: not damage.
+    let control = text
+        .chars()
+        .filter(|&ch| ch.is_control() && !ch.is_whitespace() && ch != '\u{2}')
+        .count();
+    if control >= 3 && control * 100 >= visible {
         return None;
     }
 
@@ -1468,6 +1673,7 @@ mod tests {
             None,
             &MarkdownOptions::default(),
             false,
+            false,
         )
         .unwrap();
         assert!(ocr.result.pages[0].needs_ocr);
@@ -1515,5 +1721,120 @@ mod tests {
                 OcrFusionError::InvalidHostedConfidence { .. }
             ))
         ));
+    }
+
+    /// An engine that reads fixed text in each requested region and must
+    /// never be asked for a whole-page recognition.
+    struct RegionEngine {
+        readings: Vec<Option<(&'static str, f32)>>,
+        calls: Mutex<Vec<(u32, usize)>>,
+        model: super::super::ModelIdentity,
+    }
+
+    impl OcrEngine for RegionEngine {
+        type Error = std::convert::Infallible;
+
+        fn model(&self) -> &super::super::ModelIdentity {
+            &self.model
+        }
+
+        fn recognize(
+            &self,
+            _pages: &[super::super::RenderedPage],
+            _options: &OcrOptions,
+        ) -> Result<Vec<super::super::OcrPage>, Self::Error> {
+            panic!("a span repair must not run whole-page recognition");
+        }
+
+        fn recognize_regions(
+            &self,
+            page: &super::super::RenderedPage,
+            regions: &[ImageRect],
+            _options: &OcrOptions,
+        ) -> Result<Vec<Option<super::super::OcrSpan>>, Self::Error> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((page.page(), regions.len()));
+            Ok(regions
+                .iter()
+                .zip(&self.readings)
+                .map(|(region, reading)| {
+                    reading.map(|(text, confidence)| super::super::OcrSpan {
+                        text: text.to_string(),
+                        polygon: region.to_quad(),
+                        confidence,
+                        orientation_degrees: None,
+                    })
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn native_recovery_with_control_codes_is_not_credible() {
+        let mut items = crate::span_repair_tests::page();
+        items.retain(|item| !item.text.contains('\u{FFFD}'));
+        let options = MarkdownOptions::default();
+        assert!(credible_native_recovery(&items, 1, &options).is_some());
+        // PDFium's generated line-end hyphen (U+0002) is not damage.
+        let mut hyphenated = items.clone();
+        for item in &mut hyphenated {
+            item.text.push('\u{2}');
+        }
+        assert!(credible_native_recovery(&hyphenated, 1, &options).is_some());
+        // Glyph codes read as control characters are.
+        let mut garbled = items;
+        garbled[0].text = "\u{10}\u{18} \u{14}! \u{19}\u{1}\u{1c}\u{1b}\u{11}".into();
+        assert!(credible_native_recovery(&garbled, 1, &options).is_none());
+    }
+
+    #[test]
+    fn span_repair_reads_only_the_damaged_runs_and_keeps_the_native_text() {
+        let repair =
+            crate::PageSpanRepair::from_page_items(crate::span_repair_tests::page()).unwrap();
+        let repairs = BTreeMap::from([(1, repair)]);
+        let mut native = vec![PageMarkdown {
+            page: 0,
+            markdown: String::new(),
+            needs_ocr: true,
+            ocr_reason: Some(OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()),
+        }];
+        let renderer = TrackingRenderer {
+            batches: Mutex::new(Vec::new()),
+        };
+        // The second run's reading is below the trust floor.
+        let engine = RegionEngine {
+            readings: vec![Some(("CONFIDENTIAL", 0.97)), Some(("APPROVED", 0.3))],
+            calls: Mutex::new(Vec::new()),
+            model: super::super::ModelIdentity::new("fake", "1"),
+        };
+        let outcomes = repair_undecodable_spans(
+            &renderer,
+            &engine,
+            b"",
+            &repairs,
+            None,
+            &RenderOptions::default(),
+            &OcrOptions::new().mode(OcrMode::Auto),
+            &mut native,
+        )
+        .unwrap();
+
+        assert_eq!(renderer.batches.lock().unwrap().as_slice(), &[vec![1]]);
+        assert_eq!(engine.calls.lock().unwrap().as_slice(), &[(1, 2)]);
+        let outcome = &outcomes[&1];
+        assert_eq!((outcome.runs, outcome.read), (2, 1));
+        assert_eq!(outcome.mean_confidence, Some(0.97));
+        let page = &native[0];
+        assert!(!page.needs_ocr);
+        assert!(page.markdown.contains("CONFIDENTIAL"), "{}", page.markdown);
+        assert!(!page.markdown.contains("APPROVED"), "{}", page.markdown);
+        assert!(!page.markdown.contains('\u{FFFD}'), "{}", page.markdown);
+        assert!(
+            page.markdown.contains("quarterly report"),
+            "{}",
+            page.markdown
+        );
     }
 }

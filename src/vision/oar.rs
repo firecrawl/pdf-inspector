@@ -13,8 +13,8 @@ use oar_ocr::processors::BoundingBox;
 use thiserror::Error;
 
 use super::{
-    ImagePoint, ImageQuad, ModelArtifactKind, ModelIdentity, ModelPaths, OcrEngine, OcrMode,
-    OcrOptions, OcrPage, OcrSpan, RenderPixelFormat, RenderedPage,
+    ImagePoint, ImageQuad, ImageRect, ModelArtifactKind, ModelIdentity, ModelPaths, OcrEngine,
+    OcrMode, OcrOptions, OcrPage, OcrSpan, RenderPixelFormat, RenderedPage,
 };
 
 /// Environment variable selecting the ONNX Runtime shared library.
@@ -577,6 +577,73 @@ impl OcrEngine for OarOcrEngine {
         } else {
             1
         }
+    }
+
+    /// Recognition alone on a crop of each region: no detection pass, so a
+    /// region covering part of a text line reads only that part, and a page
+    /// with a few undecodable runs costs a few recognizer calls rather than
+    /// a full-page OCR.
+    fn recognize_regions(
+        &self,
+        page: &RenderedPage,
+        regions: &[ImageRect],
+        options: &OcrOptions,
+    ) -> Result<Vec<Option<OcrSpan>>, Self::Error> {
+        validate_options(options)?;
+        if regions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let image = rendered_page_to_rgb(page)?;
+        let (width, height) = (image.width() as f32, image.height() as f32);
+        let recognizer = &self.workers[0].recognizer;
+        regions
+            .iter()
+            .map(|region| {
+                if ![region.left, region.top, region.right, region.bottom]
+                    .iter()
+                    .all(|edge| edge.is_finite())
+                {
+                    return Ok(None);
+                }
+                let left = region.left.floor().clamp(0.0, width);
+                let top = region.top.floor().clamp(0.0, height);
+                let right = region.right.ceil().clamp(0.0, width);
+                let bottom = region.bottom.ceil().clamp(0.0, height);
+                // Too thin to hold a glyph at any useful resolution.
+                if right - left < 2.0 || bottom - top < 2.0 {
+                    return Ok(None);
+                }
+                let crop = image::imageops::crop_imm(
+                    &image,
+                    left as u32,
+                    top as u32,
+                    (right - left) as u32,
+                    (bottom - top) as u32,
+                )
+                .to_image();
+                let recognized = recognizer.predict(vec![crop])?;
+                let (Some(text), Some(confidence)) = (
+                    recognized.texts.into_iter().next(),
+                    recognized.scores.into_iter().next(),
+                ) else {
+                    return Ok(None);
+                };
+                let text = text.trim();
+                if text.is_empty() || !confidence.is_finite() {
+                    return Ok(None);
+                }
+                let confidence = confidence.clamp(0.0, 1.0);
+                if confidence < options.minimum_confidence {
+                    return Ok(None);
+                }
+                Ok(Some(OcrSpan {
+                    text: text.to_string(),
+                    polygon: ImageRect::new(left, top, right, bottom).to_quad(),
+                    confidence,
+                    orientation_degrees: None,
+                }))
+            })
+            .collect()
     }
 }
 

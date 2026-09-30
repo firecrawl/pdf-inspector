@@ -2021,6 +2021,17 @@ fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
     }
 }
 
+/// Whether a fragment is drawn in a font that could not decode it: `Some(true)`
+/// for visible glyphs read as U+FFFD, `Some(false)` for decoded text, `None`
+/// for a fragment with no advance, which says nothing either way (a
+/// zero-width code a ToUnicode maps to U+FFFD merges as it always has).
+fn undecodable_run(item: &TextItem, text: &str) -> Option<bool> {
+    if effective_merge_width(item) <= 0.0 || text.trim().is_empty() {
+        return None;
+    }
+    Some(text.contains('\u{FFFD}'))
+}
+
 /// Bold and plain runs are kept apart whatever said they were bold: with
 /// `PositionOptions::bold_from_weight` the weight class has already had its
 /// say in `is_bold` (see `content_stream::read_bold_from_weight`), so runs
@@ -2264,6 +2275,10 @@ fn merge_text_items_with_clips(
             let mut box_right = first.x + first.width;
             let mut box_left = first.x;
 
+            // Whether the item being built is a run its font could not
+            // decode (see `undecodable_run`); `None` until a fragment says.
+            let mut run_undecodable = undecodable_run(first, &text);
+
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
             let tracked = if *preserve_stream_order || *bidi {
@@ -2391,7 +2406,17 @@ fn merge_text_items_with_clips(
                     _ => threshold,
                 };
                 let bold_boundary = next.is_bold != first.is_bold;
-                let explicit_bold_space = bold_boundary
+                // A run its font could not decode (U+FFFD) and a decoded run
+                // stay separate items, with the word-space decision taken here
+                // as at a bold boundary: the OCR pipeline crops and re-reads an
+                // undecodable run by its own box, which a merged item would
+                // widen to the whole line.
+                let next_undecodable = undecodable_run(next, next_text);
+                let undecodable_boundary = matches!(
+                    (run_undecodable, next_undecodable),
+                    (Some(run), Some(next)) if run != next
+                );
+                let explicit_bold_space = (bold_boundary || undecodable_boundary)
                     && (text.ends_with(char::is_whitespace)
                         || next_text.starts_with(char::is_whitespace));
                 // Numeric fragments have their own joining thresholds in
@@ -2423,10 +2448,11 @@ fn merge_text_items_with_clips(
                 // decision as an unstyled merge. Otherwise the later line
                 // assembler's wider joining threshold can glue words when
                 // newly recovered font flags split a previously merged run.
-                if bold_boundary {
+                if bold_boundary || undecodable_boundary {
                     break;
                 }
                 text.push_str(next_text);
+                run_undecodable = run_undecodable.or(next_undecodable);
                 legacy_symbol_rewrite |= next.legacy_symbol_rewrite;
                 box_right = box_right.max(next.x + next.width);
                 box_left = box_left.min(next.x);
