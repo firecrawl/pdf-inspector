@@ -1696,6 +1696,145 @@ pub(crate) fn snap_edges(values: &[f32], tolerance: f32) -> Vec<f32> {
     snapped
 }
 
+/// Cut a show-string that spans a drawn column rule into per-column pieces.
+///
+/// Generators that pad cells with spaces instead of positioning them emit one
+/// run for a whole row band: `"Concentração de hemoglobina corpuscular  MCHC"`
+/// is a label and an abbreviation two cells apart. Assignment goes by the
+/// run's centre, so both texts pile into one cell and the neighbouring column
+/// reads empty. A drawn column rule makes the crossing unambiguous, so cut
+/// the run at the padded gap the rule falls into. Only gaps of two or more
+/// spaces qualify: a single space is ordinary word spacing, and glyph-width
+/// estimates are far too coarse to cut a sentence apart.
+fn split_run_across_column_rules(item: &TextItem, col_edges: &[f32]) -> Option<Vec<TextItem>> {
+    /// Smallest slice of the run a rule must leave on either side.
+    const MIN_SIDE: f32 = 8.0;
+    /// Shortest space run that reads as cell padding rather than word spacing.
+    const MIN_PADDING_SPACES: usize = 2;
+
+    if !item.is_horizontal() || !item.advance_known || item.width <= 0.0 {
+        return None;
+    }
+    let chars: Vec<char> = item.text.chars().collect();
+    if chars.len() < 4 {
+        return None;
+    }
+    let left = item.x;
+    let right = item.x + item.width;
+
+    // Padded gaps as (first_space, after_last_space); a gap at either end
+    // would only shave whitespace off the run.
+    let mut gaps: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != ' ' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && chars[index] == ' ' {
+            index += 1;
+        }
+        if index - start >= MIN_PADDING_SPACES && start > 0 && index < chars.len() {
+            gaps.push((start, index));
+        }
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+
+    // Character positions are estimated from the run's own advance, so allow
+    // a couple of glyph widths of drift between a gap and the rule it marks.
+    let per_char = item.width / chars.len() as f32;
+    let tolerance = (per_char * 2.0).max(4.0);
+    let mut cuts: Vec<(f32, usize, usize)> = Vec::new();
+    for &edge in col_edges {
+        if edge <= left + MIN_SIDE || edge >= right - MIN_SIDE {
+            continue;
+        }
+        let nearest = gaps
+            .iter()
+            .map(|&(start, end)| {
+                let gap_left = left + per_char * start as f32;
+                let gap_right = left + per_char * end as f32;
+                let distance = if edge < gap_left {
+                    gap_left - edge
+                } else if edge > gap_right {
+                    edge - gap_right
+                } else {
+                    0.0
+                };
+                (distance, start, end)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((distance, start, end)) = nearest {
+            if distance <= tolerance {
+                cuts.push((edge, start, end));
+            }
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut fragments: Vec<TextItem> = Vec::new();
+    let mut char_start = 0usize;
+    let mut x_start = left;
+    for (edge, gap_start, gap_end) in cuts {
+        if gap_start < char_start || edge <= x_start {
+            continue;
+        }
+        let text: String = chars[char_start..gap_start].iter().collect();
+        push_run_fragment(&mut fragments, item, text, x_start, edge - x_start);
+        char_start = gap_end;
+        x_start = edge;
+    }
+    if char_start == 0 {
+        return None;
+    }
+    let text: String = chars[char_start..].iter().collect();
+    push_run_fragment(&mut fragments, item, text, x_start, right - x_start);
+
+    if fragments.len() < 2 {
+        return None;
+    }
+    // Prose double-spaces after a full stop sit wherever the sentence ends,
+    // which is sometimes right next to a rule. A padded cell break instead
+    // leaves a bare value on one side — an abbreviation, a code, a number —
+    // so accept the cut only when every piece but one is a single token, and
+    // that token reads as a value rather than as a word torn out of a
+    // sentence, which clause punctuation would give away.
+    let phrases = fragments
+        .iter()
+        .filter(|fragment| fragment.text.trim().contains(char::is_whitespace))
+        .count();
+    let torn_word = fragments.iter().any(|fragment| {
+        let value = fragment.text.trim();
+        !value.contains(char::is_whitespace) && value.ends_with([',', ';', ':'])
+    });
+    (phrases <= 1 && !torn_word).then_some(fragments)
+}
+
+/// Record one piece of a split run, keeping the original's styling.
+fn push_run_fragment(
+    fragments: &mut Vec<TextItem>,
+    item: &TextItem,
+    text: String,
+    x: f32,
+    width: f32,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    fragments.push(TextItem {
+        text,
+        x,
+        width,
+        ..item.clone()
+    });
+}
+
 /// Assign text items to grid cells defined by column/row edges.
 ///
 /// Returns `(cells, item_indices)` where `cells[row][col]` is the cell text
@@ -1709,6 +1848,21 @@ pub(crate) fn assign_items_to_grid(
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
 
+    // Runs that carry two space-padded cells cross a drawn column rule. Cut
+    // them up front so each piece can be placed in its own column; the pieces
+    // keep the original item's index, so the table still claims the run.
+    let mut split_fragments: Vec<(usize, TextItem)> = Vec::new();
+    let mut split_runs: HashSet<usize> = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        if item.page != page {
+            continue;
+        }
+        if let Some(fragments) = split_run_across_column_rules(item, col_edges) {
+            split_runs.insert(idx);
+            split_fragments.extend(fragments.into_iter().map(|fragment| (idx, fragment)));
+        }
+    }
+
     // Collect items per cell for proper sorting before joining
     let mut cell_items: Vec<Vec<Vec<(usize, &TextItem)>>> =
         vec![vec![Vec::new(); num_cols]; num_rows];
@@ -1719,10 +1873,16 @@ pub(crate) fn assign_items_to_grid(
     let row_centers: Vec<f32> = (0..num_rows)
         .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
         .collect();
-    for (idx, item) in items.iter().enumerate() {
-        if item.page != page {
-            continue;
-        }
+    let placements = items
+        .iter()
+        .enumerate()
+        .filter(|(idx, item)| item.page == page && !split_runs.contains(idx))
+        .chain(
+            split_fragments
+                .iter()
+                .map(|(idx, fragment)| (*idx, fragment)),
+        );
+    for (idx, item) in placements {
         // Use item center for assignment; a super/subscript run is assigned
         // by the body baseline it belongs to, not its own raised/lowered one.
         let cx = item.x + item.width / 2.0;
