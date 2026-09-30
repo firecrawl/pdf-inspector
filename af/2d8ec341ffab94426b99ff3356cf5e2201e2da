@@ -1,0 +1,19 @@
+SECURITY.md
+  s_44a612cef2d4f4::t_4c666ac1ac31f6 22-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "af2d8ec341ffab94426b99ff3356cf5e2201e2da",
+  "prompts": {},
+  "sessions": {
+    "s_44a612cef2d4f4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f0bc0790dffeBdTh311e51F9ky",
+        "model": "z-ai/glm-5.3"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
