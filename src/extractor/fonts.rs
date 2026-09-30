@@ -2532,6 +2532,12 @@ pub(crate) fn extract_text_from_operand(
     let is_type0_cid_font = font_widths
         .get(current_font)
         .is_some_and(|info| info.is_cid);
+    // A font the CMap collection found nothing to decode with (Identity-H/V,
+    // no ToUnicode, no usable program cmap or glyph names, no predefined
+    // collection, no plausible CID-as-Unicode reading).
+    let known_undecodable = font_tounicode_refs
+        .get(current_font)
+        .is_some_and(|&obj_num| font_cmaps.is_undecodable(obj_num));
     // A simple font (any font but Type0) shows one byte per code
     // (PDF 32000-1:2008, 9.6), whatever byte width its ToUnicode CMap
     // declares: a codespace written as `<0000> <FFFF>` over one-byte entries
@@ -2897,8 +2903,15 @@ pub(crate) fn extract_text_from_operand(
             // CID fonts with a CMap that couldn't decode: the CID is genuinely
             // unmapped. Don't fall through to text-interpretation fallbacks
             // (Latin-1, UTF-16, etc.) which would misinterpret CID bytes as
-            // character codes (e.g. CID 0x01A9 → Latin-1 "©").
-            if is_type0_cid_font && bytes.iter().any(|&b| b > 0x7F) {
+            // character codes (e.g. CID 0x01A9 → Latin-1 "©"). For a font
+            // known to be undecodable every byte pair names a CID even when
+            // both bytes are below 0x80: a glyph-indexed subset's `00 21` is
+            // glyph 33, not "!", and reading it as text would silently replace
+            // the run with unrelated characters (or drop it as control codes)
+            // instead of marking it for OCR. An empty string shows nothing.
+            if is_type0_cid_font
+                && ((known_undecodable && !bytes.is_empty()) || bytes.iter().any(|&b| b > 0x7F))
+            {
                 // 2-byte CIDs (Identity-H) are by far the common case; for
                 // an odd byte count we still emit at least one marker so
                 // detection downstream fires.
@@ -5437,6 +5450,59 @@ mod tests {
             text.contains('\u{FFFD}'),
             "CID font with unparseable CMap should emit U+FFFD so detect_encoding_issues fires: {text:?}"
         );
+    }
+
+    #[test]
+    fn undecodable_identity_font_marks_codes_below_0x80_but_not_empty_strings() {
+        // A glyph-indexed subset's CIDs are small, so both bytes of each
+        // code can sit below 0x80: `00 21 00 05` is glyphs 33 and 5. Read
+        // as text they become "!" and a dropped control code, and the run
+        // silently disappears; for a font the CMap collection found no way
+        // to decode, every pair is a CID, so each is marked instead.
+        let decode = |bytes: Vec<u8>, undecodable: bool| {
+            let obj = Object::String(bytes, lopdf::StringFormat::Hexadecimal);
+            let font_cmaps = if undecodable {
+                FontCMaps::with_undecodable(7)
+            } else {
+                FontCMaps::default()
+            };
+            let mut font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+            font_tounicode_refs.insert("F0".to_string(), 7);
+            let inline_cmaps = HashMap::new();
+            let font_encodings: PageFontEncodings = HashMap::new();
+            let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+            let mut decisions = CMapDecisionCache::new();
+            let mut font_widths: PageFontWidths = HashMap::new();
+            font_widths.insert("F0".to_string(), make_font_info(&[], 1000, true));
+            extract_text_from_operand(
+                &obj,
+                "F0",
+                None,
+                &font_cmaps,
+                &font_tounicode_refs,
+                &inline_cmaps,
+                &font_encodings,
+                &encoding_cache,
+                &mut decisions,
+                &font_widths,
+                &font_kinds("F0", true),
+            )
+            .map(|(text, _)| text)
+        };
+        assert_eq!(
+            decode(vec![0x00, 0x21, 0x00, 0x05], true).as_deref(),
+            Some("\u{FFFD}\u{FFFD}")
+        );
+        // An empty `()` or `<>` shows nothing, whatever the font.
+        assert!(!decode(Vec::new(), true)
+            .unwrap_or_default()
+            .contains('\u{FFFD}'));
+        // Nothing marked the font undecodable (its decoding was never
+        // determined, as in the fast collection): ASCII bytes keep their
+        // text reading.
+        assert!(!decode(vec![0x00, 0x21, 0x00, 0x05], false)
+            .unwrap_or_default()
+            .contains('\u{FFFD}'));
     }
 
     /// A page whose only font is the symbolic TrueType `F1` with the given

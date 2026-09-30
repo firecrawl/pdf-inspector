@@ -220,8 +220,17 @@ fn cid_to_gid_identity_is_absent_or_named() {
 #[test]
 fn identity_h_font_without_cmap_extracts_through_mac_order() {
     // With a CIDToGIDMap stream the CIDs are not glyph IDs, so the order is
-    // not applied and today's output stands: the CIDs as Latin-1 characters.
-    for (cid_to_gid, expected) in [(None, "How many"), (Some(vec![0u8; 8]), "+RZPDQ\\")] {
+    // not applied and nothing else decodes the font: every two-byte code of
+    // the Identity string is marked undecodable (one U+FFFD per CID) instead
+    // of being read as the Latin-1 characters "+RZPDQ\", which would pass for
+    // text and never reach OCR.
+    for (cid_to_gid, expected) in [
+        (None, "How many"),
+        (
+            Some(vec![0u8; 8]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}",
+        ),
+    ] {
         let mut doc = Document::with_version("1.5");
         let font_file = doc.add_object(Stream::new(
             dictionary! {},
@@ -345,4 +354,107 @@ fn mac_order_declines_a_unicode_keyed_font() {
         glyphs[code] = (true, 600);
     }
     assert!(build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).is_none());
+}
+
+/// The /W codes of a glyph-indexed subset that lost its cmap and names sit
+/// high enough (68–93, the lowercase letters of the Macintosh order) to pass
+/// for Unicode letters. Every one of them is a glyph of the embedded
+/// program, so under an Identity CIDToGIDMap they are its glyph indices and
+/// the CID-as-Unicode reading ("DEF…" for "abc…") is refused; with the
+/// program absent there is nothing to contradict it.
+#[test]
+fn cid_passthrough_refuses_codes_that_are_glyphs_of_the_embedded_program() {
+    let program = cmapless_truetype(&arial_like(&[556; 10], (false, 278)));
+    let mut w = Vec::new();
+    for gid in 68..=93 {
+        w.push(Object::Integer(gid));
+        w.push(Object::Array(vec![Object::Integer(556)]));
+    }
+    let cid_font = dictionary! {
+        "Subtype" => "CIDFontType2",
+        "W" => Object::Array(w),
+    };
+    let doc = Document::with_version("1.5");
+    assert!(crate::tounicode::cid_values_look_like_unicode(&cid_font));
+    assert!(!crate::tounicode::cid_passthrough_is_plausible(
+        &cid_font,
+        &doc,
+        Some(&program)
+    ));
+    assert!(crate::tounicode::cid_passthrough_is_plausible(
+        &cid_font, &doc, None
+    ));
+}
+
+/// Only the full collection decides a font is undecodable: the fast one
+/// skips the fallbacks that could have decoded it, so its extraction keeps
+/// the older readings rather than marking the codes.
+#[test]
+fn only_the_full_collection_marks_a_font_undecodable() {
+    let mut doc = Document::with_version("1.5");
+    let font_file = doc.add_object(Stream::new(
+        dictionary! {},
+        cmapless_truetype(&arial_like(&[556; 10], (false, 278))),
+    ));
+    let descriptor = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor", "FontName" => "ABCDEF+ArialMT", "Flags" => 4,
+        "FontFile2" => font_file,
+    });
+    // A CIDToGIDMap stream: the codes are not glyph indices, so the
+    // Macintosh order does not apply, and nothing else decodes the font.
+    let map_id = doc.add_object(Stream::new(dictionary! {}, vec![0u8; 8]));
+    let cid_font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "ABCDEF+ArialMT",
+        "CIDSystemInfo" => dictionary! { "Registry" => Object::string_literal("Adobe"), "Ordering" => Object::string_literal("Identity"), "Supplement" => 0 },
+        "FontDescriptor" => descriptor, "DW" => 600, "CIDToGIDMap" => map_id,
+    });
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "ABCDEF+ArialMT",
+        "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid_font)],
+    });
+    let content = doc.add_object(Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 40 700 Td <002B0052> Tj ET".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "Contents" => content,
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages", "Count" => 1, "Kids" => vec![Object::Reference(page_id)],
+    });
+    doc.get_object_mut(page_id)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Parent", pages_id);
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+
+    let key = font_file.0;
+    assert!(crate::tounicode::FontCMaps::from_doc(&doc).is_undecodable(key));
+    assert!(!crate::tounicode::FontCMaps::from_doc_pages_fast(&doc, None).is_undecodable(key));
+}
+
+/// The same subset with its widths written as one range (`[68 93 556]`, as
+/// producers write a run of equal advances): a range lists no used codes,
+/// but the codes it covers are still all glyphs of the program, so the
+/// glyph-index reading still rules out CID-as-Unicode.
+#[test]
+fn cid_passthrough_refuses_a_width_range_inside_the_embedded_program() {
+    let program = cmapless_truetype(&arial_like(&[556; 10], (false, 278)));
+    let cid_font = dictionary! {
+        "Subtype" => "CIDFontType2",
+        "W" => vec![Object::Integer(68), Object::Integer(93), Object::Integer(556)],
+    };
+    let doc = Document::with_version("1.5");
+    assert!(!crate::tounicode::cid_passthrough_is_plausible(
+        &cid_font,
+        &doc,
+        Some(&program)
+    ));
+    assert!(crate::tounicode::cid_passthrough_is_plausible(
+        &cid_font, &doc, None
+    ));
 }

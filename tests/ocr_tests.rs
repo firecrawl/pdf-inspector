@@ -187,6 +187,55 @@ fn auto_rejects_garbled_native_recovery_and_continues_to_ocr() {
     ));
 }
 
+#[cfg(all(feature = "ocr", feature = "render-pdfium"))]
+#[test]
+fn auto_reads_only_the_undecodable_runs_and_keeps_the_native_text() {
+    let Some(model_directory) = std::env::var_os(MODEL_DIRECTORY_ENV) else {
+        eprintln!("skipping OCR runtime test because {MODEL_DIRECTORY_ENV} is not set");
+        return;
+    };
+    let Some(_renderer) = load_renderer() else {
+        return;
+    };
+
+    let bytes = std::fs::read("tests/fixtures/undecodable_cid_runs.pdf").unwrap();
+    let ocr = OcrOptions::new()
+        .mode(OcrMode::Auto)
+        .model_directory(model_directory)
+        .model_downloads(ModelDownloadPolicy::Offline);
+    let mut options = OcrPdfOptions::new().ocr(ocr);
+    options.markdown.include_page_numbers = true;
+    let result = process_pdf_with_ocr_mem(&bytes, options).unwrap();
+
+    assert_eq!(result.pages_routed_to_ocr, vec![1, 2]);
+    assert!(!result.markdown.contains('\u{FFFD}'), "{}", result.markdown);
+    let compact: String = result.markdown.split_whitespace().collect();
+    assert!(
+        compact.contains("CONFIDENTIALREVIEWCOPY"),
+        "{}",
+        result.markdown
+    );
+    assert!(
+        result
+            .markdown
+            .contains("The auditors marked the plan APPROVED and noted no material weakness."),
+        "{}",
+        result.markdown
+    );
+    // The native lines are kept as extracted, not re-read by OCR.
+    assert!(result
+        .markdown
+        .contains("The committee reviewed the quarterly report and the attached schedules."));
+    for page in &result.pages {
+        assert_eq!(page.provenance.source, PageContentSource::Fused);
+        assert!(page
+            .provenance
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("read 1 of 1 text runs")));
+    }
+}
+
 fn recognize(
     model_directory: &std::ffi::OsStr,
     pages: &[RenderedPage],

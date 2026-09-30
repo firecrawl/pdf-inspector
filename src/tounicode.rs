@@ -3166,6 +3166,152 @@ pub(crate) fn cid_values_look_like_unicode(cid_font_dict: &lopdf::Dictionary) ->
     median >= 0x41
 }
 
+/// Whether an Identity-encoded CIDFont without a usable cmap may be read
+/// CID-as-Unicode.
+///
+/// [`cid_values_look_like_unicode`] only asks whether the /W codes sit high
+/// enough to be letters. Glyph indices of a large font sit just as high, and
+/// reading them as code points does not fail: it produces plausible-looking
+/// text in whatever script the indices land in (a Hangul face ordered by
+/// code point turns its glyphs into other Hangul syllables; a CJK face's
+/// indices land in Cyrillic, Arabic, Indic or CJK Extension A). Nothing
+/// downstream can tell that text from the real thing, so the passthrough is
+/// refused when the font itself contradicts it:
+///
+/// - **Glyph-indexed program.** A `CIDFontType2` with an Identity
+///   `CIDToGIDMap` shows code N with glyph N. When every code the /W array
+///   covers, listed or in a range, is a glyph its embedded program has, the
+///   codes are that program's glyph indices.
+/// - **Widths against scripts.** A full-width advance on a code point of a
+///   script no font sets full width (Hebrew, Arabic, Indic, Thai, Georgian,
+///   Ethiopic, …), or a narrow advance on an ideograph, Hangul syllable or
+///   kana, is a glyph read at the wrong code point.
+/// - **Code points text does not use.** C1 controls, surrogates and
+///   noncharacters, or a sizeable share of CJK Extension A, which running
+///   text almost never draws.
+pub(crate) fn cid_passthrough_is_plausible(
+    cid_font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    font_data: Option<&[u8]>,
+) -> bool {
+    if !cid_values_look_like_unicode(cid_font_dict) {
+        return false;
+    }
+    let Some(w_array) = cid_font_dict
+        .get(b"W")
+        .ok()
+        .and_then(|w| crate::extractor::fonts::resolve_array(doc, w))
+    else {
+        return false;
+    };
+    // For the statistics below only codes the array lists one by one
+    // (`c [w1 w2 …]`) count as glyphs the producer drew: a `c_first c_last w`
+    // range is a width table covering whatever falls inside it, often a
+    // whole block, and says nothing about which codes are used. The highest
+    // code the array covers either way bounds the glyph-index reading.
+    let mut widths: HashMap<u16, u16> = HashMap::new();
+    let mut max_code: u32 = 0;
+    let mut i = 0;
+    while i + 1 < w_array.len() && widths.len() < MAX_CID_W_EXPANSION {
+        let Ok(first) = doc
+            .dereference(&w_array[i])
+            .map(|(_, o)| o)
+            .and_then(Object::as_i64)
+        else {
+            i += 1;
+            continue;
+        };
+        match doc.dereference(&w_array[i + 1]).map(|(_, o)| o) {
+            Ok(Object::Array(list)) => {
+                for (offset, width) in list.iter().enumerate() {
+                    let (Ok(code), Some(width)) = (
+                        u16::try_from(first + offset as i64),
+                        width.as_float().ok().map(|w| w.max(0.0) as u16),
+                    ) else {
+                        continue;
+                    };
+                    max_code = max_code.max(u32::from(code));
+                    widths.insert(code, width);
+                }
+                i += 2;
+            }
+            Ok(last) => {
+                if let Some(last) = last.as_i64().ok().and_then(|last| u32::try_from(last).ok()) {
+                    max_code = max_code.max(last.min(u32::from(u16::MAX)));
+                }
+                i += 3;
+            }
+            Err(_) => i += 3,
+        }
+    }
+    // CID 0 is .notdef in every collection and says nothing either way.
+    widths.remove(&0);
+
+    let is_cid_font_type2 = cid_font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|name| name == b"CIDFontType2");
+    if is_cid_font_type2 && crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc) {
+        let glyph_count = font_data
+            .and_then(|data| ttf_parser::Face::parse(data, 0).ok())
+            .map(|face| u32::from(face.number_of_glyphs()));
+        if let Some(glyph_count) = glyph_count {
+            if max_code < glyph_count {
+                debug!(
+                    "CID passthrough refused: every /W code is a glyph of the embedded program ({max_code} < {glyph_count})"
+                );
+                return false;
+            }
+        }
+    }
+
+    if widths.is_empty() {
+        return true;
+    }
+
+    let total = widths.len();
+    let mut misplaced = 0usize;
+    let mut unusable = 0usize;
+    let mut extension_a = 0usize;
+    for (&cid, &width) in &widths {
+        let cp = u32::from(cid);
+        if matches!(cp, 0x7F..=0x9F | 0xD800..=0xDFFF | 0xFDD0..=0xFDEF) || cp & 0xFFFE == 0xFFFE {
+            unusable += 1;
+            continue;
+        }
+        if matches!(cp, 0x3400..=0x4DBF) {
+            extension_a += 1;
+        }
+        if width == 0 {
+            continue;
+        }
+        let narrow_only_script = matches!(
+            cp,
+            0x0530..=0x07FF | 0x0900..=0x0FFF | 0x1000..=0x10FF | 0x1200..=0x18AF
+        );
+        let full_width_block = matches!(
+            cp,
+            0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF
+        );
+        if (narrow_only_script && width >= 900) || (full_width_block && width <= 600) {
+            misplaced += 1;
+        }
+    }
+    let share_at_least =
+        |count: usize, percent: usize| count >= 3 && count * 100 >= total * percent;
+    if share_at_least(unusable, 2)
+        || share_at_least(misplaced, 10)
+        || share_at_least(extension_a, 10)
+    {
+        debug!(
+            "CID passthrough refused: {unusable} unusable, {misplaced} misplaced-width, {extension_a} Extension A of {total} /W codes"
+        );
+        return false;
+    }
+    true
+}
+
 fn record_unique_cid_range(start: u16, end: u16, seen: &mut HashSet<u16>) {
     if start > end {
         return;
@@ -3227,6 +3373,12 @@ fn build_cmap_from_cid_system_info(
 pub struct FontCMaps {
     /// Map of ToUnicode object number to CMap
     by_obj_num: HashMap<u32, CMapEntry>,
+    /// Lookup keys (see `get_font_file2_obj_num`) of Identity-H/V fonts
+    /// without ToUnicode that nothing decodes: no usable program cmap or
+    /// glyph names, no predefined collection, no plausible CID-as-Unicode
+    /// reading. Only the full collection decides this; the fast one leaves
+    /// it empty.
+    undecodable: HashSet<u32>,
 }
 
 /// Primary CMap plus optional alternative variants.
@@ -3266,6 +3418,7 @@ impl FontCMaps {
         skip_truetype_fallback: bool,
     ) -> Self {
         let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
+        let mut undecodable: HashSet<u32> = HashSet::new();
 
         for (page_num, &page_id) in doc.get_pages().iter() {
             if let Some(filter) = page_filter {
@@ -3279,16 +3432,20 @@ impl FontCMaps {
                 &fonts,
                 doc,
                 &mut by_obj_num,
+                &mut undecodable,
                 skip_truetype_fallback,
             );
 
             if !skip_truetype_fallback {
                 // Fonts inside Form XObjects referenced by this page
-                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
+                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num, &mut undecodable);
             }
         }
 
-        FontCMaps { by_obj_num }
+        FontCMaps {
+            by_obj_num,
+            undecodable,
+        }
     }
 
     /// Parse ToUnicode CMaps from a set of font dictionaries.
@@ -3298,14 +3455,16 @@ impl FontCMaps {
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+        undecodable: &mut HashSet<u32>,
     ) {
-        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
+        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, undecodable, false);
     }
 
     fn collect_cmaps_from_fonts_inner(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+        undecodable: &mut HashSet<u32>,
         skip_truetype_fallback: bool,
     ) {
         // First pass: collect ToUnicode CMaps
@@ -3473,7 +3632,13 @@ impl FontCMaps {
                     Object::Reference(r) => r.0,
                     _ => 0,
                 });
-            if lookup_key == 0 || by_obj_num.contains_key(&lookup_key) {
+            // A key already decided either way (a CMap, or found undecodable)
+            // is not evaluated again: the first font over a program settles
+            // it, as for the CMaps.
+            if lookup_key == 0
+                || by_obj_num.contains_key(&lookup_key)
+                || undecodable.contains(&lookup_key)
+            {
                 continue;
             }
 
@@ -3562,8 +3727,10 @@ impl FontCMaps {
             // ToUnicode. We detect this by checking the /W (widths) array: if CID values
             // fall in typical Unicode letter/digit ranges (0x41+), CIDs are likely Unicode.
             // If CIDs are low values (< 0x41), they're GIDs in a subset font.
+            // High codes can still be glyph indices of a large font; see
+            // `cid_passthrough_is_plausible` for when the font contradicts it.
             if !resolved {
-                if cid_values_look_like_unicode(cid_font_dict) {
+                if cid_passthrough_is_plausible(cid_font_dict, doc, font_data.as_deref()) {
                     debug!(
                         "Identity-H font obj={}: W array CIDs look like Unicode — using passthrough",
                         lookup_key
@@ -3584,6 +3751,7 @@ impl FontCMaps {
                         "Identity-H font obj={}: no decoding possible (stripped cmap, GID-based CIDs)",
                         lookup_key
                     );
+                    undecodable.insert(lookup_key);
                 }
             }
         }
@@ -3662,6 +3830,7 @@ impl FontCMaps {
         doc: &Document,
         page_id: ObjectId,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+        undecodable: &mut HashSet<u32>,
     ) {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
             Ok(r) => r,
@@ -3671,11 +3840,11 @@ impl FontCMaps {
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(resources, doc, by_obj_num, undecodable, &mut visited);
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(resources, doc, by_obj_num, undecodable, &mut visited);
             }
         }
     }
@@ -3685,6 +3854,7 @@ impl FontCMaps {
         resources: &lopdf::Dictionary,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
+        undecodable: &mut HashSet<u32>,
         visited: &mut HashSet<ObjectId>,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
@@ -3737,10 +3907,10 @@ impl FontCMaps {
                             fonts.insert(name.clone(), font);
                         }
                     }
-                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
+                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num, undecodable);
                 }
                 // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, undecodable, visited);
             }
         }
     }
@@ -3748,6 +3918,25 @@ impl FontCMaps {
     /// Get a CMap by ToUnicode object number
     pub fn get_by_obj(&self, obj_num: u32) -> Option<&CMapEntry> {
         self.by_obj_num.get(&obj_num)
+    }
+
+    /// Whether the font under this lookup key (see `get_font_file2_obj_num`)
+    /// is an Identity-H/V font the full collection found no way to decode.
+    /// A CIDFont without a FontDescriptor gets no lookup key at extraction,
+    /// so its text keeps the older single-byte reading rather than being
+    /// marked.
+    pub(crate) fn is_undecodable(&self, obj_num: u32) -> bool {
+        self.undecodable.contains(&obj_num)
+    }
+
+    /// Collection that knows only that the font under `obj_num` is
+    /// undecodable.
+    #[cfg(test)]
+    pub(crate) fn with_undecodable(obj_num: u32) -> Self {
+        Self {
+            by_obj_num: HashMap::new(),
+            undecodable: HashSet::from([obj_num]),
+        }
     }
 }
 
@@ -5545,6 +5734,104 @@ endbfrange
         let mut dict = lopdf::Dictionary::new();
         dict.set("W", Object::Array(w));
         assert!(cid_values_look_like_unicode(&dict));
+    }
+
+    /// A CIDFontType2 dict whose /W lists `codes`, each at `width`.
+    fn cid_font_with_widths(codes: &[u16], width: i64) -> lopdf::Dictionary {
+        let mut w = Vec::new();
+        for &code in codes {
+            w.push(Object::Integer(i64::from(code)));
+            w.push(Object::Array(vec![Object::Integer(width)]));
+        }
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Subtype", Object::Name(b"CIDFontType2".to_vec()));
+        dict.set("W", Object::Array(w));
+        dict
+    }
+
+    #[test]
+    fn cid_passthrough_accepts_codes_whose_widths_fit_their_scripts() {
+        let doc = Document::new();
+        let latin: Vec<u16> = (0x41..=0x5A).chain(0x61..=0x7A).collect();
+        assert!(cid_passthrough_is_plausible(
+            &cid_font_with_widths(&latin, 556),
+            &doc,
+            None
+        ));
+        let hangul: Vec<u16> = (0xAC00..0xAC40).collect();
+        assert!(cid_passthrough_is_plausible(
+            &cid_font_with_widths(&hangul, 1000),
+            &doc,
+            None
+        ));
+        let arabic: Vec<u16> = (0x0627..=0x064A).collect();
+        assert!(cid_passthrough_is_plausible(
+            &cid_font_with_widths(&arabic, 400),
+            &doc,
+            None
+        ));
+    }
+
+    #[test]
+    fn cid_passthrough_reads_width_ranges_as_tables_not_as_used_codes() {
+        // `[32 255 600]` gives every Latin-1 code one width; the C1 controls
+        // it spans are not codes the font draws.
+        let doc = Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Subtype", Object::Name(b"CIDFontType2".to_vec()));
+        dict.set(
+            "W",
+            Object::Array(vec![
+                Object::Integer(32),
+                Object::Integer(255),
+                Object::Integer(600),
+            ]),
+        );
+        assert!(cid_passthrough_is_plausible(&dict, &doc, None));
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Subtype", Object::Name(b"CIDFontType2".to_vec()));
+        dict.set(
+            "W",
+            Object::Array(vec![
+                Object::Integer(0x3400),
+                Object::Integer(0x9FFF),
+                Object::Integer(1000),
+            ]),
+        );
+        assert!(cid_passthrough_is_plausible(&dict, &doc, None));
+    }
+
+    #[test]
+    fn cid_passthrough_refuses_glyphs_read_at_the_wrong_code_points() {
+        // A CJK face's glyph indices land in scripts no font sets full width,
+        // or its narrow Latin glyphs land among the ideographs.
+        let doc = Document::new();
+        let arabic: Vec<u16> = (0x0627..=0x064A).collect();
+        assert!(!cid_passthrough_is_plausible(
+            &cid_font_with_widths(&arabic, 1000),
+            &doc,
+            None
+        ));
+        let ideographs: Vec<u16> = (0x4E00..0x4E40).collect();
+        assert!(!cid_passthrough_is_plausible(
+            &cid_font_with_widths(&ideographs, 500),
+            &doc,
+            None
+        ));
+        // CJK Extension A is almost never drawn by running text.
+        let extension_a: Vec<u16> = (0x3400..0x3440).collect();
+        assert!(!cid_passthrough_is_plausible(
+            &cid_font_with_widths(&extension_a, 1000),
+            &doc,
+            None
+        ));
+        // Surrogates and C1 controls are not characters at all.
+        let unusable: Vec<u16> = (0xD800..0xD810).chain(0x41..0x80).collect();
+        assert!(!cid_passthrough_is_plausible(
+            &cid_font_with_widths(&unusable, 600),
+            &doc,
+            None
+        ));
     }
 
     #[test]
