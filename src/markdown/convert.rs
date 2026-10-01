@@ -11,11 +11,14 @@ use super::analysis::{
     detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment,
     is_leader_continuation, is_toc_entry_line, is_toc_marker_heading, trailing_leader_dots,
 };
-use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
+use super::classify::{
+    format_list_item, is_caption_line, is_figure_caption_line, is_list_item,
+    starts_with_bullet_marker,
+};
 use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
-use super::{item_is_in_chart_region, MarkdownOptions, CHART_SEPARATOR_PAD};
+use super::{item_is_in_chart_region, HeadingMode, MarkdownOptions, CHART_SEPARATOR_PAD};
 
 /// Logical stream geometry for a page where one full-width chart separates
 /// two prose columns. Positioned non-text blocks use this same ordering so a
@@ -747,6 +750,7 @@ fn flush_page_tables_and_images(
 }
 
 /// Convert text lines to markdown, inserting tables and images at appropriate Y positions
+#[allow(clippy::too_many_arguments)]
 pub(super) fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
@@ -757,6 +761,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
     >,
+    outlines: Option<&[crate::outlines::OutlineItem]>,
 ) -> String {
     if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
         return String::new();
@@ -776,7 +781,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
     // Merge consecutive heading lines at the same level (e.g., wrapped titles)
-    let lines = merge_heading_lines(lines, base_size, &heading_tiers, struct_roles);
+    let lines = merge_heading_lines(lines, base_size, &heading_tiers, struct_roles, outlines);
 
     // Compute the typical line spacing for paragraph break detection.
     // For double-spaced documents (like legal/government PDFs), the normal
@@ -833,6 +838,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Detect struct heading levels that are overused (body text mistagged as headings)
     let overused_heading_levels = detect_overused_struct_heading_levels(&lines, struct_roles);
+
+    let page_outlines: Option<HashMap<u32, Vec<crate::outlines::OutlineItem>>> =
+        outlines.map(|items| {
+            let mut map: HashMap<u32, Vec<crate::outlines::OutlineItem>> = HashMap::new();
+            for item in items {
+                map.entry(item.page).or_default().push(item.clone());
+            }
+            map
+        });
 
     let mut output = String::new();
     let mut current_page = 0u32;
@@ -1075,10 +1089,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             in_code_block = false;
         }
 
+        let is_figure_h6 = options.figure_as_h6 && is_figure_caption_line(plain_trimmed);
         if struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::Caption))
-            || is_caption_line(plain_trimmed)
+            || (!is_figure_h6 && is_caption_line(plain_trimmed))
         {
             if in_paragraph {
                 output.push_str("\n\n");
@@ -1098,6 +1113,20 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             .as_ref()
             .and_then(struct_role_heading_level)
             .filter(|level| !overused_heading_levels.contains(level));
+
+        let has_outlines = page_outlines.as_ref().is_some_and(|m| !m.is_empty());
+
+        let outline_heading = if options.heading_mode != HeadingMode::HeuristicOnly {
+            page_outlines
+                .as_ref()
+                .and_then(|map| map.get(&line.page))
+                .and_then(|items| crate::outlines::match_outline_heading(line, items))
+        } else {
+            None
+        };
+
+        // Figure captions are preserved as the lowest-level outline tier (H6) when configured
+        let figure_heading = if is_figure_h6 { Some(6) } else { None };
 
         // Protect wrapped list items: when inside a list, a visually-continuing
         // line (same indent, line-wrap spacing) must not be reclassified as a
@@ -1124,6 +1153,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             .as_ref()
             .is_some_and(StructRole::is_non_heading_content);
         let heuristic_heading = if options.detect_headers
+            && (options.heading_mode != HeadingMode::OutlinesStrict || !has_outlines)
             && !non_heading_role
             && !wrapped_quoted_paragraph_lines.contains(&line_idx)
             && !is_code_line
@@ -1131,6 +1161,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !starts_with_bullet_marker(plain_trimmed)
+            && !is_caption_line(plain_trimmed)
             && !is_toc_entry_line(plain_trimmed)
             && !is_heading_fragment(plain_trimmed)
             && toc_suppress_page != Some(line.page)
@@ -1143,6 +1174,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 crate::markdown::analysis::line_is_mostly_bold(line),
             )
             .or_else(|| {
+                // When outlines exist in Auto mode, suppress the body-font bold rarity fallback
+                if has_outlines && options.heading_mode == HeadingMode::Auto {
+                    return None;
+                }
                 // Rarity-based heading detection (inspired by opendataloader).
                 // Heading probability scoring with lookahead context.
                 // Score = rarity * 0.5 + bold * 0.3 + standalone * 0.2
@@ -1196,7 +1231,22 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             None
         };
 
-        if let Some(level) = struct_heading.or(heuristic_heading) {
+        let heading_level = match options.heading_mode {
+            HeadingMode::OutlinesStrict => {
+                if has_outlines {
+                    struct_heading.or(outline_heading).or(figure_heading)
+                } else {
+                    struct_heading.or(figure_heading).or(heuristic_heading)
+                }
+            }
+            HeadingMode::Auto => struct_heading
+                .or(outline_heading)
+                .or(figure_heading)
+                .or(heuristic_heading),
+            HeadingMode::HeuristicOnly => struct_heading.or(figure_heading).or(heuristic_heading),
+        };
+
+        if let Some(level) = heading_level {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -1455,7 +1505,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let heading_tiers = compute_heading_tiers(&lines, base_size);
 
     // Merge consecutive heading lines at the same level (e.g., wrapped titles)
-    let lines = merge_heading_lines(lines, base_size, &heading_tiers, None);
+    let lines = merge_heading_lines(lines, base_size, &heading_tiers, None, None);
 
     // Compute the typical line spacing for paragraph break detection
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
@@ -1852,6 +1902,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::from([1]),
             None,
+            None,
         );
         let positions = [
             "Left column upper prose.",
@@ -1928,6 +1979,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         assert!(
@@ -1957,6 +2009,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         assert!(
@@ -1999,6 +2052,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         assert!(
@@ -2036,6 +2090,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         assert!(
@@ -2072,6 +2127,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         assert!(md.contains("# Title"), "H1 → #: {md}");
@@ -2101,6 +2157,7 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            None,
             None,
         );
 
@@ -2144,6 +2201,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         assert!(
@@ -2192,6 +2250,7 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            None,
             None,
         );
 
@@ -2295,6 +2354,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
+            None,
         );
 
         assert!(
@@ -2363,6 +2423,7 @@ mod tests {
                             HashMap::new(),
                             &HashMap::new(),
                             &HashSet::new(),
+                            None,
                             None,
                         ),
                     ];
@@ -2439,6 +2500,7 @@ mod tests {
                         HashMap::new(),
                         &HashMap::new(),
                         &HashSet::new(),
+                        None,
                         None,
                     ),
                 ];
@@ -2520,6 +2582,7 @@ mod tests {
                 &HashMap::new(),
                 &HashSet::new(),
                 None,
+                None,
             );
             assert!(
                 md.lines()
@@ -2536,6 +2599,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             Some(&roles),
+            None,
         );
         assert!(md.contains("## “Every member"), "{md}");
         assert!(md.contains("## so that anyone"), "{md}");
@@ -2571,6 +2635,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            None,
         );
 
         // Should produce a single fenced block, not three separate ones
@@ -2710,6 +2775,7 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            None,
             None,
         );
 
@@ -2876,6 +2942,221 @@ mod tests {
         assert!(
             !md.contains("Introduction.."),
             "a period is not a leader:\n{md}"
+        );
+    }
+
+    #[test]
+    fn test_outline_heading_detection() {
+        use crate::outlines::OutlineItem;
+
+        let outlines = vec![
+            OutlineItem {
+                title: "Chapter 1: The Foundation".to_string(),
+                level: 1,
+                page: 1,
+                dest_y: Some(720.0),
+            },
+            OutlineItem {
+                title: "1.1 Market Dynamics".to_string(),
+                level: 2,
+                page: 1,
+                dest_y: Some(600.0),
+            },
+        ];
+
+        let lines = vec![
+            make_line(vec![{
+                let mut item = make_item("Chapter 1: The Foundation", 1, None);
+                item.y = 720.0;
+                item.font_size = 12.0; // Same as body font size
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("Some introductory paragraph text.", 1, None);
+                item.y = 680.0;
+                item.font_size = 12.0;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("1.1 Market Dynamics", 1, None);
+                item.y = 600.0;
+                item.font_size = 12.0;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("More detailed discussion here.", 1, None);
+                item.y = 560.0;
+                item.font_size = 12.0;
+                item
+            }]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+            Some(&outlines),
+        );
+
+        assert!(
+            md.contains("# Chapter 1: The Foundation"),
+            "Level 1 outline should become H1 heading: {md}"
+        );
+        assert!(
+            md.contains("## 1.1 Market Dynamics"),
+            "Level 2 outline should become H2 heading: {md}"
+        );
+        assert!(
+            md.contains("Some introductory paragraph text."),
+            "Prose should remain normal: {md}"
+        );
+    }
+
+    #[test]
+    fn test_figure_caption_becomes_h6() {
+        let lines = vec![
+            make_line(vec![{
+                let mut item = make_item("Some introductory paragraph text.", 1, None);
+                item.y = 700.0;
+                item.font_size = 12.0;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("Figure 1.1: Daily Bar Chart of SPY", 1, None);
+                item.y = 650.0;
+                item.font_size = 11.0;
+                item.is_bold = true;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("Continuing discussion below the figure.", 1, None);
+                item.y = 600.0;
+                item.font_size = 12.0;
+                item
+            }]),
+        ];
+
+        let mut opts = MarkdownOptions::default().with_figure_as_h6(true);
+        opts.base_font_size = Some(12.0);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines.clone(),
+            opts,
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+            None,
+        );
+
+        assert!(
+            md.contains("###### Figure 1.1: Daily Bar Chart of SPY"),
+            "Figure caption should be formatted as H6 when figure_as_h6 is true: {md}"
+        );
+        assert!(
+            md.contains("Continuing discussion below the figure."),
+            "Prose should remain normal: {md}"
+        );
+
+        // Also verify default General profile keeps it as plain caption text
+        let default_md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+            None,
+        );
+        assert!(
+            !default_md.contains("###### Figure 1.1"),
+            "General profile should not turn figure captions into headings: {default_md}"
+        );
+        assert!(
+            default_md.contains("Figure 1.1: Daily Bar Chart of SPY"),
+            "General profile should preserve caption text in body: {default_md}"
+        );
+    }
+
+    #[test]
+    fn test_outlines_strict_suppresses_bold_body() {
+        use crate::outlines::OutlineItem;
+
+        let outlines = vec![OutlineItem {
+            title: "Chapter 1".to_string(),
+            level: 1,
+            page: 1,
+            dest_y: Some(720.0),
+        }];
+
+        let lines = vec![
+            make_line(vec![{
+                let mut item = make_item("Chapter 1", 1, None);
+                item.y = 720.0;
+                item.font_size = 14.0;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("Did You Know Most Traders Lose Money?", 1, None);
+                item.y = 650.0;
+                item.font_size = 12.0;
+                item.is_bold = true;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("Figure 1.2: Volatility Spike", 1, None);
+                item.y = 600.0;
+                item.font_size = 11.0;
+                item
+            }]),
+            make_line(vec![{
+                let mut item = make_item("Source: TradeStation Data", 1, None);
+                item.y = 550.0;
+                item.font_size = 10.0;
+                item
+            }]),
+        ];
+
+        let mut opts =
+            MarkdownOptions::default().with_document_profile(crate::DocumentProfile::Book);
+        opts.base_font_size = Some(12.0);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            opts,
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+            Some(&outlines),
+        );
+
+        assert!(
+            md.contains("# Chapter 1"),
+            "Outline heading should be H1: {md}"
+        );
+        assert!(
+            !md.contains("### Did You Know") && !md.contains("# Did You Know"),
+            "Bold body line should NOT become a heading under OutlinesStrict: {md}"
+        );
+        assert!(
+            md.contains("Did You Know Most Traders Lose Money?"),
+            "Bold body line must remain in prose: {md}"
+        );
+        assert!(
+            md.contains("###### Figure 1.2: Volatility Spike"),
+            "Figure caption should be H6: {md}"
+        );
+        assert!(
+            !md.contains("# Source:") && !md.contains("### Source:"),
+            "Caption prefix Source: must not become a heading: {md}"
         );
     }
 }

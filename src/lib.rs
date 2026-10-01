@@ -38,9 +38,10 @@ pub mod detector;
 pub mod extractor;
 mod form_bbox_repair;
 pub mod glyph_names;
-mod mac_glyph_order;
+pub mod mac_glyph_order;
 pub mod markdown;
 mod overlong_numerals;
+pub mod outlines;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
@@ -66,8 +67,10 @@ pub use extractor::{
 };
 pub use markdown::{
     export_images, to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
+    to_markdown_from_items_with_rects_and_page_count, DocumentProfile, HeadingMode,
+    MarkdownOptions, MarkdownProfile,
 };
+pub use outlines::{parse_outlines, OutlineItem};
 pub use process_mode::ProcessMode;
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
@@ -357,6 +360,24 @@ impl PdfOptions {
     pub fn with_image_dir(mut self, dir: impl Into<String>) -> Self {
         self.markdown.include_images = true;
         self.markdown.image_dir = Some(dir.into());
+        self
+    }
+
+    /// Set the heading detection mode.
+    pub fn heading_mode(mut self, mode: HeadingMode) -> Self {
+        self.markdown.heading_mode = mode;
+        self
+    }
+
+    /// Set the document profile, configuring coordinated presets.
+    pub fn document_profile(mut self, profile: DocumentProfile) -> Self {
+        self.markdown = self.markdown.with_document_profile(profile);
+        self
+    }
+
+    /// Preserve Figure/Chart captions as H6 headings.
+    pub fn figure_as_h6(mut self, enabled: bool) -> Self {
+        self.markdown.figure_as_h6 = enabled;
         self
     }
 }
@@ -826,6 +847,7 @@ fn extract_pages_markdown_mem_impl(
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
                     precomputed_chart_regions: Some(&chart_regions),
+                    outlines: None,
                 },
             )
         };
@@ -4752,6 +4774,18 @@ fn process_document(
         })
         .unwrap_or((None, Vec::new()));
 
+    // Parse outlines (bookmarks / table of contents) from document catalog
+    let doc_outlines = outlines::parse_outlines(&doc);
+    let outlines = if doc_outlines.is_empty() {
+        None
+    } else {
+        log::debug!(
+            "PDF outlines: {} outline items parsed from document",
+            doc_outlines.len()
+        );
+        Some(doc_outlines)
+    };
+
     let (
         markdown,
         layout,
@@ -4891,6 +4925,7 @@ fn process_document(
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
                         precomputed_chart_regions: Some(&chart_regions),
+                        outlines: outlines.as_deref(),
                     },
                 ))
             };

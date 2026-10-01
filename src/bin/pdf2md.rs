@@ -537,6 +537,8 @@ fn print_layout_info(layout: &LayoutComplexity) {
 }
 
 const VALUE_OPTIONS: &[&str] = &[
+    "--headings",
+    "--profile",
     "--image-dir",
     "--select-pages",
     "--password",
@@ -563,6 +565,12 @@ fn print_usage(argv0: &str) {
     eprintln!("  --items-json        Output positioned TextItem JSON");
     eprintln!("  --raw               Output only markdown (no headers)");
     eprintln!("  --compact           Collapse token-heavy source formatting such as dot leaders");
+    eprintln!(
+        "  --profile PROFILE   Document genre profile: general, book, academic (default: general)"
+    );
+    eprintln!("  --headings MODE     Heading detection mode: auto, outlines, or heuristic (default: auto)");
+    eprintln!("  --outlines-only     Alias for --headings outlines (only bookmark entries become headings)");
+    eprintln!("  --figure-as-h6      Preserve Figure/Chart captions as H6 headings (default in book profile)");
     eprintln!("  --images            Extract embedded images and embed markdown links");
     eprintln!("  --extract-images    Alias for --images");
     eprintln!("  --image-dir DIR     Directory to save extracted images (implies --images)");
@@ -646,6 +654,47 @@ fn main() {
     let extract_images = args
         .iter()
         .any(|a| a == "--images" || a == "--extract-images");
+    let figure_as_h6 = args.iter().any(|a| a == "--figure-as-h6");
+    let profile_argument = argument_value(&args, "--profile").unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    });
+    let document_profile = match profile_argument {
+        Some("book") => pdf_inspector::DocumentProfile::Book,
+        Some("academic") | Some("paper") => pdf_inspector::DocumentProfile::Academic,
+        Some("general") | None => pdf_inspector::DocumentProfile::General,
+        Some(other) => {
+            eprintln!(
+                "Error: invalid --profile value: {other:?} (expected general, book, or academic)"
+            );
+            process::exit(1);
+        }
+    };
+    let headings_argument = argument_value(&args, "--headings").unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    });
+    let outlines_only = args.iter().any(|a| a == "--outlines-only");
+    let heading_mode = match headings_argument {
+        Some("outlines") | Some("strict") | Some("outlines-strict") => {
+            pdf_inspector::HeadingMode::OutlinesStrict
+        }
+        Some("heuristic") | Some("heuristics") => pdf_inspector::HeadingMode::HeuristicOnly,
+        Some("auto") => pdf_inspector::HeadingMode::Auto,
+        Some(other) => {
+            eprintln!(
+                "Error: invalid --headings value: {other:?} (expected auto, outlines, or heuristic)"
+            );
+            process::exit(1);
+        }
+        None => {
+            if outlines_only || document_profile == pdf_inspector::DocumentProfile::Book {
+                pdf_inspector::HeadingMode::OutlinesStrict
+            } else {
+                pdf_inspector::HeadingMode::Auto
+            }
+        }
+    };
     let image_dir_argument = argument_value(&args, "--image-dir").unwrap_or_else(|error| {
         eprintln!("Error: {error}");
         process::exit(1);
@@ -775,7 +824,8 @@ fn main() {
             if args.iter().any(|argument| argument == "--ocr-offline") {
                 ocr = ocr.model_downloads(ModelDownloadPolicy::Offline);
             }
-            let mut markdown = pdf_inspector::MarkdownOptions::default();
+            let mut markdown =
+                pdf_inspector::MarkdownOptions::default().with_document_profile(document_profile);
             if compact_output {
                 markdown.profile = pdf_inspector::MarkdownProfile::Compact;
             }
@@ -786,6 +836,10 @@ fn main() {
             if let Some(ref dir) = resolved_image_dir {
                 markdown.include_images = true;
                 markdown.image_dir = Some(dir.clone());
+            }
+            markdown.heading_mode = heading_mode;
+            if figure_as_h6 {
+                markdown.figure_as_h6 = true;
             }
             let mut pdf_options = OcrPdfOptions::new()
                 .render(RenderOptions::new().dpi(dpi))
@@ -862,7 +916,9 @@ fn main() {
         ProcessMode::Full
     };
 
-    let mut options = PdfOptions::new().mode(process_mode);
+    let mut options = PdfOptions::new()
+        .mode(process_mode)
+        .document_profile(document_profile);
     if compact_output {
         options.markdown.profile = pdf_inspector::MarkdownProfile::Compact;
     }
@@ -880,6 +936,10 @@ fn main() {
     if let Some(ref dir) = resolved_image_dir {
         options.markdown.include_images = true;
         options.markdown.image_dir = Some(dir.clone());
+    }
+    options.markdown.heading_mode = heading_mode;
+    if figure_as_h6 {
+        options.markdown.figure_as_h6 = true;
     }
 
     match process_pdf_with_options(pdf_path, options) {

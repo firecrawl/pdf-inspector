@@ -11194,3 +11194,212 @@ fn test_image_extraction_and_markdown_linking() {
     let entries: Vec<_> = std::fs::read_dir(&img_dir).unwrap().collect();
     assert!(!entries.is_empty(), "should have exported images");
 }
+
+#[test]
+fn test_drop_cap_paragraph_extraction() {
+    use pdf_inspector::markdown::to_markdown_from_items;
+    use pdf_inspector::MarkdownOptions;
+
+    let mut drop_cap = make_text_item("T", 50.0, 686.0, 36.0, 1);
+    drop_cap.width = 24.0;
+    drop_cap.font = "Times-Roman".to_string();
+
+    let mut line1 = make_text_item(
+        "here is something fascinating and mesmerizing about price movements in actively",
+        78.0,
+        700.0,
+        12.0,
+        1,
+    );
+    line1.width = 400.0;
+    line1.font = "Times-Roman".to_string();
+
+    let mut line2 = make_text_item(
+        "traded markets; academics, researchers, traders, and analysts are drawn to study",
+        78.0,
+        686.0,
+        12.0,
+        1,
+    );
+    line2.width = 400.0;
+    line2.font = "Times-Roman".to_string();
+
+    let mut line3 = make_text_item(
+        "markets, perhaps captivated as much by the patterns in the market as by the",
+        50.0,
+        672.0,
+        12.0,
+        1,
+    );
+    line3.width = 428.0;
+    line3.font = "Times-Roman".to_string();
+
+    let items = vec![drop_cap, line1, line2, line3];
+    let md = to_markdown_from_items(items, MarkdownOptions::default());
+
+    // Must NOT be treated as a heading # Tmarkets...
+    assert!(!md.contains("# T"));
+    assert!(!md.contains('#'));
+    // Must start with "There is something..."
+    assert!(md.contains(
+        "There is something fascinating and mesmerizing about price movements in actively"
+    ));
+    // Must seamlessly contain subsequent lines
+    assert!(md.contains(
+        "traded markets; academics, researchers, traders, and analysts are drawn to study"
+    ));
+    assert!(
+        md.contains("markets, perhaps captivated as much by the patterns in the market as by the")
+    );
+}
+
+fn synthetic_outline_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+    let outlines_id = doc.new_object_id();
+    let item1_id = doc.new_object_id();
+    let item2_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        // Heading 1 line at Y=700
+        Operation::new("Td", vec![50.into(), 700.into()]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("Chapter 1: The Foundation")],
+        ),
+        // Body text at Y=660
+        Operation::new("Td", vec![0.into(), Object::Integer(-40)]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("This is introductory text.")],
+        ),
+        // Heading 2 line at Y=500
+        Operation::new("Td", vec![0.into(), Object::Integer(-160)]),
+        Operation::new("Tj", vec![Object::string_literal("1.1 Market Dynamics")]),
+        // Body text at Y=460
+        Operation::new("Td", vec![0.into(), Object::Integer(-40)]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("Detailed discussion of markets.")],
+        ),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+
+    // Outlines tree: Root outlines dict -> item1 (H1) -> First -> item2 (H2)
+    doc.objects.insert(
+        outlines_id,
+        dictionary! {
+            "Type" => "Outlines",
+            "First" => item1_id,
+            "Last" => item1_id,
+            "Count" => 2,
+        }
+        .into(),
+    );
+
+    doc.objects.insert(
+        item1_id,
+        dictionary! {
+            "Title" => Object::string_literal("Chapter 1: The Foundation"),
+            "Parent" => outlines_id,
+            "First" => item2_id,
+            "Last" => item2_id,
+            "Count" => 1,
+            "Dest" => vec![page_id.into(), "XYZ".into(), 50.into(), 700.into(), Object::Null],
+        }
+        .into(),
+    );
+
+    doc.objects.insert(
+        item2_id,
+        dictionary! {
+            "Title" => Object::string_literal("1.1 Market Dynamics"),
+            "Parent" => item1_id,
+            "Dest" => vec![page_id.into(), "XYZ".into(), 50.into(), 500.into(), Object::Null],
+        }
+        .into(),
+    );
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "Outlines" => outlines_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_pdf_outlines_heading_extraction() {
+    let pdf_bytes = synthetic_outline_pdf();
+    let result = pdf_inspector::process_pdf_mem(&pdf_bytes).unwrap();
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.expect("markdown should be generated");
+
+    assert!(
+        md.contains("# Chapter 1: The Foundation"),
+        "Top-level outline item should produce H1: {md}"
+    );
+    assert!(
+        md.contains("## 1.1 Market Dynamics"),
+        "Child outline item should produce H2: {md}"
+    );
+    assert!(
+        md.contains("This is introductory text."),
+        "Body text should be preserved: {md}"
+    );
+    assert!(
+        md.contains("Detailed discussion of markets."),
+        "Body text should be preserved: {md}"
+    );
+}

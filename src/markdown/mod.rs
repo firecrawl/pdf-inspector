@@ -1258,11 +1258,46 @@ pub enum MarkdownProfile {
     Compact,
 }
 
+/// Preset document profile targeting specific document genres.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocumentProfile {
+    /// Standard balanced extraction for general documents.
+    #[default]
+    General,
+    /// Optimized for published books, manuals, and eBooks:
+    /// - HeadingMode: OutlinesStrict (when outlines exist)
+    /// - Preserves Figure captions as H6 outlines
+    /// - Removes running headers/footers
+    Book,
+    /// Optimized for academic and technical papers:
+    /// - HeadingMode: Auto (font-size heuristics with numbering)
+    /// - Column flow reading order
+    Academic,
+}
+
+/// Policy for heading detection and outline authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeadingMode {
+    /// Outline-first when outlines exist (suppresses body-font bold heuristics);
+    /// falls back to visual heuristics when no outlines are present. This is the default.
+    #[default]
+    Auto,
+    /// Outlines (and PDF struct tree) are the sole authority for H1..H5 headings.
+    /// Heuristic heading detection is disabled when outlines are available.
+    OutlinesStrict,
+    /// Pure visual and font-size heuristics; outlines are ignored.
+    HeuristicOnly,
+}
+
 /// Options for markdown conversion
 #[derive(Debug, Clone)]
 pub struct MarkdownOptions {
     /// Source-fidelity versus token-efficient post-processing policy.
     pub profile: MarkdownProfile,
+    /// Document genre profile
+    pub document_profile: DocumentProfile,
+    /// Heading detection mode
+    pub heading_mode: HeadingMode,
     /// Detect headers by font size
     pub detect_headers: bool,
     /// Detect list items
@@ -1300,9 +1335,35 @@ pub struct MarkdownOptions {
     /// AcroForm field values and content-stream destination markers
     /// (`P1: OTA/XYZ`, `P2: DEST/...`). When false these are removed.
     pub include_form_fields: bool,
+    /// Preserve Figure/Chart captions as H6 headings (`###### Figure 1.1`).
+    /// Enabled by default in `DocumentProfile::Book`.
+    pub figure_as_h6: bool,
 }
 
 impl MarkdownOptions {
+    /// Set the document profile, adjusting defaults accordingly.
+    pub fn with_document_profile(mut self, profile: DocumentProfile) -> Self {
+        self.document_profile = profile;
+        match profile {
+            DocumentProfile::Book => {
+                self.heading_mode = HeadingMode::OutlinesStrict;
+                self.strip_headers_footers = true;
+                self.figure_as_h6 = true;
+            }
+            DocumentProfile::Academic => {
+                self.heading_mode = HeadingMode::Auto;
+            }
+            DocumentProfile::General => {}
+        }
+        self
+    }
+
+    /// Preserve Figure/Chart captions as H6 headings.
+    pub fn with_figure_as_h6(mut self, enabled: bool) -> Self {
+        self.figure_as_h6 = enabled;
+        self
+    }
+
     /// Enable or disable image inclusion in Markdown.
     pub fn with_images(mut self, include: bool) -> Self {
         self.include_images = include;
@@ -1315,12 +1376,20 @@ impl MarkdownOptions {
         self.image_dir = Some(dir.into());
         self
     }
+
+    /// Set the heading detection mode.
+    pub fn with_heading_mode(mut self, mode: HeadingMode) -> Self {
+        self.heading_mode = mode;
+        self
+    }
 }
 
 impl Default for MarkdownOptions {
     fn default() -> Self {
         Self {
             profile: MarkdownProfile::default(),
+            document_profile: DocumentProfile::default(),
+            heading_mode: HeadingMode::default(),
             detect_headers: true,
             detect_lists: true,
             detect_code: true,
@@ -1346,6 +1415,7 @@ impl Default for MarkdownOptions {
             include_page_numbers: false,
             strip_headers_footers: true,
             include_form_fields: true,
+            figure_as_h6: false,
         }
     }
 }
@@ -1491,6 +1561,7 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            outlines: None,
         },
     )
 }
@@ -1511,6 +1582,9 @@ pub(crate) struct MarkdownDocumentContext<'a> {
     /// Optional chart masks shared with layout analysis so the geometry is
     /// detected once and interpreted identically by both pipelines.
     pub(crate) precomputed_chart_regions: Option<&'a PageChartRegions>,
+    /// Optional PDF Outlines (bookmarks / table of contents) extracted from
+    /// the document catalog.
+    pub(crate) outlines: Option<&'a [crate::outlines::OutlineItem]>,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -1557,6 +1631,7 @@ pub(crate) fn complete_table_markdown_from_items(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            outlines: None,
         },
         TableOutputMode::CompleteTables,
     );
@@ -1596,6 +1671,7 @@ fn convert_items_with_rects_lines_and_table_output(
         prefiltered_page_number_pages,
         prefiltered_page_number_mask,
         precomputed_chart_regions,
+        outlines,
     } = context;
 
     if items.is_empty() {
@@ -2514,6 +2590,7 @@ fn convert_items_with_rects_lines_and_table_output(
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
+        outlines,
     );
     MarkdownConversionOutput {
         markdown,
@@ -2868,6 +2945,7 @@ mod tests {
                 prefiltered_page_number_pages: Some(&removed_pages),
                 prefiltered_page_number_mask: Some(&removal_mask),
                 precomputed_chart_regions: None,
+                outlines: None,
             },
         );
 
@@ -3624,6 +3702,9 @@ mod tests {
 
     #[test]
     fn markdown_generation_with_image_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap();
+
         let text_item = make_item(50.0, 700.0, 1);
         let mut img_item = make_item(50.0, 600.0, 1);
         img_item.text = "[Image: Im0]".to_string();
@@ -3633,13 +3714,15 @@ mod tests {
 
         let mut opts = MarkdownOptions::default();
         opts.include_images = true;
-        opts.image_dir = Some("my_images".to_string());
+        opts.image_dir = Some(dir_str.to_string());
 
         let md = to_markdown_from_items(vec![text_item, img_item], opts);
+        let expected_link = format!("![Image: Im0]({dir_str}/page_1_Im0.jpg)");
         assert!(
-            md.contains("![Image: Im0](my_images/page_1_Im0.jpg)"),
+            md.contains(&expected_link),
             "Markdown should contain image link with image_dir path, got: {md}"
         );
+        assert!(temp_dir.path().join("page_1_Im0.jpg").exists());
     }
 
     #[test]
