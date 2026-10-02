@@ -4838,6 +4838,10 @@ fn process_document(
                 &lines,
                 &chart_regions,
             );
+            // `layout_items` is a second copy of the document's text items and
+            // is dead once layout complexity is known. Release it before the
+            // Markdown stage, which is the high-water mark of the run.
+            drop(layout_items);
 
             let md = if options.mode == ProcessMode::Analyze {
                 None
@@ -6742,11 +6746,36 @@ fn compute_layout_complexity_with_chart_regions(
     let font_stats = calculate_font_stats_from_items(items);
     let base_size = font_stats.most_common_size;
 
+    // Partition by page once. Rescanning the whole document on every page made
+    // both loops below O(pages x items), which dominated long documents.
+    // Each bucket keeps document order, so per-page results are unchanged.
+    let mut items_by_page: HashMap<u32, Vec<&types::TextItem>> = HashMap::new();
+    for item in items {
+        items_by_page.entry(item.page).or_default().push(item);
+    }
+    let mut column_items_by_page: HashMap<u32, Vec<&types::TextItem>> = HashMap::new();
+    for item in column_items {
+        column_items_by_page
+            .entry(item.page)
+            .or_default()
+            .push(item);
+    }
+    let mut rects_by_page: HashMap<u32, Vec<&types::PdfRect>> = HashMap::new();
+    for rect in rects {
+        rects_by_page.entry(rect.page).or_default().push(rect);
+    }
+    let mut lines_by_page: HashMap<u32, Vec<&types::PdfLine>> = HashMap::new();
+    for line in lines {
+        lines_by_page.entry(line.page).or_default().push(line);
+    }
+
     // --- Tables: use rect-based → line-based → heuristic detectors per page,
     //     with side-by-side band splitting ---
     let mut pages_with_tables: Vec<u32> = Vec::new();
     for &page in &seen_pages {
-        let page_items: Vec<&types::TextItem> = items.iter().filter(|i| i.page == page).collect();
+        let page_items = items_by_page.get(&page).map_or(&[][..], |v| v.as_slice());
+        let page_rects = rects_by_page.get(&page).map_or(&[][..], |v| v.as_slice());
+        let page_lines = lines_by_page.get(&page).map_or(&[][..], |v| v.as_slice());
 
         // Check for side-by-side layout
         let owned_items: Vec<types::TextItem> = page_items.iter().map(|i| (*i).clone()).collect();
@@ -6777,15 +6806,15 @@ fn compute_layout_complexity_with_chart_regions(
                 .collect();
 
             let band_rects: Vec<types::PdfRect> = if x_lo == f32::MIN {
-                rects.iter().filter(|r| r.page == page).cloned().collect()
+                page_rects.iter().map(|r| (*r).clone()).collect()
             } else {
-                markdown::filter_rects_to_band(rects, page, x_lo, x_hi)
+                markdown::filter_rects_to_band(page_rects.iter().copied(), page, x_lo, x_hi)
             };
 
             let band_lines: Vec<types::PdfLine> = if x_lo == f32::MIN {
-                lines.iter().filter(|l| l.page == page).cloned().collect()
+                page_lines.iter().map(|l| (*l).clone()).collect()
             } else {
-                markdown::filter_lines_to_band(lines, page, x_lo, x_hi)
+                markdown::filter_lines_to_band(page_lines.iter().copied(), page, x_lo, x_hi)
             };
 
             // TOC pages route through the table detector but render as flat
@@ -6828,12 +6857,12 @@ fn compute_layout_complexity_with_chart_regions(
             .get(&page)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let page_column_items: Vec<types::TextItem> = column_items
+        let page_column_items: Vec<types::TextItem> = column_items_by_page
+            .get(&page)
+            .map_or(&[][..], |v| v.as_slice())
             .iter()
-            .filter(|item| {
-                item.page == page && !markdown::item_is_in_chart_region(item, chart_regions)
-            })
-            .cloned()
+            .filter(|item| !markdown::item_is_in_chart_region(item, chart_regions))
+            .map(|item| (*item).clone())
             .collect();
         let cols =
             extractor::detect_columns(&page_column_items, page, pages_with_tables.contains(&page));

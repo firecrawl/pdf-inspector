@@ -37,10 +37,11 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
 /// (parentheses) are NOT stripped — only top-level comments.
-fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
-    // Quick check: if no '%' present, return as-is (common case)
+fn strip_pdf_comments(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    // Quick check: if no '%' present, borrow as-is (common case) rather than
+    // copying a whole page's content stream.
     if !data.contains(&b'%') {
-        return data.to_vec();
+        return std::borrow::Cow::Borrowed(data);
     }
 
     let mut result = Vec::with_capacity(data.len());
@@ -94,7 +95,14 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
         i += 1;
     }
 
-    result
+    // A `%` that only occurs inside a string or hex literal leaves every byte
+    // untouched, so the scan reproduces the input exactly. Borrow in that case
+    // rather than handing back a copy of the whole page's stream.
+    if result == data {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        std::borrow::Cow::Owned(result)
+    }
 }
 
 fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
@@ -601,10 +609,11 @@ pub(crate) fn extract_page_text_items_with_options(
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
     // Content::decode parser, causing it to skip operators like ET and Q.
-    let content_data = strip_pdf_comments(&content_data);
+    let stripped_data = strip_pdf_comments(&content_data);
+    let content_data = stripped_data.as_ref();
 
     let content = match super::content_decode::decode_content_bounded(
-        &content_data,
+        content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     )? {
         Some(content) => content,
@@ -4561,22 +4570,22 @@ end"#;
         // Basic comment stripping
         let input = b"BT\n% comment\nTj\nET\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, b"BT\n \nTj\nET\n");
+        assert_eq!(output.as_ref(), b"BT\n \nTj\nET\n");
 
         // No comments = unchanged
         let input = b"BT\nTj\nET\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, input.to_vec());
+        assert_eq!(output.as_ref(), input);
 
         // Don't strip inside string literals
         let input = b"(text with % not a comment)\n% real comment\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, b"(text with % not a comment)\n \n");
+        assert_eq!(output.as_ref(), b"(text with % not a comment)\n \n");
 
         // Don't strip inside hex strings
         let input = b"<0033% not a comment>\n% real comment\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, b"<0033% not a comment>\n \n");
+        assert_eq!(output.as_ref(), b"<0033% not a comment>\n \n");
 
         // PD4ML style: comment between Tj and ET
         let input = b"<0033> Tj\n\t% Mission Statement\n\tET\n";
@@ -4595,19 +4604,45 @@ end"#;
         // glyphs to `%` and to escaped parens in the same TJ array).
         let input = b"[ (a\\)b) 1 (%) 1 (c) ] TJ\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, input.to_vec());
+        assert_eq!(output.as_ref(), input);
 
         // Same for an escaped `\(` — must not open a phantom string that
         // shields a real comment.
         let input = b"(x\\(y) Tj % real comment\nET\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, b"(x\\(y) Tj  \nET\n");
+        assert_eq!(output.as_ref(), b"(x\\(y) Tj  \nET\n");
 
         // Escaped backslash before a real close-paren: `\\` ends the escape,
         // the `)` does close the string, and the comment is stripped.
         let input = b"(x\\\\) Tj % comment\nET\n";
         let output = strip_pdf_comments(input);
-        assert_eq!(output, b"(x\\\\) Tj  \nET\n");
+        assert_eq!(output.as_ref(), b"(x\\\\) Tj  \nET\n");
+
+        // A `%` that only occurs inside a string leaves the stream unchanged,
+        // so the result borrows the input instead of copying it.
+        let input = b"[ (50%) 1 (%) ] TJ\nBT\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output.as_ref(), input);
+        assert!(
+            matches!(output, std::borrow::Cow::Borrowed(_)),
+            "unchanged stream should be borrowed, not copied"
+        );
+
+        // Same for a `%` inside a hex string.
+        let input = b"<2530> Tj\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output.as_ref(), input);
+        assert!(
+            matches!(output, std::borrow::Cow::Borrowed(_)),
+            "unchanged stream should be borrowed, not copied"
+        );
+
+        // A real comment alongside a `%` in a string is still stripped, so the
+        // result owns its buffer.
+        let input = b"(50%) Tj % comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output.as_ref(), b"(50%) Tj  \nET\n");
+        assert!(matches!(output, std::borrow::Cow::Owned(_)));
     }
 
     #[test]

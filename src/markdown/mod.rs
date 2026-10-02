@@ -136,23 +136,30 @@ pub(crate) fn chart_regions_by_page(
     rects: &[PdfRect],
     lines: &[PdfLine],
 ) -> PageChartRegions {
-    let mut page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
-    for item in items.iter().filter(|item| {
-        matches!(
+    // Group by page as indices, not clones: cloning every item up front held a
+    // second copy of the whole document for the length of the scan. The
+    // detectors below still need owned per-page items, so materialise one
+    // page at a time and drop it before the next.
+    let mut page_items: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (idx, item) in items.iter().enumerate() {
+        if matches!(
             &item.item_type,
             crate::types::ItemType::Text | crate::types::ItemType::FormField
-        )
-    }) {
-        page_items.entry(item.page).or_default().push(item.clone());
+        ) {
+            page_items.entry(item.page).or_default().push(idx as u32);
+        }
     }
 
     page_items
         .into_iter()
-        .filter_map(|(page, items)| {
-            let rect_regions = crate::tables::detect_chart_regions(&items, rects, page);
+        .filter_map(|(page, indices)| {
+            let page_items: Vec<TextItem> =
+                indices.iter().map(|&i| items[i as usize].clone()).collect();
+            let rect_regions =
+                crate::tables::chart_regions_from_layout_items(&page_items, rects, page);
             let line_regions = crate::tables::detect_dense_line_chart_regions(lines, rects, page)
                 .into_iter()
-                .filter(|&region| chart_region_separates_prose_columns(&items, region));
+                .filter(|&region| chart_region_separates_prose_columns(&page_items, region));
             let regions = merge_chart_regions(rect_regions.into_iter().chain(line_regions));
             (!regions.is_empty()).then_some((page, regions))
         })
@@ -1189,15 +1196,15 @@ fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> 
 /// Excludes rects that extend significantly beyond the band (e.g. page-wide
 /// background stripes spanning both side-by-side tables). A rect must have
 /// at least 70% of its width inside the band to be included.
-pub(crate) fn filter_rects_to_band(
-    rects: &[PdfRect],
+pub(crate) fn filter_rects_to_band<'a>(
+    rects: impl IntoIterator<Item = &'a PdfRect>,
     page: u32,
     x_lo: f32,
     x_hi: f32,
 ) -> Vec<PdfRect> {
     let band_width = x_hi - x_lo;
     rects
-        .iter()
+        .into_iter()
         .filter(|r| {
             r.page == page && {
                 let rx_min = if r.width >= 0.0 { r.x } else { r.x + r.width };
@@ -1225,14 +1232,14 @@ pub(crate) fn filter_rects_to_band(
 type BandSpec = (Vec<TextItem>, Vec<usize>, Vec<PdfRect>, Vec<PdfLine>);
 
 /// Filter PDF lines to those overlapping an X band.
-pub(crate) fn filter_lines_to_band(
-    lines: &[PdfLine],
+pub(crate) fn filter_lines_to_band<'a>(
+    lines: impl IntoIterator<Item = &'a PdfLine>,
     page: u32,
     x_lo: f32,
     x_hi: f32,
 ) -> Vec<PdfLine> {
     lines
-        .iter()
+        .into_iter()
         .filter(|l| {
             l.page == page && {
                 let lx_min = l.x1.min(l.x2);
@@ -1736,8 +1743,8 @@ fn convert_items_with_rects_lines_and_table_output(
                         .filter(|(_, item)| item.x >= x_lo - margin && item.x < x_hi + margin)
                         .map(|(idx, item)| (item.clone(), idx))
                         .unzip();
-                    let band_rects = filter_rects_to_band(rects, page, x_lo, x_hi);
-                    let band_lines = filter_lines_to_band(pdf_lines, page, x_lo, x_hi);
+                    let band_rects = filter_rects_to_band(rects.iter(), page, x_lo, x_hi);
+                    let band_lines = filter_lines_to_band(pdf_lines.iter(), page, x_lo, x_hi);
                     (items_in_band, idx_map, band_rects, band_lines)
                 })
                 .collect()
