@@ -100,24 +100,36 @@ fn union_bucket_pairs(
     bucket: &[usize],
     tolerance: f32,
 ) {
+    let capped = rects.len() > MAX_CLUSTER_RECTS;
     let m = bucket.len();
+    // Wide rects are replicated into every cell they span, so the same pair is
+    // re-tested in each shared cell. Once a cell's rects are all in one
+    // component every remaining `union` is a no-op, so the whole cell can be
+    // skipped. Only legal when the pair cap below provably cannot fire, since
+    // skipping also skips those counter increments.
+    if m * m.saturating_sub(1) / 2 <= MAX_CLUSTER_PAIRS_PER_CELL && m > 1 {
+        let root = uf.find(bucket[0]);
+        if bucket[1..].iter().all(|&j| uf.find(j) == root) {
+            return;
+        }
+    }
     let mut pairs = 0usize;
     'cell: for a in 0..m {
         let i = bucket[a];
-        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+        if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
         for &j in &bucket[a + 1..] {
             if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
                 break 'cell;
             }
-            if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+            if capped && uf.component_size(j) >= MAX_CLUSTER_RECTS {
                 continue;
             }
             pairs += 1;
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
-                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
                     break;
                 }
             }
@@ -134,7 +146,8 @@ fn union_rect_against_bands(
     hi: i32,
     tolerance: f32,
 ) {
-    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+    let capped = rects.len() > MAX_CLUSTER_RECTS;
+    if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
         return;
     }
     let mut pairs = 0usize;
@@ -147,13 +160,13 @@ fn union_rect_against_bands(
             if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
                 return;
             }
-            if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
+            if i == j || (capped && uf.component_size(j) >= MAX_CLUSTER_RECTS) {
                 continue;
             }
             pairs += 1;
             if rects_overlap(&rects[i], &rects[j], tolerance) {
                 uf.union(i, j);
-                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
                     return;
                 }
             }
@@ -191,6 +204,11 @@ pub(crate) fn cluster_rects(
     let n = rects.len();
     let mut uf = UnionFind::new(n);
     let cell = CLUSTER_GRID_CELL.max(tolerance * 4.0);
+    // A component can never hold more than `n` rects, so below
+    // MAX_CLUSTER_RECTS the size guards in the union helpers are dead.
+    // Skipping them drops two `find` calls per candidate pair without changing
+    // which pairs run or the order they union in, so the partition and its
+    // root indices are identical.
 
     let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
     let mut large: Vec<usize> = Vec::new();
@@ -220,8 +238,9 @@ pub(crate) fn cluster_rects(
 
     // Oversized spans skip insert. Range-query occupied cells they cover so
     // later X-ranges are not starved and we do not scan unrelated rows.
+    let capped = n > MAX_CLUSTER_RECTS;
     for &i in &large {
-        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+        if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
         let (x, y, w, h) = rects[i];
@@ -241,22 +260,22 @@ pub(crate) fn cluster_rects(
                     if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
                         break;
                     }
-                    if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                    if capped && uf.component_size(j) >= MAX_CLUSTER_RECTS {
                         continue;
                     }
                     pairs += 1;
                     if rects_overlap(&rects[i], &rects[j], tolerance) {
                         uf.union(i, j);
-                        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                        if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
                             break;
                         }
                     }
                 }
-                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
                     break;
                 }
             }
-            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            if capped && uf.component_size(i) >= MAX_CLUSTER_RECTS {
                 break;
             }
         }
@@ -457,7 +476,16 @@ pub fn detect_chart_regions(
         .filter(|i| crate::extractor::is_text_layout_item(i))
         .cloned()
         .collect();
-    let items = items_owned.as_slice();
+    chart_regions_from_layout_items(&items_owned, rects, page)
+}
+
+/// [`detect_chart_regions`] for callers that already hold only
+/// `is_text_layout_item` items, so the filter-and-clone copy is redundant.
+pub(crate) fn chart_regions_from_layout_items(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+) -> Vec<(f32, f32, f32, f32)> {
     let page_rects: Vec<(f32, f32, f32, f32)> = rects
         .iter()
         .filter(|r| r.page == page)
@@ -2553,6 +2581,315 @@ fn has_external_segmented_bar_labels(
     labeled_rows >= 2 && labeled_rows * 2 >= geometry.row_bands.len()
 }
 
+/// A bar-family candidate's four measured axes, in one orientation.
+///
+/// Vertical bars read position from x and breadth from width; the horizontal
+/// pass swaps the two (`BarAxes::horizontal`).
+struct BarAxes {
+    pos: Vec<f32>,
+    breadth: Vec<f32>,
+    length: Vec<f32>,
+    along: Vec<f32>,
+}
+
+impl BarAxes {
+    fn vertical(rects: &[(f32, f32, f32, f32)]) -> Self {
+        Self {
+            pos: rects.iter().map(|r| r.0).collect(),
+            breadth: rects.iter().map(|r| r.2).collect(),
+            length: rects.iter().map(|r| r.3).collect(),
+            along: rects.iter().map(|r| r.1).collect(),
+        }
+    }
+
+    fn horizontal(rects: &[(f32, f32, f32, f32)]) -> Self {
+        Self {
+            pos: rects.iter().map(|r| r.1).collect(),
+            breadth: rects.iter().map(|r| r.3).collect(),
+            length: rects.iter().map(|r| r.2).collect(),
+            along: rects.iter().map(|r| r.0).collect(),
+        }
+    }
+}
+
+/// Per-item "reads as a number" flags, computed at most once per cluster and
+/// only once some candidate bar family actually needs them.
+#[derive(Default)]
+struct NumericLabels(std::cell::OnceCell<Vec<bool>>);
+
+impl NumericLabels {
+    fn get(&self, items: &[TextItem]) -> &[bool] {
+        self.0
+            .get_or_init(|| items.iter().map(item_is_numeric_or_empty).collect())
+    }
+}
+
+/// Whether a text item's glyphs read as a number (or as nothing at all).
+///
+/// Precomputed once per cluster so the per-bar label test below is a plain
+/// lookup: the test used to re-tokenize every string for every candidate bar,
+/// which is what made wide clusters expensive.
+fn item_is_numeric_or_empty(item: &TextItem) -> bool {
+    let t = item.text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let data = t
+        .chars()
+        .filter(|c| c.is_ascii_digit() || ",.%-".contains(*c))
+        .count();
+    data * 2 >= t.chars().count()
+}
+
+/// How many of `family` have a partner in another bar column at the same
+/// height and length — the "grid rows disguise as bars" test.
+///
+/// Counts only far enough to settle `matched * 5 >= len * 3`, and answers
+/// each partner query from a 3x3 neighbourhood index over (along, length)
+/// rather than rescanning the family, so a wide cluster stays linear instead
+/// of turning into a quadratic scan per candidate width.
+fn count_grid_matched_partners(axes: &BarAxes, family: &[u32]) -> usize {
+    const CELL: f32 = 3.0;
+
+    // Cell size equals the tolerance, so a partner within tolerance is at
+    // most one cell away on each axis; the 3x3 neighbourhood is a superset
+    // and each candidate is confirmed exactly below.
+    let cell_of = |v: f32| -> i64 { (v / CELL).floor() as i64 };
+    let mut buckets: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+    for &i in family {
+        buckets
+            .entry((
+                cell_of(axes.along[i as usize]),
+                cell_of(axes.length[i as usize]),
+            ))
+            .or_default()
+            .push(i);
+    }
+
+    let has_partner = |i: u32| -> bool {
+        let ri = i as usize;
+        let (ca, cl) = (cell_of(axes.along[ri]), cell_of(axes.length[ri]));
+        for da in -1..=1i64 {
+            for dl in -1..=1i64 {
+                let Some(candidates) = buckets.get(&(ca + da, cl + dl)) else {
+                    continue;
+                };
+                for &s in candidates {
+                    let rs = s as usize;
+                    if (axes.pos[rs] - axes.pos[ri]).abs() > 2.0
+                        && (axes.along[rs] - axes.along[ri]).abs() <= 3.0
+                        && (axes.length[rs] - axes.length[ri]).abs() <= 3.0
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    let limit = family.len() * 3;
+    let mut matched = 0usize;
+    for &i in family {
+        if has_partner(i) {
+            matched += 1;
+            // The caller only compares `matched * 5` against `limit`, so once
+            // the line is crossed the exact count no longer matters.
+            if matched * 5 >= limit {
+                return matched;
+            }
+        }
+    }
+    matched
+}
+
+/// Bars: the dominant equal-width family, arranged in >=2 spaced columns
+/// (inter-column gap >= half a bar width — table cell rects touch), with
+/// data-driven height variation (checkbox/cell grids are uniform).
+/// Mirrored predicate catches horizontal bar charts.
+/// Everything a bar-family verdict needs that depends only on *which* rects
+/// the family holds — never on the anchor's own width.
+///
+/// Two anchors that select the same equal-width family reach the same verdict,
+/// so this is computed once per distinct family and reused across anchors. On
+/// a dense page hundreds of anchors share one family, and recomputing per
+/// anchor is what made cluster scanning quadratic in practice.
+struct BarFamilyShape {
+    /// Distinct bar-column positions, in the family's own (cluster) order.
+    positions: Vec<f32>,
+    len_min: f32,
+    len_max: f32,
+    /// Rects with a same-height, same-length partner in another column.
+    matched: usize,
+    /// Rects whose label box holds only numbers or nothing.
+    numeric: usize,
+    len: usize,
+}
+
+fn bar_family_shape(
+    axes: &BarAxes,
+    rects: &[(f32, f32, f32, f32)],
+    family: &[u32],
+    items: &[TextItem],
+    items_numeric: &NumericLabels,
+    page: u32,
+) -> BarFamilyShape {
+    let items_numeric = items_numeric.get(items);
+    // Distinct positions along the axis (bar columns).
+    let mut positions: Vec<f32> = Vec::with_capacity(family.len());
+    for &i in family {
+        let p = axes.pos[i as usize];
+        if !positions.iter().any(|&q| (q - p).abs() <= 2.0) {
+            positions.push(p);
+        }
+    }
+    positions.sort_by(|a, b| a.total_cmp(b));
+
+    let mut len_min = f32::INFINITY;
+    let mut len_max = f32::NEG_INFINITY;
+    for &i in family {
+        let li = axes.length[i as usize];
+        len_min = len_min.min(li);
+        len_max = len_max.max(li);
+    }
+
+    // Grid rows disguise as bars: a table's cell rects have same-y,
+    // same-height partners in other columns (uniform row heights).
+    // Chart segments start where the previous datum ended, so their extents
+    // rarely pair up across positions.
+    let matched = count_grid_matched_partners(axes, family);
+
+    // Any number of numeric data labels is chart-like; a single run of word
+    // text inside means a table cell.
+    let mut numeric = 0usize;
+    for &i in family {
+        let (rx, ry, rw, rh) = rects[i as usize];
+        if items.iter().zip(items_numeric).all(|(it, &num)| {
+            if it.page != page {
+                return true;
+            }
+            let cx = it.x + it.width / 2.0;
+            !(cx >= rx && cx <= rx + rw && it.y >= ry && it.y <= ry + rh) || num
+        }) {
+            numeric += 1;
+        }
+    }
+
+    BarFamilyShape {
+        positions,
+        len_min,
+        len_max,
+        matched,
+        numeric,
+        len: family.len(),
+    }
+}
+
+fn has_bar_family(
+    axes: &BarAxes,
+    rects: &[(f32, f32, f32, f32)],
+    items: &[TextItem],
+    items_numeric: &NumericLabels,
+    page: u32,
+) -> bool {
+    let n = axes.breadth.len();
+    if n == 0 {
+        return false;
+    }
+
+    // Widths ascending, so each anchor's equal-width band is a contiguous
+    // range found by binary search instead of a rescan of the whole cluster.
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by(|&a, &b| axes.breadth[a as usize].total_cmp(&axes.breadth[b as usize]));
+
+    // Cache of the last family shape, keyed by the window it came from and by
+    // how much of that window the anchor's length cutoff admitted. Both only
+    // grow as the anchor width grows, so a run of similar anchors hits the
+    // cache instead of rebuilding it.
+    let mut cache_window: (usize, usize) = (usize::MAX, usize::MAX);
+    let mut cache_len_order: Vec<u32> = Vec::new();
+    let mut cache_admitted = usize::MAX;
+    let mut cache_shape: Option<BarFamilyShape> = None;
+
+    // Scratch for one family, reused across anchors.
+    let mut family: Vec<u32> = Vec::new();
+
+    for &anchor in &order {
+        let bw = axes.breadth[anchor as usize];
+        if bw <= 0.0 {
+            // Sorted ascending: no later anchor has a positive breadth.
+            break;
+        }
+        let tol = (bw * 0.1).max(2.0);
+        let lo = order.partition_point(|&i| axes.breadth[i as usize] < bw - tol);
+        let hi = order.partition_point(|&i| axes.breadth[i as usize] <= bw + tol);
+
+        if hi - lo < 4 {
+            continue;
+        }
+        // The family is this width window minus zero-length and over-long
+        // rects. Sort the window by length so the anchor's cutoff selects a
+        // prefix, then restore cluster order — the position dedup below is
+        // order-sensitive, so the family must be walked as the cluster
+        // itself is ordered.
+        if cache_window != (lo, hi) {
+            cache_len_order.clear();
+            cache_len_order.extend(
+                order[lo..hi]
+                    .iter()
+                    .copied()
+                    .filter(|&i| axes.length[i as usize] > 0.0),
+            );
+            cache_len_order.sort_unstable_by(|&a, &b| {
+                axes.length[a as usize].total_cmp(&axes.length[b as usize])
+            });
+            cache_window = (lo, hi);
+            cache_admitted = usize::MAX;
+        }
+        let admitted = cache_len_order.partition_point(|&i| axes.length[i as usize] < bw * 20.0);
+        if admitted < 4 {
+            continue;
+        }
+        if cache_admitted != admitted || cache_shape.is_none() {
+            family.clear();
+            family.extend_from_slice(&cache_len_order[..admitted]);
+            family.sort_unstable();
+            cache_shape = Some(bar_family_shape(
+                axes,
+                rects,
+                &family,
+                items,
+                items_numeric,
+                page,
+            ));
+            cache_admitted = admitted;
+        }
+        let shape = cache_shape.as_ref().expect("shape computed just above");
+        if shape.positions.len() < 2 {
+            continue;
+        }
+        let min_gap = shape
+            .positions
+            .windows(2)
+            .map(|w| w[1] - w[0] - bw)
+            .fold(f32::INFINITY, f32::min);
+        if min_gap < bw * 0.5 {
+            continue;
+        }
+        // Data-driven variation along the bar direction.
+        if shape.len_max < shape.len_min * 1.3 {
+            continue;
+        }
+        if shape.matched * 5 >= shape.len * 3 {
+            continue;
+        }
+        if shape.numeric * 3 >= shape.len * 2 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Recognize filled vertical or horizontal bars whose geometry and labels are
 /// data-driven rather than uniform table cells.
 fn has_chart_bar_signature(
@@ -2560,106 +2897,26 @@ fn has_chart_bar_signature(
     group_rects: &[(f32, f32, f32, f32)],
     page: u32,
 ) -> bool {
-    let numeric_or_empty = |(rx, ry, rw, rh): (f32, f32, f32, f32)| {
-        let inside: Vec<&TextItem> = items
-            .iter()
-            .filter(|it| {
-                let cx = it.x + it.width / 2.0;
-                it.page == page && cx >= rx && cx <= rx + rw && it.y >= ry && it.y <= ry + rh
-            })
-            .collect();
-        // Any number of numeric data labels is chart-like; a single run of
-        // word text inside means a table cell.
-        inside.iter().all(|it| {
-            let t = it.text.trim();
-            let data = t
-                .chars()
-                .filter(|c| c.is_ascii_digit() || ",.%-".contains(*c))
-                .count();
-            t.is_empty() || data * 2 >= t.chars().count()
-        })
-    };
-
-    // Bars: the dominant equal-width family, arranged in >=2 spaced columns
-    // (inter-column gap >= half a bar width — table cell rects touch), with
-    // data-driven height variation (checkbox/cell grids are uniform).
-    // Mirrored predicate catches horizontal bar charts.
-    let bar_family = |pos: fn(&(f32, f32, f32, f32)) -> f32,
-                      breadth: fn(&(f32, f32, f32, f32)) -> f32,
-                      length: fn(&(f32, f32, f32, f32)) -> f32,
-                      along: fn(&(f32, f32, f32, f32)) -> f32| {
-        group_rects.iter().any(|anchor| {
-            let bw = breadth(anchor);
-            if bw <= 0.0 {
-                return false;
-            }
-            let family: Vec<&(f32, f32, f32, f32)> = group_rects
-                .iter()
-                .filter(|r| {
-                    (breadth(r) - bw).abs() <= (bw * 0.1).max(2.0)
-                        && length(r) > 0.0
-                        && length(r) < bw * 20.0
-                })
-                .collect();
-            if family.len() < 4 {
-                return false;
-            }
-            // Distinct positions along the axis (bar columns).
-            let mut positions: Vec<f32> = Vec::new();
-            for r in &family {
-                let p = pos(r);
-                if !positions.iter().any(|&q| (q - p).abs() <= 2.0) {
-                    positions.push(p);
-                }
-            }
-            if positions.len() < 2 {
-                return false;
-            }
-            positions.sort_by(|a, b| a.total_cmp(b));
-            let min_gap = positions
-                .windows(2)
-                .map(|w| w[1] - w[0] - bw)
-                .fold(f32::INFINITY, f32::min);
-            if min_gap < bw * 0.5 {
-                return false;
-            }
-            // Data-driven variation along the bar direction.
-            let len_min = family
-                .iter()
-                .map(|r| length(r))
-                .fold(f32::INFINITY, f32::min);
-            let len_max = family
-                .iter()
-                .map(|r| length(r))
-                .fold(f32::NEG_INFINITY, f32::max);
-            if len_max < len_min * 1.3 {
-                return false;
-            }
-            // Grid rows disguise as bars: a table's cell rects have same-y,
-            // same-height partners in other columns (uniform row heights).
-            // Chart segments start where the previous datum ended, so their
-            // extents rarely pair up across positions.
-            let matched = family
-                .iter()
-                .filter(|r| {
-                    family.iter().any(|s| {
-                        (pos(s) - pos(r)).abs() > 2.0
-                            && (along(s) - along(r)).abs() <= 3.0
-                            && (length(s) - length(r)).abs() <= 3.0
-                    })
-                })
-                .count();
-            if matched * 5 >= family.len() * 3 {
-                return false;
-            }
-            family.iter().filter(|r| numeric_or_empty(***r)).count() * 3 >= family.len() * 2
-        })
-    };
+    // Filled on first use: most clusters are rejected before any label is
+    // read, and tokenizing every item up front cost more than it saved.
+    let items_numeric = NumericLabels::default();
 
     // vertical bars: position/breadth = x/width, length = height, along = y
-    bar_family(|r| r.0, |r| r.2, |r| r.3, |r| r.1)
-        // horizontal bars: position/breadth = y/height, length = width, along = x
-        || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
+    has_bar_family(
+        &BarAxes::vertical(group_rects),
+        group_rects,
+        items,
+        &items_numeric,
+        page,
+    )
+    // horizontal bars: position/breadth = y/height, length = width, along = x
+    || has_bar_family(
+        &BarAxes::horizontal(group_rects),
+        group_rects,
+        items,
+        &items_numeric,
+        page,
+    )
 }
 
 fn is_chart_bar_cluster(
