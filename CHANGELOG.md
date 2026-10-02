@@ -7,6 +7,27 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Chart detection and layout complexity scoring no longer take time
+  proportional to pages times items. Both walked the whole document once per
+  page, so a long document paid for every page on every page. The bar axes of
+  a chart are now derived once per page, the shapes of overlapping bar
+  families are remembered rather than re-probed, grid-matched partners are
+  counted through a spatial index, and numeric labels are built only for the
+  pages that need them. Rect clustering skips the lookups that its own size
+  and pair caps make unreachable, without changing which rects it groups.
+  Layout complexity partitions items, rects and lines by page once instead
+  of rescanning the document, and the folio-cleaned copy of the text items is
+  released before Markdown conversion. A 430-page report with many charts
+  converts about 10x faster, a 269-page report about 3x, and peak memory on
+  the former falls from 59.9 MB to 54.0 MB. Markdown and JSON output is
+  unchanged.
+- A page's content stream is no longer copied when it holds no `%` comment
+  to strip.
+
 ## [1.25.2] - 2026-09-28
 
 Changes since 1.25.1.
