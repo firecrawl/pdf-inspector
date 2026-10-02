@@ -107,7 +107,9 @@ fn union_bucket_pairs(
     // component every remaining `union` is a no-op, so the whole cell can be
     // skipped. Only legal when the pair cap below provably cannot fire, since
     // skipping also skips those counter increments.
-    if m * m.saturating_sub(1) / 2 <= MAX_CLUSTER_PAIRS_PER_CELL && m > 1 {
+    // Saturating, not wrapping: a wrapped product could land under the cap and
+    // wrongly take the skip below, dropping unions this cell still needs.
+    if m.saturating_mul(m.saturating_sub(1)) / 2 <= MAX_CLUSTER_PAIRS_PER_CELL && m > 1 {
         let root = uf.find(bucket[0]);
         if bucket[1..].iter().all(|&j| uf.find(j) == root) {
             return;

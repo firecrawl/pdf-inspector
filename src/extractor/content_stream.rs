@@ -95,7 +95,14 @@ fn strip_pdf_comments(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         i += 1;
     }
 
-    std::borrow::Cow::Owned(result)
+    // A `%` that only occurs inside a string or hex literal leaves every byte
+    // untouched, so the scan reproduces the input exactly. Borrow in that case
+    // rather than handing back a copy of the whole page's stream.
+    if result == data {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        std::borrow::Cow::Owned(result)
+    }
 }
 
 fn transform_path_point(x: f32, y: f32, ctm: &[f32; 6]) -> (f32, f32) {
@@ -4610,6 +4617,32 @@ end"#;
         let input = b"(x\\\\) Tj % comment\nET\n";
         let output = strip_pdf_comments(input);
         assert_eq!(output.as_ref(), b"(x\\\\) Tj  \nET\n");
+
+        // A `%` that only occurs inside a string leaves the stream unchanged,
+        // so the result borrows the input instead of copying it.
+        let input = b"[ (50%) 1 (%) ] TJ\nBT\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output.as_ref(), input);
+        assert!(
+            matches!(output, std::borrow::Cow::Borrowed(_)),
+            "unchanged stream should be borrowed, not copied"
+        );
+
+        // Same for a `%` inside a hex string.
+        let input = b"<2530> Tj\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output.as_ref(), input);
+        assert!(
+            matches!(output, std::borrow::Cow::Borrowed(_)),
+            "unchanged stream should be borrowed, not copied"
+        );
+
+        // A real comment alongside a `%` in a string is still stripped, so the
+        // result owns its buffer.
+        let input = b"(50%) Tj % comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output.as_ref(), b"(50%) Tj  \nET\n");
+        assert!(matches!(output, std::borrow::Cow::Owned(_)));
     }
 
     #[test]
