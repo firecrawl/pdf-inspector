@@ -114,6 +114,62 @@ pub(crate) fn extract_image_from_stream(
         return Ok(Some((stream.content.clone(), "jp2".to_string())));
     }
 
+    // JBIG2 bi-level image stream
+    let is_jbig2 = match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => name == b"JBIG2Decode",
+        Ok(Object::Array(arr)) => arr
+            .iter()
+            .any(|item| item.as_name().map(|n| n == b"JBIG2Decode").unwrap_or(false)),
+        _ => false,
+    };
+    if is_jbig2 {
+        let jbig2_bytes = match stream.decompressed_content() {
+            Ok(data) => data,
+            Err(_) => stream.content.clone(),
+        };
+        if !jbig2_bytes.is_empty() {
+            let globals_bytes = resolve_jbig2_globals(doc, stream);
+            if let Ok(img) =
+                hayro_jbig2::Image::new_embedded(&jbig2_bytes, globals_bytes.as_deref())
+            {
+                let w = img.width();
+                let h = img.height();
+                if w > 0 && h > 0 {
+                    let mut buf = vec![255u8; (w * h) as usize];
+                    let mut dec = Jbig2LumaDecoder {
+                        buf: &mut buf,
+                        pos: 0,
+                    };
+                    if img.decode(&mut dec).is_ok() {
+                        // Invert if /Decode array specifies inverted polarity [1, 0]
+                        if let Ok(Object::Array(arr)) = stream.dict.get(b"Decode") {
+                            if arr.len() >= 2 {
+                                let d0 = arr[0]
+                                    .as_float()
+                                    .or_else(|_| arr[0].as_i64().map(|v| v as f32))
+                                    .unwrap_or(0.0);
+                                let d1 = arr[1]
+                                    .as_float()
+                                    .or_else(|_| arr[1].as_i64().map(|v| v as f32))
+                                    .unwrap_or(1.0);
+                                if d0 > d1 {
+                                    for b in &mut buf {
+                                        *b = 255 - *b;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(png) = encode_png(w, h, 0, &buf) {
+                            return Ok(Some((png, "png".to_string())));
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(None);
+    }
+
     // FlateDecode or uncompressed raster image
     let is_flate = match stream.dict.get(b"Filter") {
         Ok(Object::Name(name)) => name == b"FlateDecode",
@@ -508,6 +564,55 @@ fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     hasher.update(data);
     let crc = hasher.finalize();
     out.extend_from_slice(&crc.to_be_bytes());
+}
+
+struct Jbig2LumaDecoder<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl hayro_jbig2::Decoder for Jbig2LumaDecoder<'_> {
+    fn push_pixel(&mut self, black: bool) {
+        if self.pos < self.buf.len() {
+            self.buf[self.pos] = if black { 0 } else { 255 };
+            self.pos += 1;
+        }
+    }
+
+    fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+        let luma = if black { 0 } else { 255 };
+        let count = chunk_count as usize * 8;
+        let end = (self.pos + count).min(self.buf.len());
+        if self.pos < end {
+            self.buf[self.pos..end].fill(luma);
+            self.pos = end;
+        }
+    }
+
+    fn next_line(&mut self) {}
+}
+
+fn resolve_jbig2_globals(doc: &Document, stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    let dp = stream.dict.get(b"DecodeParms").ok()?;
+    let globals_obj = match dp {
+        Object::Dictionary(dict) => dict.get(b"JBIG2Globals").ok()?,
+        Object::Array(arr) => arr.iter().find_map(|item| match item {
+            Object::Dictionary(dict) => dict.get(b"JBIG2Globals").ok(),
+            _ => None,
+        })?,
+        _ => return None,
+    };
+    let resolved = match globals_obj {
+        Object::Reference(r) => doc.get_object(*r).ok()?,
+        other => other,
+    };
+    match resolved {
+        Object::Stream(s) => match s.decompressed_content() {
+            Ok(data) => Some(data),
+            Err(_) => Some(s.content.clone()),
+        },
+        _ => None,
+    }
 }
 
 /// Resolve a dictionary field value (inline dict or reference) to a borrowed
@@ -3453,6 +3558,46 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
         let stream = lopdf::Stream::new(dict, content);
         let extracted = extract_image_from_stream(&doc, &stream).unwrap();
         assert!(extracted.is_some());
+        let (data, fmt) = extracted.unwrap();
+        assert_eq!(fmt, "png");
+        assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn test_jbig2_image_extraction() {
+        let doc = Document::with_version("1.7");
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Type", Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype", Object::Name(b"Image".to_vec()));
+        dict.set(b"Width", Object::Integer(8));
+        dict.set(b"Height", Object::Integer(1));
+        dict.set(b"ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set(b"Filter", Object::Name(b"JBIG2Decode".to_vec()));
+
+        // Minimal valid embedded JBIG2 stream:
+        // Segment 0: Page Information (19 bytes data, width=8, height=1)
+        // Segment 1: End of Page (0 bytes data)
+        let mut content = Vec::new();
+        // Seg 0 header: seg_num=0 (4B), flags=0x30 (Page Info, 1B), no refs (1B), page_assoc=1 (1B), len=19 (4B)
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00, 0x13,
+        ]);
+        // Seg 0 data: width=8 (4B), height=1 (4B), xres=0 (4B), yres=0 (4B), flags=0 (1B), striping=0 (2B)
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        // Seg 1 header: seg_num=1 (4B), flags=0x31 (End of Page, 1B), no refs (1B), page_assoc=1 (1B), len=0 (4B)
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x31, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ]);
+
+        let stream = lopdf::Stream::new(dict, content);
+        let extracted = extract_image_from_stream(&doc, &stream).unwrap();
+        assert!(
+            extracted.is_some(),
+            "JBIG2 stream should decode successfully"
+        );
         let (data, fmt) = extracted.unwrap();
         assert_eq!(fmt, "png");
         assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));

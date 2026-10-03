@@ -57,6 +57,7 @@ ttf-parser = "0.25"
 # Image compression and checksums for extracted images
 flate2 = "1.0"
 crc32fast = "1.3"
+hayro-jbig2 = { version = "0.3.0", default-features = false, features = ["std"] }
 
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
