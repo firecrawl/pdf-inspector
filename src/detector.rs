@@ -1119,11 +1119,17 @@ fn font_decoder(doc: &Document, font: &lopdf::Dictionary) -> Option<FontDecoder>
             Err(_) if stream.content.len() > crate::MAX_STREAM_DECOMPRESSED_BYTES => return None,
             Err(_) => stream.content.clone(),
         };
-        if let Some(cmap) = crate::tounicode::ToUnicodeCMap::parse(&data) {
-            return Some(FontDecoder::CMap {
-                cmap,
-                cid: subtype == Some(b"Type0"),
-            });
+        if let Some(mut cmap) = crate::tounicode::ToUnicodeCMap::parse(&data) {
+            let cid = subtype == Some(b"Type0");
+            // A simple font's codes are one byte, whatever width its CMap
+            // declares: read its strings byte by byte, as extraction does.
+            // A font whose subtype is not a name keeps the CMap's width, in
+            // both (see `PageFontKinds`).
+            if subtype.is_some_and(|name| name != b"Type0") && cmap.code_byte_length != 1 {
+                cmap.code_byte_length = 1;
+                cmap.refresh_gap_fills();
+            }
+            return Some(FontDecoder::CMap { cmap, cid });
         }
     }
     match subtype {
@@ -4765,6 +4771,38 @@ mod tests {
             cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, CidTextLayout::UninvokedForm);
         assert!(analyze_page_content(&doc, page_id).has_vector_text);
         assert!(!decoded_text_counts(&doc, page_id).through_cid_cmap);
+    }
+
+    /// A simple font's ToUnicode CMap declared two bytes wide over one-byte
+    /// entries decodes one byte per code, as extraction reads it; a
+    /// composite font keeps the CMap's two-byte codes.
+    #[test]
+    fn a_simple_fonts_cmap_declared_two_bytes_wide_decodes_one_byte_per_code() {
+        use lopdf::dictionary;
+
+        let cmap = b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+            3 beginbfchar\n<0A> <006E>\n<82> <0063>\n<0020> <0020>\nendbfchar\n";
+        let mut doc = Document::with_version("1.5");
+        let stream = doc.add_object(lopdf::Stream::new(dictionary! {}, cmap.to_vec()));
+        let simple = dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "ToUnicode" => stream,
+        };
+        let composite = dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "Composite",
+            "Encoding" => "Identity-H", "ToUnicode" => stream,
+        };
+        let decode = |font: &lopdf::Dictionary| match font_decoder(&doc, font) {
+            Some(FontDecoder::CMap { cmap, .. }) => cmap.decode_cids(&[0x0A, 0x82]),
+            _ => panic!("a CMap decoder"),
+        };
+        assert_eq!(decode(&simple), "nc");
+        assert_ne!(decode(&composite), "nc");
+        // A font without a subtype keeps the CMap's width, as extraction
+        // keeps it.
+        let unknown = dictionary! {
+            "Type" => "Font", "BaseFont" => "NoSubtype", "ToUnicode" => stream,
+        };
+        assert_ne!(decode(&unknown), "nc");
     }
 
     /// The decoded counts cover the whole text: the three lines show
