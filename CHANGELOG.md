@@ -18,10 +18,8 @@ version and date. Earlier releases are described in their
   otherwise returned no Markdown, as did a Mixed or TextBased one whose
   text was judged garbled or undecodable. With the option set, extraction
   runs anyway, and a TextBased page whose text reads as garbage is kept
-  too. The OCR flags (`pdf_type`, `pages_needing_ocr`,
-  `ocr_reasons_by_page`) are still reported, so a caller can tell the text
-  may be unreliable. Extraction may add a `suspected_garbled_text` reason,
-  and a Mixed document whose text is garbage is still reclassified Scanned.
+  too. Detection still sets the OCR flags (`pdf_type`, `pages_needing_ocr`,
+  `ocr_reasons_by_page`), so a caller can tell the text may be unreliable.
   The new `PdfProcessResult::text_unreliable` (also on the Python result)
   is `true` when the Markdown is text the default would have withheld. Off
   by default.
