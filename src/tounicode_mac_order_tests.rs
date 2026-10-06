@@ -6,12 +6,27 @@ use lopdf::{dictionary, Document, Object, Stream};
 /// `glyf` but no `cmap` and no `post` names. Glyph `i` is `(outlined,
 /// advance)`; a missing glyph is `(false, 0)`.
 fn cmapless_truetype(glyphs: &[(bool, u16)]) -> Vec<u8> {
-    truetype(glyphs, false, false)
+    truetype(glyphs, &[], false, false)
+}
+
+/// The same font, with the glyphs at `blank_records` drawn as a single
+/// point: an outline record that paints nothing, the way the core Windows
+/// fonts draw their en and em spaces.
+fn cmapless_truetype_with_blank_records(
+    glyphs: &[(bool, u16)],
+    blank_records: &[usize],
+) -> Vec<u8> {
+    truetype(glyphs, blank_records, false, false)
 }
 
 /// The same font, optionally with a (3,1) `cmap` mapping `A` to glyph 36,
 /// or a `post` format 2 table naming glyph 36 `A`.
-fn truetype(glyphs: &[(bool, u16)], with_cmap: bool, with_post_names: bool) -> Vec<u8> {
+fn truetype(
+    glyphs: &[(bool, u16)],
+    blank_records: &[usize],
+    with_cmap: bool,
+    with_post_names: bool,
+) -> Vec<u8> {
     let square: Vec<u8> = {
         let mut g = Vec::new();
         g.extend(1i16.to_be_bytes());
@@ -26,12 +41,25 @@ fn truetype(glyphs: &[(bool, u16)], with_cmap: bool, with_post_names: bool) -> V
         }
         g
     };
+    let point: Vec<u8> = {
+        let mut g = Vec::new();
+        g.extend(1i16.to_be_bytes());
+        g.extend([0u8; 8]); // bbox 0,0,0,0
+        g.extend(0u16.to_be_bytes()); // endPtsOfContours
+        g.extend(0u16.to_be_bytes()); // instructionLength
+        g.push(1); // on curve, word coordinates
+        g.extend([0u8; 4]); // x, y
+        g.extend([0u8; 3]); // pad to a 4-byte boundary
+        g
+    };
     let mut glyf = Vec::new();
     let mut loca: Vec<u8> = Vec::new();
     loca.extend(0u32.to_be_bytes());
-    for &(outlined, _) in glyphs {
+    for (gid, &(outlined, _)) in glyphs.iter().enumerate() {
         if outlined {
             glyf.extend(&square);
+        } else if blank_records.contains(&gid) {
+            glyf.extend(&point);
         }
         loca.extend((glyf.len() as u32).to_be_bytes());
     }
@@ -188,11 +216,11 @@ fn mac_order_is_not_used_when_the_font_has_a_cmap_or_glyph_names() {
     // A cmap or post names are authoritative; those fonts take the regular
     // embedded-cmap and glyph-name paths instead.
     let glyphs = arial_like(&[556; 10], (false, 278));
-    let with_cmap = truetype(&glyphs, true, false);
+    let with_cmap = truetype(&glyphs, &[], true, false);
     let face = ttf_parser::Face::parse(&with_cmap, 0).unwrap();
     assert_eq!(face.glyph_index('A').map(|g| g.0), Some(36));
     assert!(build_cmap_from_mac_glyph_order(&with_cmap).is_none());
-    let with_names = truetype(&glyphs, false, true);
+    let with_names = truetype(&glyphs, &[], false, true);
     let face = ttf_parser::Face::parse(&with_names, 0).unwrap();
     assert_eq!(face.glyph_name(ttf_parser::GlyphId(36)), Some("A"));
     assert!(build_cmap_from_mac_glyph_order(&with_names).is_none());
@@ -345,4 +373,99 @@ fn mac_order_declines_a_unicode_keyed_font() {
         glyphs[code] = (true, 600);
     }
     assert!(build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).is_none());
+}
+
+/// A core font laid out in `names` order, every slot kept: tabular digits,
+/// a blank space and no-break space, capitals and lowercase each one width
+/// apart, every accented letter as wide as its base letter, and the other
+/// glyphs at widths of their own.
+fn core_font(names: &[&str]) -> Vec<(bool, u16)> {
+    let letter_width = |c: char| match c {
+        'i' | 'l' => 222,
+        'm' => 833,
+        'w' => 722,
+        'A'..='Z' => 600 + 10 * (c as u16 - 'A' as u16),
+        'a'..='z' => 400 + 5 * (c as u16 - 'a' as u16),
+        _ => unreachable!(),
+    };
+    names
+        .iter()
+        .enumerate()
+        .map(|(gid, &name)| {
+            if matches!(name, "space" | "nonbreakingspace") {
+                return (false, 278);
+            }
+            if (19..=28).contains(&gid) {
+                return (true, 556);
+            }
+            let mut chars = name.chars();
+            let first = chars.next().unwrap();
+            if first.is_ascii_alphabetic()
+                && (chars.as_str().is_empty() || advance_twin(name).is_some())
+            {
+                return (true, letter_width(first));
+            }
+            (true, 300 + (gid as u16 % 50) * 7)
+        })
+        .collect()
+}
+
+#[test]
+fn windows_order_reads_a_core_windows_subset() {
+    // Arial and Times New Roman leave out the Macintosh no-break space at
+    // 172, so from there each glyph sits one slot earlier: “N/A” read
+    // through the Macintosh order would come out as —N/A“.
+    let font = cmapless_truetype(&core_font(&WINDOWS_GLYPH_NAMES));
+    let cmap = build_cmap_from_mac_glyph_order(&font).expect("corroborated");
+    assert_eq!(decode(&cmap, &[179, 49, 18, 36, 180]), "“N/A”");
+    assert_eq!(decode(&cmap, &[177, 3, 182, 3, 188]), "– ’ €");
+}
+
+#[test]
+fn mac_order_still_reads_a_core_macintosh_subset() {
+    let font = cmapless_truetype(&core_font(&MAC_GLYPH_NAMES));
+    let cmap = build_cmap_from_mac_glyph_order(&font).expect("corroborated");
+    assert_eq!(decode(&cmap, &[180, 49, 18, 36, 181]), "“N/A”");
+    assert_eq!(decode(&cmap, &[178, 3, 179, 3, 183]), "– — ’");
+}
+
+#[test]
+fn mac_order_stands_without_advances_to_tell_the_orders_apart() {
+    // A subset that zeroed the metrics of the glyphs it dropped leaves no
+    // accented letter to compare, so the Macintosh reading stands.
+    let mut glyphs = core_font(&WINDOWS_GLYPH_NAMES);
+    for (gid, glyph) in glyphs.iter_mut().enumerate().skip(172) {
+        if !matches!(gid, 179 | 180) {
+            *glyph = (false, 0);
+        }
+    }
+    let cmap = build_cmap_from_mac_glyph_order(&cmapless_truetype(&glyphs)).unwrap();
+    assert_eq!(decode(&cmap, &[179, 180]), "—“");
+}
+
+#[test]
+fn windows_glyph_names_differ_from_the_mac_order_from_slot_172() {
+    assert_eq!(WINDOWS_GLYPH_NAMES.len(), MAC_GLYPH_NAMES.len());
+    let first_difference =
+        (0..MAC_GLYPH_NAMES.len()).find(|&gid| WINDOWS_GLYPH_NAMES[gid] != MAC_GLYPH_NAMES[gid]);
+    assert_eq!(first_difference, Some(usize::from(FIRST_WINDOWS_ONLY_SLOT)));
+    assert_eq!(WINDOWS_GLYPH_NAMES[188], "Euro");
+    assert_eq!(WINDOWS_GLYPH_NAMES[209], "Ograve");
+}
+
+#[test]
+fn a_blank_glyph_past_the_order_reads_as_a_space() {
+    // Word justifies lines with Arial's en space (glyph 3024), a one-point
+    // outline that advances. A dropped glyph that kept its advance has no
+    // outline record and stays unmapped, as do a zero-width blank and an
+    // outlined glyph past the order.
+    let mut glyphs = core_font(&WINDOWS_GLYPH_NAMES);
+    glyphs.extend([(false, 500), (false, 500), (false, 0), (true, 600)]);
+    let font = cmapless_truetype_with_blank_records(&glyphs, &[258, 260]);
+    let cmap = build_cmap_from_mac_glyph_order(&font).unwrap();
+    assert_eq!(cmap.lookup(258).as_deref(), Some(" "));
+    for gid in [259, 260, 261] {
+        assert_eq!(cmap.lookup(gid), None, "glyph {gid}");
+    }
+    assert_eq!(decode(&cmap, &[51, 85, 82, 258, 47]), "Pro L");
 }

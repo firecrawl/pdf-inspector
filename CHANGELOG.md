@@ -7,6 +7,23 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
+  comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
+  read through the Windows variant of the standard glyph order. That
+  variant leaves out the Macintosh no-break space, so from glyph 172 on
+  the Macintosh order read every glyph as its neighbour: `“N/A”` as
+  `—N/A“`, `company’s` as `company‘s` and en dashes as `œ`. The font's
+  own advances choose the variant, since an accented letter advances like
+  its base letter.
+- A glyph in such a subset past the standard order that paints nothing but
+  advances reads as a space. Word justifies lines with Arial's en and em
+  spaces, which came out as U+FFFD between every word
+  (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+
 ## [1.25.2] - 2026-09-28
 
 Changes since 1.25.1.

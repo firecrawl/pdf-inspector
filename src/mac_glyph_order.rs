@@ -3,20 +3,24 @@
 //! A TrueType subset embedded for an Identity-H CIDFont sometimes keeps
 //! neither a `cmap` table nor glyph names, and the PDF carries no
 //! ToUnicode. The glyph IDs are then the only handle on the text. The core
-//! Windows and Macintosh fonts (Arial, Times New Roman, Helvetica, ...) place
-//! the 258 glyphs of the standard Macintosh ordering first, so for those
-//! fonts the glyph ID alone still names the character. The order is only
-//! assumed when the font's own metrics corroborate it.
+//! Macintosh fonts (Helvetica, Times, ...) place the 258 glyphs of the
+//! standard Macintosh ordering first, and the core Windows fonts (Arial,
+//! Times New Roman, ...) a variant of it, so for those fonts the glyph ID
+//! alone still names the character. The order is only assumed when the
+//! font's own metrics corroborate it, and the font's advances choose between
+//! the two variants.
+
+use std::sync::LazyLock;
 
 use crate::glyph_names::glyph_to_char;
 use crate::tounicode::ToUnicodeCMap;
 use lopdf::{Document, Object};
 
 /// The 258 glyph names of the standard Macintosh ordering (`post` format 1;
-/// TrueType Reference Manual, "The 'post' table"). The core Windows and
-/// Macintosh fonts (Arial, Times New Roman, Helvetica, ...) place these
-/// glyphs first in this order, so a subset that dropped its `cmap` and its
-/// glyph names still exposes them through the glyph ID alone.
+/// TrueType Reference Manual, "The 'post' table"). The core Macintosh fonts
+/// (Helvetica, Times, ...) place these glyphs first in this order, so a
+/// subset that dropped its `cmap` and its glyph names still exposes them
+/// through the glyph ID alone.
 const MAC_GLYPH_NAMES: [&str; 258] = [
     ".notdef",
     ".null",
@@ -278,6 +282,98 @@ const MAC_GLYPH_NAMES: [&str; 258] = [
     "dcroat",
 ];
 
+/// The first slot at which [`WINDOWS_GLYPH_NAMES`] departs from
+/// [`MAC_GLYPH_NAMES`]; every slot before it names the same glyph in both.
+const FIRST_WINDOWS_ONLY_SLOT: u16 = 172;
+
+/// The order the core Windows fonts (Arial, Times New Roman, Courier New,
+/// Verdana, Georgia, Tahoma) give their first 258 glyphs: the Macintosh
+/// order without `nonbreakingspace` (172) and `apple` (210), with `Euro` in
+/// the place of `currency`, closed by `overscore` and `middot`. From slot
+/// 172 on the two orders name different glyphs, so a Windows subset read
+/// through the Macintosh order turns curly quotes into dashes (“N/A” as
+/// —N/A“), apostrophes into opening quotes and en dashes into `œ`.
+static WINDOWS_GLYPH_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    MAC_GLYPH_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !matches!(*name, "nonbreakingspace" | "apple"))
+        .map(|name| if name == "currency" { "Euro" } else { name })
+        .chain(["overscore", "middot"])
+        .collect()
+});
+
+/// The glyph a slot named `name` advances like in either order: the base
+/// letter of a precomposed accented letter (`Agrave` advances like `A` at
+/// 36, `ydieresis` like `y` at 92), and the space at 3 for the no-break
+/// space. Both orders keep the space and the letters at the same slots.
+fn advance_twin(name: &str) -> Option<u16> {
+    const ACCENTS: [&str; 10] = [
+        "grave",
+        "acute",
+        "circumflex",
+        "tilde",
+        "dieresis",
+        "caron",
+        "breve",
+        "cedilla",
+        "dotaccent",
+        "ring",
+    ];
+    if name == "nonbreakingspace" {
+        return Some(3);
+    }
+    let mut chars = name.chars();
+    let base = chars.next()?;
+    if !ACCENTS.contains(&chars.as_str()) {
+        return None;
+    }
+    match base {
+        'A'..='Z' => Some(36 + (base as u16 - 'A' as u16)),
+        'a'..='z' => Some(68 + (base as u16 - 'a' as u16)),
+        _ => None,
+    }
+}
+
+/// The variant of the standard order the font's advances support. Each
+/// order is scored over the slots from 172 on that it names after a twin
+/// ([`advance_twin`]): how many advance like their twin and how many do
+/// not. The advances of glyphs a subset dropped still count, since
+/// subsetters that keep glyph IDs usually keep the metrics too. The
+/// Windows order is taken only when it fits more slots and misfits fewer;
+/// equal evidence, as in a monospaced font or a subset that zeroed its
+/// dropped metrics, keeps the Macintosh order.
+fn standard_order_names(face: &ttf_parser::Face) -> &'static [&'static str] {
+    let advance = |gid: u16| {
+        face.glyph_hor_advance(ttf_parser::GlyphId(gid))
+            .filter(|&w| w > 0)
+    };
+    let score = |names: &[&str]| {
+        let (mut fits, mut misfits) = (0usize, 0usize);
+        let last = face.number_of_glyphs().min(names.len() as u16);
+        for gid in FIRST_WINDOWS_ONLY_SLOT..last {
+            let Some(twin) = advance_twin(names[usize::from(gid)]) else {
+                continue;
+            };
+            if let (Some(own), Some(theirs)) = (advance(gid), advance(twin)) {
+                if own == theirs {
+                    fits += 1;
+                } else {
+                    misfits += 1;
+                }
+            }
+        }
+        (fits, misfits)
+    };
+    let (mac_fits, mac_misfits) = score(&MAC_GLYPH_NAMES);
+    let (windows_fits, windows_misfits) = score(&WINDOWS_GLYPH_NAMES);
+    if windows_fits > mac_fits && windows_misfits < mac_misfits {
+        &WINDOWS_GLYPH_NAMES
+    } else {
+        &MAC_GLYPH_NAMES
+    }
+}
+
 /// Whether the CIDFont maps CIDs to glyph IDs without a table, so the CIDs
 /// in the content stream are the embedded font's glyph IDs.
 pub(crate) fn cid_to_gid_is_identity(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> bool {
@@ -299,7 +395,8 @@ pub(crate) fn font_file_follows_mac_order(font_data: &[u8]) -> bool {
 }
 
 /// Build a GID→Unicode CMap for a TrueType font that has neither a `cmap`
-/// table nor glyph names, assuming the standard Macintosh glyph order.
+/// table nor glyph names, assuming the standard Macintosh glyph order or
+/// its Windows variant ([`standard_order_names`]).
 ///
 /// The assumption is only accepted when the font's own metrics corroborate
 /// it: at least three glyphs at the digit positions (19–28) exist and share
@@ -307,7 +404,12 @@ pub(crate) fn font_file_follows_mac_order(font_data: &[u8]) -> bool {
 /// advances without an outline; every present `i` and `l` is narrower than
 /// every present `m` and `w`;
 /// and capitals average wider than lowercase. Each check only applies to
-/// glyphs the subset kept. Everything else keeps today's behaviour.
+/// glyphs the subset kept, and all of them to slots both variants share.
+/// Everything else keeps today's behaviour.
+///
+/// A kept glyph past the order that paints nothing but advances reads as a
+/// space: the core Windows fonts draw U+2000–U+200A (en space, em space,
+/// ...) that way, and Word justifies lines with them.
 pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnicodeCMap> {
     use ttf_parser::GlyphId;
 
@@ -370,9 +472,10 @@ pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnic
 
     // Only slots the subset kept: an outline, or a blank glyph that still
     // advances (space, no-break space).
+    let names = standard_order_names(&face);
     let mut cmap = ToUnicodeCMap::new();
-    let count = usize::from(face.number_of_glyphs()).min(MAC_GLYPH_NAMES.len());
-    for (gid, name) in MAC_GLYPH_NAMES.iter().enumerate().take(count) {
+    let count = usize::from(face.number_of_glyphs()).min(names.len());
+    for (gid, name) in names.iter().enumerate().take(count) {
         let gid = gid as u16;
         let kept = present(gid) || face.glyph_hor_advance(GlyphId(gid)).is_some_and(|w| w > 0);
         if !kept {
@@ -380,6 +483,22 @@ pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnic
         }
         if let Some(ch) = glyph_to_char(name) {
             cmap.char_map.insert(gid, ch.to_string());
+        }
+    }
+    // Past the order a glyph has no name to read, but one that paints
+    // nothing and advances is a space whatever its code point. Only glyphs
+    // with an outline record count: the core fonts give those spaces a
+    // one-point outline, while a glyph the subset dropped has no record,
+    // though it often keeps its advance.
+    if let Some(glyf) = face.tables().glyf {
+        for gid in (names.len() as u16)..face.number_of_glyphs() {
+            let id = GlyphId(gid);
+            if glyf.bbox(id).is_some()
+                && face.glyph_bounding_box(id).is_none()
+                && face.glyph_hor_advance(id).is_some_and(|w| w > 0)
+            {
+                cmap.char_map.insert(gid, " ".to_string());
+            }
         }
     }
     if cmap.char_map.is_empty() {
