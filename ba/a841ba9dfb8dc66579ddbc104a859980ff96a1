@@ -1,0 +1,19 @@
+CHANGELOG.md
+  s_b5e3c56a4f481a::t_cbdd034ddf8727 17-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "baa841ba9dfb8dc66579ddbc104a859980ff96a1",
+  "prompts": {},
+  "sessions": {
+    "s_b5e3c56a4f481a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "69739ab4-7ae8-4b3d-ac7c-38650e02f893",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
