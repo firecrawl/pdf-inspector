@@ -15,6 +15,7 @@ pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
 mod text_paint;
+mod type1;
 pub(crate) mod underline;
 pub(crate) mod word_gaps;
 mod xobjects;
