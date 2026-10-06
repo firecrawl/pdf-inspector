@@ -22,10 +22,9 @@ version and date. Earlier releases are described in their
   `ocr_reasons_by_page`) are still reported, so a caller can tell the text
   may be unreliable. Extraction may add a `suspected_garbled_text` reason,
   and a Mixed document whose text is garbage is still reclassified Scanned.
-  The new
-  `PdfProcessResult::text_unreliable` (also on the Python result) is `true`
-  when the Markdown is text the default would have withheld. Off by
-  default.
+  The new `PdfProcessResult::text_unreliable` (also on the Python result)
+  is `true` when the Markdown is text the default would have withheld. Off
+  by default.
 
 ## [1.25.2] - 2026-09-28
 
