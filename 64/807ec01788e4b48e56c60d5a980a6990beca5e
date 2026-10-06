@@ -1,0 +1,21 @@
+CHANGELOG.md
+  s_53b28e0c01b904::t_2d2060175457e6 22-25
+src/lib.rs
+  s_53b28e0c01b904::t_5d0c52a886c8ea 350-352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "64807ec01788e4b48e56c60d5a980a6990beca5e",
+  "prompts": {},
+  "sessions": {
+    "s_53b28e0c01b904": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7098fafa-2e25-431b-9d76-67c366b1433e",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
