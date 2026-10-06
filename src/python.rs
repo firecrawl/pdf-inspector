@@ -848,10 +848,17 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 // ---------------------------------------------------------------------------
 
 /// Process a PDF file: detect type, extract text, and convert to Markdown.
+///
+/// With force_extraction=True the text of pages flagged for OCR is kept
+/// instead of suppressed; pdf_type and pages_needing_ocr are unchanged.
 #[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+#[pyo3(signature = (path, pages=None, force_extraction=false))]
+fn process_pdf(
+    path: &str,
+    pages: Option<Vec<u32>>,
+    force_extraction: bool,
+) -> PyResult<PyPdfResult> {
+    let mut opts = crate::PdfOptions::new().force_extraction(force_extraction);
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
@@ -861,9 +868,13 @@ fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
 
 /// Process a PDF from bytes in memory.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
-fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+#[pyo3(signature = (data, pages=None, force_extraction=false))]
+fn process_pdf_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+    force_extraction: bool,
+) -> PyResult<PyPdfResult> {
+    let mut opts = crate::PdfOptions::new().force_extraction(force_extraction);
     if let Some(p) = pages {
         opts = opts.pages(p);
     }

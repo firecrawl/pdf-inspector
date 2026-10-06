@@ -304,12 +304,20 @@ class PagesExtractionResult:
     is_complex: bool
     """True if any page has tables or multi-column layout."""
 
-def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
-    """Process a PDF: detect type, extract text, convert to Markdown."""
+def process_pdf(
+    path: str, pages: Optional[list[int]] = None, force_extraction: bool = False
+) -> PdfResult:
+    """Process a PDF: detect type, extract text, convert to Markdown.
+
+    ``force_extraction`` keeps the text of pages flagged for OCR (scanned,
+    garbled, undecodable fonts) instead of returning none; ``pdf_type`` and
+    ``pages_needing_ocr`` still report the flag."""
     ...
 
-def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
-    """Process a PDF from bytes in memory."""
+def process_pdf_bytes(
+    data: bytes, pages: Optional[list[int]] = None, force_extraction: bool = False
+) -> PdfResult:
+    """Process a PDF from bytes in memory. See ``process_pdf`` for ``force_extraction``."""
     ...
 
 def process_pdf_with_ocr(

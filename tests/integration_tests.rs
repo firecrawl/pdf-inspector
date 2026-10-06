@@ -3196,6 +3196,27 @@ fn test_inline_image_raster_covers_the_page() {
     assert_eq!(processed.pdf_type, PdfType::Scanned);
 }
 
+/// `force_extraction` keeps the text layer behind a scan that the default
+/// withholds, and leaves the OCR flags as they were.
+#[test]
+fn test_force_extraction_keeps_scanned_text() {
+    let buf = make_pdf_with_glyph_layer(&[SCAN_WITH_INVISIBLE_LAYER]);
+
+    let default = process_pdf_mem(&buf).unwrap();
+    assert!(matches!(
+        default.pdf_type,
+        PdfType::Scanned | PdfType::ImageBased
+    ));
+    assert!(default.markdown.is_none());
+
+    let forced =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().force_extraction(true)).unwrap();
+    assert_eq!(forced.pdf_type, default.pdf_type);
+    assert_eq!(forced.pages_needing_ocr, default.pages_needing_ocr);
+    assert_eq!(forced.ocr_reasons_by_page, default.ocr_reasons_by_page);
+    assert!(forced.markdown.is_some_and(|m| !m.trim().is_empty()));
+}
+
 /// A scan tiled into two thousand strips — image XObjects or inline
 /// images — covers the page as one draw does: the hidden layer over it
 /// is a layer nobody sees.
