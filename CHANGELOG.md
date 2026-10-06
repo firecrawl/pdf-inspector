@@ -7,6 +7,18 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A simple font's ToUnicode CMap of fewer than ten entries keeps its say
+  for the codes the embedded program does not read. Such a CMap yields to
+  the program's own reading, and its entries were then dropped, so a code
+  whose glyph the program does not name read as its byte value: a
+  heading set by macOS Quartz in a small subset of Times New Roman Bold
+  read `CÔNG TY` as `CÔ!G TY` and `phẩm` as `ph'm`. The CMap's entry is
+  now read before that guess.
+
 ## [1.25.2] - 2026-09-28
 
 Changes since 1.25.1.
