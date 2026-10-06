@@ -1,0 +1,30 @@
+tests/integration_tests.rs
+  s_53b28e0c01b904::t_9eb2eed776dd59 2144,3200-3201,3203,3212,3214,3218
+src/lib.rs
+  s_53b28e0c01b904::t_ab9404a61cf942 5022-5025,5051
+  s_53b28e0c01b904::t_9eb2eed776dd59 228-232,270-274,287,300,343-344,350-354,4645,4652,4671,4679-4681,4933,4936,4950,4952,5011-5012
+src/bin/pdf2md.rs
+  s_53b28e0c01b904::t_9eb2eed776dd59 411
+src/python.rs
+  s_53b28e0c01b904::t_9eb2eed776dd59 81-85,605,858-860,862-864,874,878,880
+CHANGELOG.md
+  s_53b28e0c01b904::t_9eb2eed776dd59 14-23
+pdf_inspector.pyi
+  s_53b28e0c01b904::t_9eb2eed776dd59 43-45,311,315-319,323,325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a9bf79907686ad8a354ee9dc6f7e60da65d54ed6",
+  "prompts": {},
+  "sessions": {
+    "s_53b28e0c01b904": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7098fafa-2e25-431b-9d76-67c366b1433e",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
