@@ -18,7 +18,8 @@ pub struct PyPdfResult {
     /// The detected PDF type: "text_based", "scanned", "image_based", or "mixed".
     #[pyo3(get)]
     pub pdf_type: String,
-    /// Markdown output (None if detect-only or scanned PDF).
+    /// Markdown output (None if detect-only, or if the text was withheld as
+    /// scanned or unreliable and best_effort was not set).
     #[pyo3(get)]
     pub markdown: Option<String>,
     /// Total number of pages.
@@ -78,6 +79,11 @@ pub struct PyPdfResult {
     /// Whether encoding issues were detected.
     #[pyo3(get)]
     pub has_encoding_issues: bool,
+    /// True when `markdown` is text that `best_effort=True` kept and the
+    /// default would have withheld (scanned or image-based document, garbled
+    /// text, undecodable fonts). Always False without `best_effort`.
+    #[pyo3(get)]
+    pub text_unreliable: bool,
     /// Fonts whose ToUnicode CMap — or, for a font without one, the embedded
     /// program's cmap table — lacked an entry for a code the document shows
     /// through it, with the counts of codes shown, read from their neighbours
@@ -597,6 +603,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        text_unreliable: r.text_unreliable,
         cmap_gaps: to_py_font_cmap_gaps(r.cmap_gaps),
     }
 }
@@ -848,10 +855,14 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 // ---------------------------------------------------------------------------
 
 /// Process a PDF file: detect type, extract text, and convert to Markdown.
+///
+/// With best_effort=True the text is returned even where the library is not
+/// confident in it, instead of withheld; pdf_type and pages_needing_ocr are
+/// unchanged and text_unreliable says when the text was kept this way.
 #[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+#[pyo3(signature = (path, pages=None, best_effort=false))]
+fn process_pdf(path: &str, pages: Option<Vec<u32>>, best_effort: bool) -> PyResult<PyPdfResult> {
+    let mut opts = crate::PdfOptions::new().best_effort(best_effort);
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
@@ -861,9 +872,13 @@ fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
 
 /// Process a PDF from bytes in memory.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
-fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
-    let mut opts = crate::PdfOptions::new();
+#[pyo3(signature = (data, pages=None, best_effort=false))]
+fn process_pdf_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+    best_effort: bool,
+) -> PyResult<PyPdfResult> {
+    let mut opts = crate::PdfOptions::new().best_effort(best_effort);
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
