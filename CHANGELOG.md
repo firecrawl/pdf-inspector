@@ -11,15 +11,16 @@ version and date. Earlier releases are described in their
 
 ### Added
 
-- `PdfOptions::force_extraction` (`force_extraction=True` in the Python
-  `process_pdf` and `process_pdf_bytes`) keeps the text of pages flagged for
-  OCR instead of suppressing it. A Scanned or ImageBased document, whose
-  text layer may still hold real or invisible text, otherwise returned no
-  Markdown, as did a Mixed or TextBased one whose text was judged garbled or
-  undecodable. With the option set, extraction runs anyway and returns what
-  it reads. `pdf_type`, `pages_needing_ocr` and `ocr_reasons_by_page` are
-  unchanged, so a caller still sees that the text may be unreliable. Off by
-  default.
+- `PdfOptions::best_effort` (`best_effort=True` in the Python `process_pdf`
+  and `process_pdf_bytes`) returns whatever native text can be read, even
+  where the library is not confident in it. A Scanned or ImageBased
+  document, whose text layer may still hold real or invisible text,
+  otherwise returned no Markdown, as did a Mixed or TextBased one whose
+  text was judged garbled or undecodable. With the option set, extraction
+  runs anyway. `pdf_type`, `pages_needing_ocr` and `ocr_reasons_by_page`
+  are unchanged, and the new `PdfProcessResult::text_unreliable` (also on
+  the Python result) is `true` when the Markdown is text the default would
+  have withheld. Off by default.
 
 ## [1.25.2] - 2026-09-28
 

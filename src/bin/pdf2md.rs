@@ -408,6 +408,7 @@ mod tests {
             confidence: 1.0,
             layout: pdf_inspector::LayoutComplexity::default(),
             has_encoding_issues: false,
+            text_unreliable: false,
             cmap_gaps: Vec::new(),
         };
         assert_eq!(

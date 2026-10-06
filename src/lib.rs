@@ -225,6 +225,11 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// `true` when `markdown` is text that [`PdfOptions::best_effort`] kept
+    /// and the default would have withheld: the document was classified
+    /// Scanned or ImageBased, or its text was judged garbled or its fonts
+    /// undecodable. Always `false` without `best_effort`.
+    pub text_unreliable: bool,
     /// The fonts whose ToUnicode CMap — or, for a font without one, the
     /// embedded program's cmap table — lacked an entry for a code the
     /// document shows through it, with the counts of codes shown, read from
@@ -262,11 +267,11 @@ pub struct PdfOptions {
     /// Password for decrypting an encrypted PDF. `None` falls back to the
     /// empty password (owner-only encryption).
     pub password: Option<String>,
-    /// Keep the extracted text of pages flagged for OCR instead of
-    /// suppressing it (default: `false`). The flags (`pdf_type`,
-    /// `pages_needing_ocr`, `ocr_reasons_by_page`) are reported as usual, so
-    /// the caller still knows the text may be incomplete or unreliable.
-    pub force_extraction: bool,
+    /// Return whatever native text can be read, even where the library is
+    /// not confident in it (default: `false`). The flags (`pdf_type`,
+    /// `pages_needing_ocr`, `ocr_reasons_by_page`) are reported as usual, and
+    /// [`PdfProcessResult::text_unreliable`] marks text kept by this option.
+    pub best_effort: bool,
 }
 
 // Manual `Debug` so the password is never leaked through debug logging or a
@@ -279,7 +284,7 @@ impl std::fmt::Debug for PdfOptions {
             .field("markdown", &self.markdown)
             .field("page_filter", &self.page_filter)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
-            .field("force_extraction", &self.force_extraction)
+            .field("best_effort", &self.best_effort)
             .finish()
     }
 }
@@ -292,7 +297,7 @@ impl Default for PdfOptions {
             markdown: MarkdownOptions::default(),
             page_filter: None,
             password: None,
-            force_extraction: false,
+            best_effort: false,
         }
     }
 }
@@ -335,15 +340,18 @@ impl PdfOptions {
         self
     }
 
-    /// Keep the text of pages flagged for OCR rather than returning none.
+    /// Return whatever native text can be read, even where the library is
+    /// not confident in it.
     ///
     /// By default a Scanned or ImageBased document yields no markdown, and
     /// the markdown of a Mixed or TextBased document is dropped when it is
     /// garbled or its fonts are undecodable. With this set, extraction runs
     /// anyway (including a scanned page's invisible text layer) and whatever
-    /// it reads is returned; `pdf_type` and the OCR page flags are unchanged.
-    pub fn force_extraction(mut self, force: bool) -> Self {
-        self.force_extraction = force;
+    /// it reads is returned. `pdf_type` and the OCR page flags are unchanged,
+    /// and [`PdfProcessResult::text_unreliable`] says when the markdown is
+    /// text the default would have withheld.
+    pub fn best_effort(mut self, best_effort: bool) -> Self {
+        self.best_effort = best_effort;
         self
     }
 
@@ -4634,13 +4642,14 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            text_unreliable: false,
             cmap_gaps: Vec::new(),
         });
     }
 
     // Scanned / ImageBased → nothing to extract, unless extraction is forced
     let scanned_type = matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased);
-    if scanned_type && !options.force_extraction {
+    if scanned_type && !options.best_effort {
         return Ok(PdfProcessResult {
             pdf_type,
             markdown: None,
@@ -4659,6 +4668,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            text_unreliable: false,
             cmap_gaps: Vec::new(),
         });
     }
@@ -4666,6 +4676,9 @@ fn process_document(
     // Mixed PDFs, and Scanned/ImageBased ones whose extraction is forced, are
     // backed by images: their text layer may be absent or invisible.
     let image_backed = pdf_type == PdfType::Mixed || scanned_type;
+    // A Scanned or ImageBased document reaches extraction only under
+    // `best_effort`, so whatever it yields is text the default withholds.
+    let mut text_unreliable = scanned_type;
 
     // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
@@ -4917,13 +4930,10 @@ fn process_document(
     // layer comes from a bad OCR pass, and callers should use proper OCR.
     let (pdf_type, markdown, confidence) =
         if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
+            text_unreliable |= options.best_effort;
             (
                 PdfType::Scanned,
-                if options.force_extraction {
-                    markdown
-                } else {
-                    None
-                },
+                if options.best_effort { markdown } else { None },
                 0.95,
             )
         } else {
@@ -4937,12 +4947,9 @@ fn process_document(
         && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
     {
         log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
+        text_unreliable |= options.best_effort;
         (
-            if options.force_extraction {
-                markdown
-            } else {
-                None
-            },
+            if options.best_effort { markdown } else { None },
             true,
             true,
         )
@@ -5001,7 +5008,8 @@ fn process_document(
         }
     }
 
-    let markdown = if all_gid && !options.force_extraction {
+    text_unreliable |= all_gid && options.best_effort;
+    let markdown = if all_gid && !options.best_effort {
         log::debug!(
             "all {} pages have gid-encoded fonts — suppressing markdown output",
             page_count
@@ -5010,6 +5018,10 @@ fn process_document(
     } else {
         markdown
     };
+
+    // Only text that is actually returned can be unreliable.
+    let text_unreliable =
+        text_unreliable && markdown.as_ref().is_some_and(|m| !m.trim().is_empty());
 
     Ok(PdfProcessResult {
         pdf_type,
@@ -5036,6 +5048,7 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        text_unreliable,
         cmap_gaps,
     })
 }

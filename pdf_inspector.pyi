@@ -40,6 +40,9 @@ class PdfResult:
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool
+    text_unreliable: bool
+    """True when ``markdown`` is text that ``best_effort=True`` kept and the
+    default would have withheld. Always False without ``best_effort``."""
     cmap_gaps: list["FontCMapGaps"]
     """Fonts whose ToUnicode CMap (or, for a font without one, the embedded
     program's cmap table) lacked an entry for a code the document shows
@@ -305,19 +308,21 @@ class PagesExtractionResult:
     """True if any page has tables or multi-column layout."""
 
 def process_pdf(
-    path: str, pages: Optional[list[int]] = None, force_extraction: bool = False
+    path: str, pages: Optional[list[int]] = None, best_effort: bool = False
 ) -> PdfResult:
     """Process a PDF: detect type, extract text, convert to Markdown.
 
-    ``force_extraction`` keeps the text of pages flagged for OCR (scanned,
-    garbled, undecodable fonts) instead of returning none; ``pdf_type`` and
-    ``pages_needing_ocr`` still report the flag."""
+    ``best_effort`` returns whatever native text can be read even where the
+    library is not confident in it (scanned or image-based document, garbled
+    text, undecodable fonts) instead of none; ``pdf_type`` and
+    ``pages_needing_ocr`` still report the flag, and ``text_unreliable`` is
+    True when the markdown is text kept this way."""
     ...
 
 def process_pdf_bytes(
-    data: bytes, pages: Optional[list[int]] = None, force_extraction: bool = False
+    data: bytes, pages: Optional[list[int]] = None, best_effort: bool = False
 ) -> PdfResult:
-    """Process a PDF from bytes in memory. See ``process_pdf`` for ``force_extraction``."""
+    """Process a PDF from bytes in memory. See ``process_pdf`` for ``best_effort``."""
     ...
 
 def process_pdf_with_ocr(

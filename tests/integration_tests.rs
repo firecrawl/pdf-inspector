@@ -2141,6 +2141,7 @@ fn test_pages_needing_ocr_field_accessible() {
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
+        text_unreliable: false,
         cmap_gaps: Vec::new(),
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
@@ -3196,10 +3197,10 @@ fn test_inline_image_raster_covers_the_page() {
     assert_eq!(processed.pdf_type, PdfType::Scanned);
 }
 
-/// `force_extraction` keeps the text layer behind a scan that the default
-/// withholds, and leaves the OCR flags as they were.
+/// `best_effort` returns the text layer behind a scan that the default
+/// withholds, leaves the OCR flags as they were, and marks the text unreliable.
 #[test]
-fn test_force_extraction_keeps_scanned_text() {
+fn test_best_effort_keeps_scanned_text() {
     let buf = make_pdf_with_glyph_layer(&[SCAN_WITH_INVISIBLE_LAYER]);
 
     let default = process_pdf_mem(&buf).unwrap();
@@ -3208,12 +3209,13 @@ fn test_force_extraction_keeps_scanned_text() {
         PdfType::Scanned | PdfType::ImageBased
     ));
     assert!(default.markdown.is_none());
+    assert!(!default.text_unreliable);
 
-    let forced =
-        process_pdf_mem_with_options(&buf, PdfOptions::new().force_extraction(true)).unwrap();
+    let forced = process_pdf_mem_with_options(&buf, PdfOptions::new().best_effort(true)).unwrap();
     assert_eq!(forced.pdf_type, default.pdf_type);
     assert_eq!(forced.pages_needing_ocr, default.pages_needing_ocr);
     assert_eq!(forced.ocr_reasons_by_page, default.ocr_reasons_by_page);
+    assert!(forced.text_unreliable);
     assert!(forced.markdown.is_some_and(|m| !m.trim().is_empty()));
 }
 
