@@ -1,0 +1,28 @@
+tests/integration_tests.rs
+  s_53b28e0c01b904::t_c23993f9d96e2a 3199-3205,3210-3213,3215-3219
+  s_53b28e0c01b904::t_57cc15ebf8cb04 3206-3209,3214
+src/lib.rs
+  s_53b28e0c01b904::t_b4349eded00916 265-269,282,295,338-349,4641-4643,4666-4669,4685,4721,4920-4928,4940-4948,5004
+src/python.rs
+  s_53b28e0c01b904::t_b4349eded00916 851-853,855-861,871-877
+pdf_inspector.pyi
+  s_53b28e0c01b904::t_b4349eded00916 307-314,317-320
+CHANGELOG.md
+  s_53b28e0c01b904::t_ecdd5d95ff2a40 10-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2fa731ab76ade69ab548563d62da463f2762bf8d",
+  "prompts": {},
+  "sessions": {
+    "s_53b28e0c01b904": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7098fafa-2e25-431b-9d76-67c366b1433e",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Abimael Martell <1450169+abimaelmartell@users.noreply.github.com>"
+    }
+  }
+}
