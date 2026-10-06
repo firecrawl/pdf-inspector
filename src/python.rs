@@ -18,7 +18,8 @@ pub struct PyPdfResult {
     /// The detected PDF type: "text_based", "scanned", "image_based", or "mixed".
     #[pyo3(get)]
     pub pdf_type: String,
-    /// Markdown output (None if detect-only or scanned PDF).
+    /// Markdown output (None if detect-only, or if the text was withheld as
+    /// scanned or unreliable and best_effort was not set).
     #[pyo3(get)]
     pub markdown: Option<String>,
     /// Total number of pages.

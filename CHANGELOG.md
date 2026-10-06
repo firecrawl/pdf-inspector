@@ -17,10 +17,13 @@ version and date. Earlier releases are described in their
   document, whose text layer may still hold real or invisible text,
   otherwise returned no Markdown, as did a Mixed or TextBased one whose
   text was judged garbled or undecodable. With the option set, extraction
-  runs anyway. `pdf_type`, `pages_needing_ocr` and `ocr_reasons_by_page`
-  are unchanged, and the new `PdfProcessResult::text_unreliable` (also on
-  the Python result) is `true` when the Markdown is text the default would
-  have withheld. Off by default.
+  runs anyway, and a TextBased page whose text reads as garbage is kept
+  too. The OCR flags (`pdf_type`, `pages_needing_ocr`,
+  `ocr_reasons_by_page`) still report what detection found, and extraction
+  may add a `suspected_garbled_text` reason for text it reads. The new
+  `PdfProcessResult::text_unreliable` (also on the Python result) is `true`
+  when the Markdown is text the default would have withheld. Off by
+  default.
 
 ## [1.25.2] - 2026-09-28
 

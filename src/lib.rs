@@ -4810,8 +4810,9 @@ fn process_document(
                         (items, rects, lines)
                     } else {
                         log::debug!(
-                            "suppressing garbage text from OCR-flagged pages: {:?}",
-                            garbage_pages
+                            "garbage text on OCR-flagged pages {:?} (kept: {})",
+                            garbage_pages,
+                            options.best_effort
                         );
                         for page in &garbage_pages {
                             add_ocr_reason(
@@ -4820,17 +4821,25 @@ fn process_document(
                                 OCR_REASON_SUSPECTED_GARBLED_TEXT,
                             );
                         }
+                        // `best_effort` keeps the text of these pages; the
+                        // reason above still says it is suspect.
+                        text_unreliable |= options.best_effort;
+                        let dropped: std::collections::HashSet<u32> = if options.best_effort {
+                            std::collections::HashSet::new()
+                        } else {
+                            garbage_pages
+                        };
                         let items: Vec<_> = items
                             .into_iter()
-                            .filter(|i| !garbage_pages.contains(&i.page))
+                            .filter(|i| !dropped.contains(&i.page))
                             .collect();
                         let rects: Vec<_> = rects
                             .into_iter()
-                            .filter(|r| !garbage_pages.contains(&r.page))
+                            .filter(|r| !dropped.contains(&r.page))
                             .collect();
                         let lines: Vec<_> = lines
                             .into_iter()
-                            .filter(|l| !garbage_pages.contains(&l.page))
+                            .filter(|l| !dropped.contains(&l.page))
                             .collect();
                         (items, rects, lines)
                     }
