@@ -186,6 +186,18 @@ fn stale_cmap_repairs_only_font_backed_identity_entries_through_extraction() {
 }
 
 #[test]
+fn stale_cmap_declaring_a_two_byte_codespace_over_one_byte_entries_is_repaired_too() {
+    // The same stale CMap written with the codespace `<0000> <FFFF>` and one
+    // entry spelled in four hex digits, which keeps it two bytes wide: the
+    // Type1 font still reads one byte per code, and the repair still applies.
+    let wide = STALE_MAP
+        .replace("<00><FF>", "<0000><FFFF>")
+        .replace("6 beginbfchar\n", "7 beginbfchar\n<00ff><00ff>\n");
+    let (mut doc, _) = subset_doc(GLYPHS, DIFFERENCES, &wide);
+    assert_eq!(first_text(&mut doc), "ščř\u{00a0}ffiΩ");
+}
+
+#[test]
 fn stale_cmap_keeps_valid_nonidentity_mappings_and_ligatures() {
     let valid =
         format!("{STALE_MAP}\n3 beginbfchar\n<21><017e>\n<22><0107>\n<23><00660069>\nendbfchar");

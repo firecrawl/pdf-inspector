@@ -494,12 +494,12 @@ fn cff_cid_to_gid(cff: &ttf_parser::cff::Table<'_>) -> HashMap<u16, u16> {
         .collect()
 }
 
-/// The embedded program (`FontFile2` or `FontFile3`) the descriptor of
-/// `font` names, decompressed — or as the stream holds it when its content
-/// does not decompress, or decompresses to nothing (a filter the decoder
-/// cannot apply, or one declared over bytes that are in fact plain), as
-/// the loaders before this one read it.
-fn font_program(font: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+/// The stream of the embedded program (`FontFile2` or `FontFile3`) the
+/// descriptor of `font` names.
+fn font_program_stream<'a>(
+    font: &'a lopdf::Dictionary,
+    doc: &'a Document,
+) -> Option<&'a lopdf::Stream> {
     let descriptor = match font.get(b"FontDescriptor").ok()? {
         Object::Reference(r) => doc.get_dictionary(*r).ok()?,
         Object::Dictionary(d) => d,
@@ -508,11 +508,26 @@ fn font_program(font: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
     let font_file = [&b"FontFile2"[..], &b"FontFile3"[..]]
         .into_iter()
         .find_map(|key| descriptor.get(key).ok().and_then(|o| o.as_reference().ok()))?;
-    let stream = doc.get_object(font_file).ok()?.as_stream().ok()?;
-    Some(match stream.decompressed_content() {
-        Ok(data) if !data.is_empty() => data,
-        _ => stream.content.clone(),
-    })
+    doc.get_object(font_file).ok()?.as_stream().ok()
+}
+
+/// The bytes of a program's `stream`, decompressed — or as the stream holds
+/// them when its content does not decompress, or decompresses to nothing (a
+/// filter the decoder cannot apply, or one declared over bytes that are in
+/// fact plain), as the loaders before this one read it. With a `limit`, a
+/// program that would take more bytes than that is not read at all.
+fn program_bytes(stream: &lopdf::Stream, limit: Option<usize>) -> Option<Vec<u8>> {
+    let decoded = match limit {
+        Some(limit) => stream.decompressed_content_with_limit(limit),
+        None => stream.decompressed_content(),
+    };
+    match decoded {
+        Ok(data) if !data.is_empty() => Some(data),
+        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => None,
+        _ => limit
+            .is_none_or(|limit| stream.content.len() <= limit)
+            .then(|| stream.content.clone()),
+    }
 }
 
 /// The font's `/Subtype` name.
@@ -544,16 +559,25 @@ fn identity_type0_descendant<'a>(
 /// own, an Identity-H or Identity-V Type0 font's descendant's. None for a
 /// Type0 font under another encoding, whose codes are not glyph indices.
 fn embedded_font_program(font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+    program_bytes(embedded_font_program_stream(font_dict, doc)?, None)
+}
+
+/// The stream of the program [`embedded_font_program`] reads.
+fn embedded_font_program_stream<'a>(
+    font_dict: &'a lopdf::Dictionary,
+    doc: &'a Document,
+) -> Option<&'a lopdf::Stream> {
     match font_subtype(font_dict)? {
-        b"Type0" => font_program(identity_type0_descendant(font_dict, doc)?, doc),
-        _ => font_program(font_dict, doc),
+        b"Type0" => font_program_stream(identity_type0_descendant(font_dict, doc)?, doc),
+        _ => font_program_stream(font_dict, doc),
     }
 }
 
 /// A font's embedded program (see [`embedded_font_program`]), decompressed
 /// and read on first need and at most once, for all that a CMap entry
-/// takes from it: the fallback of a sparse CMap, and the reading and the
-/// outlines a control-destination repair looks at.
+/// takes from it: the glyphs that tell whether a subset was renumbered,
+/// the fallback of a sparse CMap, and the reading and the outlines a
+/// control-destination repair looks at.
 struct LazyProgram<'a> {
     font_dict: &'a lopdf::Dictionary,
     doc: &'a Document,
@@ -576,6 +600,19 @@ impl<'a> LazyProgram<'a> {
         self.bytes
             .get_or_init(|| embedded_font_program(self.font_dict, self.doc))
             .as_deref()
+    }
+
+    /// The program's bytes when it takes no more than `limit` of them: those
+    /// read already, else read now within the bound. A program read this way
+    /// is kept for the other readers; one over the bound is not read, and a
+    /// reader without the bound ([`Self::bytes`]) still reads it.
+    fn bytes_within(&self, limit: usize) -> Option<&[u8]> {
+        if self.bytes.get().is_none() {
+            let bytes = embedded_font_program_stream(self.font_dict, self.doc)
+                .and_then(|stream| program_bytes(stream, Some(limit)))?;
+            let _ = self.bytes.set(Some(bytes));
+        }
+        self.bytes.get()?.as_deref()
     }
 
     /// The fallback CMap the program yields (see [`program_fallback_cmap`]),
@@ -620,7 +657,10 @@ enum ProgramFallback {
 /// allows — and the repair of the control destinations
 /// ([`repair_control_destinations`]), each in the role [`cmap_entry`]
 /// gives it. The program is decompressed at most once, on first need, for
-/// all that is taken from it.
+/// all that is taken from it; whatever `build` allows, the subset remap
+/// reads it when a renumbering is in question, as it alone tells a stale
+/// CMap from a right one there — within the per-stream decompression
+/// bound, as nothing else may read it then.
 fn font_cmap_entry(
     cmap: ToUnicodeCMap,
     font_dict: &lopdf::Dictionary,
@@ -628,10 +668,12 @@ fn font_cmap_entry(
     obj_num: u32,
     build: EntryBuild,
 ) -> CMapEntry {
-    let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+    let program = LazyProgram::new(font_dict, doc);
+    let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num, || {
+        program.bytes_within(crate::MAX_STREAM_DECOMPRESSED_BYTES)
+    });
     let primary_entries = primary.char_map.len() + primary.ranges.len();
     let sparse = primary_entries < 10;
-    let program = LazyProgram::new(font_dict, doc);
     let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
     let program_fallback = match build.program_fallback {
         ProgramFallback::Always => true,
@@ -1880,6 +1922,120 @@ fn parse_cid_to_gid_stream(data: &[u8]) -> Option<Vec<u16>> {
     Some(map)
 }
 
+/// The most codes a check of a repair's premise reads the CMap at: the
+/// lowest of those it looks at, over which it counts both readings it
+/// compares — the CIDs a `/CIDToGIDMap` sends to other glyphs
+/// ([`cmap_keyed_by_glyph_index`]), or the codes of a CMap and of its
+/// renumbering, which are the same entries in order
+/// ([`program_reads_cmap_as_written`]) — so the CMap of a whole large font
+/// costs no more to judge than a subset's.
+const MAX_PREMISE_CHECK_CODES: usize = 1024;
+
+/// Whether `cmap`, a font's ToUnicode CMap, is keyed by glyph index — the
+/// premise of [`build_cmap_with_cid_to_gid_map`] — rather than by CID, as
+/// the specification has it, as far as the font's `/CIDToGIDMap` shows.
+/// Over the lowest [`MAX_PREMISE_CHECK_CODES`] CIDs the map sends to
+/// another glyph (neither glyph 0 nor the glyph whose index is the CID),
+/// the CMap's usable entries are counted at each CID and at its glyph's
+/// index: a CMap keyed by CID has entries for the CIDs a font shows, one
+/// keyed by glyph index for their glyphs. A usable entry reads as some
+/// text, not as nothing, a control destination or U+FFFD. `Some(true)` when
+/// the glyph indexes have more usable entries, `Some(false)` when the CIDs
+/// do, and `None` when both have as many, as when the map sends no CID to
+/// another glyph.
+fn cmap_keyed_by_glyph_index(cmap: &ToUnicodeCMap, cid_to_gid: &[u16]) -> Option<bool> {
+    let usable = |code: u16| {
+        cmap.lookup(code)
+            .is_some_and(|text| !text.is_empty() && !text.contains('\u{FFFD}'))
+    };
+    let (mut at_cid, mut at_glyph) = (0usize, 0usize);
+    for (cid, &gid) in (0..=u16::MAX)
+        .zip(cid_to_gid)
+        .filter(|&(cid, &gid)| gid != 0 && gid != cid)
+        .take(MAX_PREMISE_CHECK_CODES)
+    {
+        at_cid += usize::from(usable(cid));
+        at_glyph += usize::from(usable(gid));
+    }
+    match at_glyph.cmp(&at_cid) {
+        std::cmp::Ordering::Greater => Some(true),
+        std::cmp::Ordering::Less => Some(false),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// The characters an embedded program's cmap sends a glyph to when the
+/// glyph reads as `text`, a CMap's entry: the text's one character, or the
+/// ligature it spells, as a CMap writes the glyph of U+FB01 as `fi`.
+fn cmap_chars_reading_as(text: &str) -> Vec<char> {
+    let mut chars = text.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        return vec![ch];
+    }
+    let spelled = crate::text_utils::expand_ligatures(text);
+    ('\u{FB00}'..='\u{FB06}')
+        .filter(|ligature| crate::text_utils::expand_ligatures(&ligature.to_string()) == spelled)
+        .collect()
+}
+
+/// Whether a glyph a program names `name` reads as `text`, a CMap's entry:
+/// the characters the name spells are the text's once ligatures are
+/// spelled out, as the glyph named `fi` (U+FB01) reads as `fi`.
+fn glyph_name_reads_as(name: &str, text: &str) -> bool {
+    glyph_name_to_string(name).is_some_and(|named| {
+        crate::text_utils::expand_ligatures(&named) == crate::text_utils::expand_ligatures(text)
+    })
+}
+
+/// Whether an Identity CID font's embedded `program` reads the font's codes
+/// as `cmap`, its ToUnicode CMap, has them — rather than as `renumbered`,
+/// the CMap renumbered by [`ToUnicodeCMap::remap_to_sequential`] for a
+/// subset that renumbered its glyphs and kept the CMap of the whole font.
+/// Under an Identity CIDToGIDMap a code is its glyph's index, and a glyph
+/// reads as a text when the program's cmap sends it the text's character
+/// or ligature ([`cmap_chars_reading_as`]), or its glyph name spells the
+/// text ([`glyph_name_reads_as`]). Each CMap counts the codes it has a
+/// usable entry for — some text, not nothing or U+FFFD — whose glyph reads
+/// as that entry, over the lowest [`MAX_PREMISE_CHECK_CODES`] codes it
+/// maps below the program's glyph count. `Some(true)` when the CMap as
+/// written agrees on more codes, `Some(false)` when the renumbered one
+/// does, and `None` when the program does not parse, says nothing of those
+/// glyphs, or both agree on as many.
+fn program_reads_cmap_as_written(
+    cmap: &ToUnicodeCMap,
+    renumbered: &ToUnicodeCMap,
+    program: &[u8],
+) -> Option<bool> {
+    let face = ttf_parser::Face::parse(program, 0).ok()?;
+    let glyphs = face.number_of_glyphs();
+    let reads_as = |gid: u16, text: &str| {
+        let glyph = ttf_parser::GlyphId(gid);
+        cmap_chars_reading_as(text)
+            .into_iter()
+            .any(|ch| face.glyph_index(ch) == Some(glyph))
+            || face
+                .glyph_name(glyph)
+                .is_some_and(|name| glyph_name_reads_as(name, text))
+    };
+    let agreeing = |cmap: &ToUnicodeCMap| {
+        cmap.mapped_runs()
+            .into_iter()
+            .flat_map(|(first, last)| first.max(1)..=last.min(glyphs.saturating_sub(1)))
+            .take(MAX_PREMISE_CHECK_CODES)
+            .filter(|&code| {
+                cmap.lookup(code).is_some_and(|text| {
+                    !text.is_empty() && !text.contains('\u{FFFD}') && reads_as(code, &text)
+                })
+            })
+            .count()
+    };
+    match agreeing(cmap).cmp(&agreeing(renumbered)) {
+        std::cmp::Ordering::Greater => Some(true),
+        std::cmp::Ordering::Less => Some(false),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
 /// Build a CID→Unicode CMap by applying a CIDToGIDMap to an existing CMap that maps GID→Unicode.
 fn build_cmap_with_cid_to_gid_map(
     cmap: &ToUnicodeCMap,
@@ -1907,11 +2063,20 @@ fn build_cmap_with_cid_to_gid_map(
 /// Some PDF generators subset-embed fonts by renumbering GIDs sequentially (1, 2, 3...)
 /// but fail to update the ToUnicode CMap, which still references original GID values.
 /// This detects the mismatch and remaps the CMap to sequential positions.
-fn try_remap_subset_cmap(
+///
+/// Each repair is made only when the font does not show the CMap right as
+/// written: a CMap whose entries cover the CIDs a `/CIDToGIDMap` sends to
+/// other glyphs better than those glyphs' indexes is keyed by CID (see
+/// [`cmap_keyed_by_glyph_index`]), and one whose codes the embedded
+/// `program` — the descendant's, read only when a renumbering is in
+/// question — reads as the CMap has them more often than as renumbered is
+/// not stale (see [`program_reads_cmap_as_written`]).
+fn try_remap_subset_cmap<'p>(
     cmap: ToUnicodeCMap,
     font_dict: &lopdf::Dictionary,
     doc: &Document,
     obj_num: u32,
+    program: impl FnOnce() -> Option<&'p [u8]>,
 ) -> (ToUnicodeCMap, Option<ToUnicodeCMap>) {
     // Only applies to Identity-H/V CID fonts
     let encoding = font_dict
@@ -1953,9 +2118,17 @@ fn try_remap_subset_cmap(
         return (cmap, None);
     }
 
-    // If there's an explicit CIDToGIDMap, build a repaired CMap using it.
-    if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
-        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
+    // If there's an explicit CIDToGIDMap, build a repaired CMap using it —
+    // unless the CMap is keyed by CID: read through the map, each code would
+    // read as another glyph's text. Nor is it renumbered then, as the codes
+    // of a font with such a map are not its glyph indexes.
+    let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
+    if let Some(cid_to_gid) = &cid_to_gid {
+        if cmap_keyed_by_glyph_index(&cmap, cid_to_gid) == Some(false) {
+            debug!("CIDToGIDMap repair skipped for obj={obj_num}: the CMap is keyed by CID");
+            return (cmap, None);
+        }
+        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, cid_to_gid) {
             debug!(
                 "CIDToGIDMap repair applied for obj={}: {} entries",
                 obj_num,
@@ -1986,12 +2159,29 @@ fn try_remap_subset_cmap(
         }
     }
 
+    // A width array like that is what a renumbered subset leaves, and what a
+    // subset that kept its glyph indexes can leave too; the program, where
+    // it says what its glyphs are, tells the two apart — for a font without
+    // a CIDToGIDMap of its own, whose codes are its glyph indexes. Nothing
+    // else does, so the program is read here even where the fallbacks leave
+    // it unread, within the per-stream decompression bound; only a font
+    // that got this far is, at most once.
+    let remapped = cmap.remap_to_sequential();
+    if cid_to_gid.is_none()
+        && program().and_then(|program| program_reads_cmap_as_written(&cmap, &remapped, program))
+            == Some(true)
+    {
+        debug!(
+            "Subset remap skipped for obj={obj_num}: the embedded program reads the CMap's codes as written"
+        );
+        return (cmap, None);
+    }
+
     debug!(
         "Subset GID mismatch detected for obj={}: W starts at CID {}, CMap min CID {}. Remapping to sequential.",
         obj_num, w_start, min_cid
     );
 
-    let remapped = cmap.remap_to_sequential();
     (cmap, Some(remapped))
 }
 
@@ -3157,7 +3347,11 @@ impl FontCMaps {
                 // only outside fast mode, which leaves that parsing to the
                 // regions it sends to OCR; fast mode leaves the program to
                 // them for the repair of the control destinations too, whose
-                // codes stay marked.
+                // codes stay marked. In fast mode the one read of a Type0
+                // font's program is the subset remap's, and only for a font
+                // whose width array looks renumbered (see
+                // `try_remap_subset_cmap`): nothing else tells a stale CMap
+                // from a right one there.
                 let is_type0 = font_subtype(font_dict) == Some(&b"Type0"[..]);
                 let entry = font_cmap_entry(
                     cmap,
@@ -5018,7 +5212,7 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 123);
+        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 123, || None);
         assert!(
             remapped.is_none(),
             "Remap must be skipped when W covers CMap max CID (this is 16.pdf)"
@@ -5058,7 +5252,7 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 456);
+        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 456, || None);
         assert!(
             remapped.is_some(),
             "Remap must fire when CMap's CIDs are outside W array coverage"
@@ -5113,7 +5307,7 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 789);
+        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 789, || None);
         assert!(
             remapped.is_none(),
             "Remap must be skipped for CIDFontType0 (CFF) descendants, including a \
@@ -5160,11 +5354,156 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 790);
+        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 790, || None);
         assert!(
             remapped.is_some(),
             "An indirect /Subtype naming CIDFontType2 must still reach the remap"
         );
+    }
+
+    /// A CMap mapping each of `codes` to the letter after the one before,
+    /// from `a`.
+    fn letters_at(codes: &[u16]) -> ToUnicodeCMap {
+        let mut cmap = ToUnicodeCMap::new();
+        for (&code, letter) in codes.iter().zip('a'..='z') {
+            cmap.char_map.insert(code, letter.to_string());
+        }
+        cmap.code_byte_length = 2;
+        cmap.refresh_gap_fills();
+        cmap
+    }
+
+    #[test]
+    fn cmap_keyed_by_cid_is_told_from_one_keyed_by_glyph_index() {
+        // A subset that numbered its glyphs 1, 2, 3, … in CID order: its
+        // CIDToGIDMap sends CID 4 to glyph 1, CIDs 8 to 25 to glyphs 2 to 19.
+        let cids: Vec<u16> = std::iter::once(4).chain(8..=25).collect();
+        let mut map = vec![0u16; 26];
+        for (glyph, &cid) in (1..).zip(&cids) {
+            map[usize::from(cid)] = glyph;
+        }
+        // A CMap keyed by CID has an entry at each CID the map sends to
+        // another glyph, and at some of their glyph indexes (4, and 8 to
+        // 19) only by the overlap of the two ranges.
+        assert_eq!(
+            cmap_keyed_by_glyph_index(&letters_at(&cids), &map),
+            Some(false)
+        );
+        // The same text keyed by glyph index is the repair's premise.
+        let glyphs: Vec<u16> = (1..=19).collect();
+        assert_eq!(
+            cmap_keyed_by_glyph_index(&letters_at(&glyphs), &map),
+            Some(true)
+        );
+        // A map that sends every CID to its own glyph says nothing either way.
+        let identity: Vec<u16> = (0..26).collect();
+        assert_eq!(
+            cmap_keyed_by_glyph_index(&letters_at(&cids), &identity),
+            None
+        );
+        // An entry that reads as a control destination, or as nothing, is
+        // no entry: a CMap whose entries at the moved CIDs are all unusable
+        // no longer covers them better than their glyph indexes.
+        let mut unusable = letters_at(&cids);
+        for (index, &cid) in cids.iter().enumerate() {
+            let text = if index % 2 == 0 { "\u{0001}" } else { "" };
+            unusable.char_map.insert(cid, text.to_string());
+        }
+        unusable.char_map.insert(1, "x".to_string());
+        assert_eq!(cmap_keyed_by_glyph_index(&unusable, &map), Some(true));
+    }
+
+    #[test]
+    fn test_try_remap_skipped_for_a_cmap_keyed_by_cid() {
+        // A CMap keyed by CID under a CIDToGIDMap stream that sends each CID
+        // to another glyph, as a subset numbering its glyphs in CID order
+        // writes it, and a W array that starts at CID 0 and stops short of
+        // the CMap's codes: no repair through the map, and no sequential
+        // remap either.
+        let cids: Vec<u16> = (0x45..=0x5E).collect();
+        let cmap = letters_at(&cids);
+        let mut map = vec![0u8; 2 * 0x5F];
+        for (glyph, &cid) in (1u16..).zip(&cids) {
+            map[2 * usize::from(cid)..2 * usize::from(cid) + 2]
+                .copy_from_slice(&glyph.to_be_bytes());
+        }
+        let mut doc = Document::new();
+        let map_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), map));
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
+        cid_font.set("CIDToGIDMap", lopdf::Object::Reference(map_id));
+        cid_font.set(
+            "W",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(500)]),
+            ]),
+        );
+        let cid_font_id = doc.add_object(cid_font);
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+
+        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 791, || None);
+        assert!(remapped.is_none());
+        assert_eq!(primary.lookup(0x45), Some("a".to_string()));
+    }
+
+    #[test]
+    fn a_cmap_entry_reads_as_its_ligature_through_a_program() {
+        // A CMap writes a ligature glyph's text as its letters or as the
+        // ligature's code point, and a program's cmap sends it the
+        // ligature's code point either way.
+        assert_eq!(cmap_chars_reading_as("a"), ['a']);
+        assert_eq!(cmap_chars_reading_as("\u{FB01}"), ['\u{FB01}']);
+        assert_eq!(cmap_chars_reading_as("fi"), ['\u{FB01}']);
+        assert_eq!(cmap_chars_reading_as("ffl"), ['\u{FB04}']);
+        assert_eq!(cmap_chars_reading_as("st"), ['\u{FB05}', '\u{FB06}']);
+        assert!(cmap_chars_reading_as("ab").is_empty());
+        // A glyph name reads as the text it spells, ligatures spelled out.
+        assert!(glyph_name_reads_as("fi", "fi"));
+        assert!(glyph_name_reads_as("fi", "\u{FB01}"));
+        assert!(glyph_name_reads_as("f_f_i", "ffi"));
+        assert!(glyph_name_reads_as("parenleft", "("));
+        assert!(!glyph_name_reads_as("fi", "fl"));
+        assert!(!glyph_name_reads_as(".notdef", ""));
+    }
+
+    #[test]
+    fn a_program_over_the_bound_is_left_to_the_readers_without_one() {
+        // A Type0 font under Identity-H whose descendant embeds a program of
+        // 64 plain bytes.
+        let mut doc = Document::new();
+        let program_id =
+            doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), vec![7u8; 64]));
+        let mut descriptor = lopdf::Dictionary::new();
+        descriptor.set("FontFile2", lopdf::Object::Reference(program_id));
+        let descriptor_id = doc.add_object(descriptor);
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
+        cid_font.set("FontDescriptor", lopdf::Object::Reference(descriptor_id));
+        let cid_font_id = doc.add_object(cid_font);
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Subtype", lopdf::Object::Name(b"Type0".to_vec()));
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+        // Within the bound, the program is read and kept for the others.
+        let program = LazyProgram::new(&font_dict, &doc);
+        assert_eq!(program.bytes_within(64).map(<[u8]>::len), Some(64));
+        assert_eq!(program.bytes().map(<[u8]>::len), Some(64));
+        // Over it, the program is not read, and a reader without the bound
+        // still reads it.
+        let program = LazyProgram::new(&font_dict, &doc);
+        assert_eq!(program.bytes_within(63), None);
+        assert_eq!(program.bytes().map(<[u8]>::len), Some(64));
+        // Read already, it serves the bounded reader as it is.
+        assert_eq!(program.bytes_within(63).map(<[u8]>::len), Some(64));
     }
 
     #[test]
