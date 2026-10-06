@@ -347,9 +347,10 @@ impl PdfOptions {
     /// the markdown of a Mixed or TextBased document is dropped when it is
     /// garbled or its fonts are undecodable. With this set, extraction runs
     /// anyway (including a scanned page's invisible text layer) and whatever
-    /// it reads is returned. `pdf_type` and the OCR page flags are unchanged,
-    /// and [`PdfProcessResult::text_unreliable`] says when the markdown is
-    /// text the default would have withheld.
+    /// it reads is returned. `pdf_type` and the OCR page flags still report
+    /// what detection found (extraction may add a garbled-text reason), and
+    /// [`PdfProcessResult::text_unreliable`] says when the markdown is text
+    /// the default would have withheld.
     pub fn best_effort(mut self, best_effort: bool) -> Self {
         self.best_effort = best_effort;
         self
