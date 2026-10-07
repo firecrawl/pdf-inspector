@@ -12,7 +12,7 @@
 mod contracts;
 #[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
 mod download;
-#[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 mod fusion;
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 mod image_analysis;
@@ -37,7 +37,7 @@ pub use contracts::{
 };
 #[cfg(all(feature = "model-download", not(target_arch = "wasm32")))]
 pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DOWNLOAD_TIMEOUT};
-#[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 pub use fusion::{
     fuse_ocr_pages, ocr_page_to_markdown, FusedPageMarkdown, FusedPages, OcrFusionError,
     OcrFusionOptions,
