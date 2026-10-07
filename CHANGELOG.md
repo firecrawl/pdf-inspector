@@ -17,7 +17,8 @@ version and date. Earlier releases are described in their
   whose glyph the program does not name read as its byte value: a
   heading set by macOS Quartz in a small subset of Times New Roman Bold
   read `CÔNG TY` as `CÔ!G TY` and `phẩm` as `ph'm`. The CMap's entry is
-  now read before that guess.
+  now read before that guess, and a code it maps to a control character
+  reads as U+FFFD.
 
 ## [1.25.2] - 2026-09-28
 
