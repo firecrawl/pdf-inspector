@@ -2657,7 +2657,22 @@ pub(crate) fn extract_text_from_operand(
                                 }
                             }
                         }
-                        // 6. Printable single-byte fallback — a guess at a
+                        // 6. A simple font's sparse ToUnicode CMap that
+                        // yielded the primary role to the program's reading
+                        // (the one alternative such a font has, see
+                        // `cmap_entry`): what it says of a code nothing
+                        // above reads is no guess, and a code it maps to
+                        // no text is not guessed at below either.
+                        if is_simple_font {
+                            match entry.remapped.as_ref().map(|c| c.lookup_code(code)) {
+                                Some(CodeMapping::Text(text)) if !text.contains('\u{FFFD}') => {
+                                    return Some(text);
+                                }
+                                Some(CodeMapping::ControlDestination) => control_destination = true,
+                                _ => {}
+                            }
+                        }
+                        // 7. Printable single-byte fallback — a guess at a
                         // code the CMap says nothing about, not at one it
                         // maps to no text
                         if b >= 0x20 && !control_destination {
@@ -6021,6 +6036,55 @@ mod tests {
                 &[0, 1, 0, 2, 0, 3, 0, 4, 0, 4]
             ),
             "coffee"
+        );
+    }
+
+    /// A simple font's sparse ToUnicode CMap, once the program's own reading
+    /// has taken the primary role, still reads the codes that reading has
+    /// no entry for: the program names the glyph of `o` alone, and `c` and
+    /// `e` read as the CMap has them, not as the bytes `!` and `$`. Where
+    /// both read a code, the program's reading stays first.
+    #[test]
+    fn a_simple_fonts_sparse_cmap_reads_the_codes_the_program_does_not() {
+        const SPARSE_BFCHAR: &str = "<21> <0063>\n<22> <006F>\n<24> <0065>";
+        let mut names = vec![None; 0x25];
+        names[0x22] = Some("o");
+        assert_eq!(
+            decode_simple_font_string(
+                SPARSE_BFCHAR,
+                Some(sfnt_with_glyph_names(&names)),
+                None,
+                &[0x21, 0x22, 0x24, 0x24]
+            ),
+            "coee"
+        );
+        names[0x21] = Some("x");
+        assert_eq!(
+            decode_simple_font_string(
+                SPARSE_BFCHAR,
+                Some(sfnt_with_glyph_names(&names)),
+                None,
+                &[0x21, 0x22, 0x24, 0x24]
+            ),
+            "xoee"
+        );
+    }
+
+    /// A control destination left in that sparse CMap — the program does
+    /// not name the glyph, so nothing repaired it — marks the code like any
+    /// other CMap's would: it is not guessed to be `#` from its byte value.
+    #[test]
+    fn a_simple_fonts_sparse_cmap_marks_its_control_destination() {
+        let mut names = vec![None; 0x25];
+        names[0x22] = Some("o");
+        assert_eq!(
+            decode_simple_font_string(
+                "<21> <0063>\n<22> <006F>\n<23> <0003>\n<24> <0065>",
+                Some(sfnt_with_glyph_names(&names)),
+                None,
+                &[0x21, 0x22, 0x23, 0x24, 0x24]
+            ),
+            "co\u{FFFD}ee"
         );
     }
 
