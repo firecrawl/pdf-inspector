@@ -680,7 +680,9 @@ fn extract_form_xobject_text_inner(
                 // it neither emits items nor votes on page rotation — unless
                 // the caller asked for the hidden layer.
                 if let Some(mode) = op.operands.first().and_then(get_number) {
-                    text_rendering_mode = mode as i32;
+                    if mode.fract() == 0.0 && (0.0..=7.0).contains(&mode) {
+                        text_rendering_mode = mode as i32;
+                    }
                 }
             }
             "Tz" => {
