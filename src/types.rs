@@ -120,6 +120,12 @@ pub(crate) enum BaseEncoding {
 
 /// Explicit glyph encodings and narrowly verified repairs for a stale CMap.
 pub(crate) struct FontEncoding {
+    /// The character of each code the font's `/Differences` name by a name
+    /// that reads as one (through the embedded program for a numbered
+    /// name), and, beneath them, of each code the built-in encoding of an
+    /// embedded Type 1 program names, for a font whose `/Encoding` names no
+    /// base (see `fonts::type1_builtin_encoding`); a longer reading is in
+    /// `sequences`.
     pub(crate) differences: FontEncodingMap,
     /// Codes whose entry in a stale ToUnicode CMap describes the slot's
     /// original occupant rather than the glyph the font's `/Differences`
@@ -141,12 +147,18 @@ pub(crate) struct FontEncoding {
     /// entry is a control destination, where the standard decode reads the
     /// rest as before.
     pub(crate) named: Option<BaseEncoding>,
-    /// Every code the `/Differences` array names, mapped or not: a code
-    /// named there is that glyph, whatever the base encoding puts at it.
+    /// Every code the `/Differences` array names, mapped or not, and each
+    /// code other than the word space that the encoding array of an
+    /// embedded Type 1 program leaves at `.notdef`, for a font whose
+    /// `/Encoding` names no base (see `fonts::type1_builtin_encoding`): a
+    /// code named there is that glyph, whatever the base encoding puts at
+    /// it, and one that `differences` and `sequences` do not read reads as
+    /// nothing.
     pub(crate) named_codes: std::collections::HashSet<u8>,
-    /// Codes whose `/Differences` glyph stands for several characters: a
-    /// ligature named by its components (`f_t`, `f_f_i`) or by a `uni`
-    /// sequence, read as the letters it joins.
+    /// Codes whose glyph stands for several characters, named by the
+    /// `/Differences` or, beneath them, by the encoding array of an
+    /// embedded Type 1 program: a ligature named by its components (`f_t`,
+    /// `f_f_i`) or by a `uni` sequence, read as the letters it joins.
     pub(crate) sequences: HashMap<u8, String>,
 }
 
@@ -215,6 +227,12 @@ impl FontWidthInfo {
 
 /// All font width info for a page, keyed by font resource name
 pub(crate) type PageFontWidths = HashMap<String, FontWidthInfo>;
+
+/// Whether each font resource of a page is composite (`/Subtype /Type0`): a
+/// composite font's codes are as wide as its CMap says, every other font
+/// shows one byte per code (PDF 32000-1:2008, 9.6). A font whose subtype
+/// cannot be read has no entry.
+pub(crate) type PageFontKinds = HashMap<String, bool>;
 
 // ── Public types ─────────────────────────────────────────────────────
 

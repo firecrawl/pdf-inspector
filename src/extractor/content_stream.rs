@@ -15,9 +15,9 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, build_type3_scales, build_type3_y_flips,
-    compute_string_width_ts, extract_text_from_operand, font_style, get_font_file2_obj_num,
-    get_operand_bytes, CMapDecisionCache, FontStyle, FontStyleCache,
+    build_font_encodings, build_font_kinds, build_font_widths, build_type3_scales,
+    build_type3_y_flips, compute_string_width_ts, extract_text_from_operand, font_style,
+    get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyle, FontStyleCache,
 };
 use super::geometry::{
     advanced_tm, estimated_advance_for_glyphs, estimated_advance_ts, normalize_degrees,
@@ -499,6 +499,7 @@ pub(crate) fn extract_page_text_items_with_options(
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts, style_cache);
+    let font_kinds = build_font_kinds(&fonts);
     let type3_scales = build_type3_scales(doc, &fonts);
     let type3_y_flips = build_type3_y_flips(doc, &fonts);
 
@@ -1022,6 +1023,7 @@ pub(crate) fn extract_page_text_items_with_options(
                         &encoding_cache,
                         &mut cmap_decisions,
                         &font_widths,
+                        &font_kinds,
                     ) {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
@@ -1158,6 +1160,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                                     &encoding_cache,
                                                     decisions,
                                                     &font_widths,
+                                                    &font_kinds,
                                                 )
                                             })
                                         },
@@ -1213,6 +1216,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                     &encoding_cache,
                                     probe_decisions.get_or_insert_with(|| cmap_decisions.clone()),
                                     &font_widths,
+                                    &font_kinds,
                                 )
                             })
                         };
@@ -1470,6 +1474,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                         &encoding_cache,
                                         &mut cmap_decisions,
                                         &font_widths,
+                                        &font_kinds,
                                     )
                                 {
                                     // A short string with word-gap character
@@ -1502,6 +1507,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                                         &encoding_cache,
                                                         decisions,
                                                         &font_widths,
+                                                        &font_kinds,
                                                     )
                                                 })
                                             },
@@ -1845,6 +1851,7 @@ pub(crate) fn extract_page_text_items_with_options(
                         &encoding_cache,
                         &mut cmap_decisions,
                         &font_widths,
+                        &font_kinds,
                     ) {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
@@ -1970,6 +1977,7 @@ pub(crate) fn extract_page_text_items_with_options(
                                                 &encoding_cache,
                                                 decisions,
                                                 &font_widths,
+                                                &font_kinds,
                                             )
                                         })
                                     },

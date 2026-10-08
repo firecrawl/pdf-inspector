@@ -70,6 +70,10 @@ const SCRIPT_MAX_RATIO: f32 = 0.75;
 /// Smallest ratio: body text beside a drop cap or a display figure is far
 /// smaller than this, and never a script of it.
 const SCRIPT_MIN_RATIO: f32 = 0.4;
+/// Largest size step between neighbouring glyphs of a run, as a fraction of
+/// the larger: a sign from a symbol font set a design size above the digits
+/// beside it is within a step of them, the body text around a run is not.
+const SCRIPT_RUN_SIZE_STEP: f32 = 0.2;
 /// Minimum |baseline offset| as a fraction of the anchor size. Level runs —
 /// small caps, a smaller label on the same baseline — are not scripts.
 const SCRIPT_MIN_SHIFT: f32 = 0.1;
@@ -262,7 +266,7 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 let fs = last.font_size.max(glyph.font_size);
                 let gap = glyph.x - item_right(last);
                 (last.y - glyph.y).abs() <= SCRIPT_RUN_BASELINE_TOL
-                    && (last.font_size - glyph.font_size).abs() <= fs * 0.2
+                    && (last.font_size - glyph.font_size).abs() <= fs * SCRIPT_RUN_SIZE_STEP
                     && gap <= fs * SCRIPT_CHAIN_GAP
                     && gap >= -fs
             });
@@ -279,10 +283,29 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
             }
             let first = &items[chain[0]];
             let last = &items[*chain.last().unwrap()];
-            let run_fs = chain
-                .iter()
-                .map(|&i| items[i].font_size)
-                .fold(0.0_f32, f32::max);
+            // The run's size is that of its letters and digits: a sign set
+            // from a symbol font can be a design size above them (the minus
+            // of an exponent in TeX), which would take the run past the size
+            // a script may have. A sign more than a step above them (a chain
+            // that grows a step at a time up to the body size), and a run of
+            // signs alone, size the run by its largest glyph.
+            let size_of = |letters_and_digits: bool| {
+                chain
+                    .iter()
+                    .filter(|&&i| {
+                        !letters_and_digits || items[i].text.chars().any(char::is_alphanumeric)
+                    })
+                    .map(|&i| items[i].font_size)
+                    .fold(0.0_f32, f32::max)
+            };
+            let (letters_fs, largest_fs) = (size_of(true), size_of(false));
+            let run_fs = if letters_fs > 0.0
+                && largest_fs - letters_fs <= largest_fs * SCRIPT_RUN_SIZE_STEP
+            {
+                letters_fs
+            } else {
+                largest_fs
+            };
 
             // Nearest anchor wins; on a tie the preceding word does — a
             // footnote reference belongs to the word before it, not to the
@@ -692,6 +715,41 @@ mod tests {
             "run spans all glyphs"
         );
         assert!(merged.iter().filter(|i| i.is_script()).count() == 1);
+    }
+
+    #[test]
+    fn a_sign_set_a_size_above_its_digits_keeps_the_run_a_script() {
+        // "cm⁻³": the exponent's minus is set from a symbol font a design
+        // size above its digit (7.89pt against 7.57pt, beside 10.16pt
+        // text); the run's size is its digit's, which a script's may be.
+        let exponent = |glyphs: Vec<TextItem>| {
+            let mut items = vec![make_item_fs("pc cm", 200.0, 192.13, 53.0, 10.16)];
+            items.extend(glyphs);
+            items.push(make_item_fs("), were", 263.6, 192.13, 30.0, 10.16));
+            merge_subscript_items(items)
+        };
+        let merged = exponent(vec![
+            make_item_fs("\u{2212}", 253.1, 195.75, 6.1, 7.89),
+            make_item_fs("3", 259.3, 195.75, 3.8, 7.57),
+        ]);
+        assert_eq!(texts(&merged), vec!["pc cm", "\u{2212}3", "), were"]);
+        assert!(
+            (merged[1].baseline_shift - 3.62).abs() < 1e-3,
+            "{:?}",
+            merged[1]
+        );
+        // The sign alone keeps its own size, past a script's.
+        let merged = exponent(vec![make_item_fs("\u{2212}", 253.1, 195.75, 6.1, 7.89)]);
+        assert!(merged.iter().all(|item| !item.is_script()), "{merged:?}");
+        // Signs that grow a step at a time from a digit's size to the body
+        // size are no sign of a symbol font: the run is as large as its
+        // largest glyph, and no script.
+        let merged = exponent(vec![
+            make_item_fs("7", 253.1, 195.75, 3.5, 7.0),
+            make_item_fs("(", 256.6, 195.75, 2.8, 8.5),
+            make_item_fs(")", 259.4, 195.75, 3.4, 10.2),
+        ]);
+        assert!(merged.iter().all(|item| !item.is_script()), "{merged:?}");
     }
 
     #[test]
