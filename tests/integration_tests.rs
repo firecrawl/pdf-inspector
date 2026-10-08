@@ -2290,30 +2290,21 @@ fn test_extract_structure_elements_untagged_pdf_empty() {
 }
 
 #[test]
-fn test_identity_h_no_tounicode_suppresses_garbage() {
+fn test_identity_h_no_tounicode_decodes_through_cid_collection() {
     // shinagawa_identity_h.pdf uses YuGothic with Identity-H encoding and no
-    // usable ToUnicode CMap. The raw CID bytes (e.g. 0x08 0x37, 0x0E 0x0F)
-    // contain non-ASCII high bytes and previously fell through to the
-    // per-byte Latin-1 fallback, producing high-Latin-1 mojibake that
-    // `is_cid_garbage` flagged. The Type0/CID guard in
-    // `extract_text_from_operand` now emits one U+FFFD per CID instead of
-    // mojibake; `detect_encoding_issues` trips on that and suppresses the
-    // markdown / flags the page for OCR — so we still pass this test, but
-    // via the deliberate marker path rather than by accident.
+    // ToUnicode CMap. Its CIDFont declares Adobe-Japan1, so its CIDs read
+    // through the collection's predefined UCS2 map — the fallback that never
+    // ran while the bundled bcmaps failed to parse (#573). Until then this
+    // test pinned U+FFFD per CID and suppressed markdown; the synthetic
+    // Identity-ordering tests below still pin that path for fonts that have
+    // no collection to read through.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
 
-    // Pre-suppression check: the raw text items must contain the U+FFFD
-    // markers that prove the Type0/CID fallback fired. This pins the
-    // mechanism so a future regression that re-enables Latin-1 mojibake
-    // would fail loudly here, not just silently change the suppression
-    // chain to one that depends on `is_cid_garbage` + high-Latin-1 chars.
     let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
     let combined: String = items.iter().map(|i| i.text.as_str()).collect();
     assert!(
-        combined.contains('\u{FFFD}'),
-        "Type0/CID font with unparseable ToUnicode CMap should emit U+FFFD per CID; \
-         got {} chars: {:?}",
-        combined.len(),
+        !combined.contains('\u{FFFD}'),
+        "Adobe-Japan1 CIDs should decode through the collection; got: {:?}",
         &combined[..combined.len().min(100)]
     );
     assert!(
@@ -2325,21 +2316,11 @@ fn test_identity_h_no_tounicode_suppresses_garbage() {
     );
 
     let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
-
-    // Page 1 should be flagged for OCR
-    assert!(
-        result.pages_needing_ocr.contains(&1),
-        "Page with Identity-H font without ToUnicode should be flagged for OCR"
-    );
-
-    // Markdown should be empty (garbage suppressed)
+    assert!(!result.has_encoding_issues);
+    // The same text poppler and pdf.js read from the page.
     let md = result.markdown.unwrap_or_default();
-    assert!(
-        md.trim().is_empty(),
-        "Garbage CID text should be suppressed, got {} chars: {:?}",
-        md.len(),
-        &md[..md.len().min(100)]
-    );
+    assert!(md.contains("羽田空港新飛行経路に係る航空機騒音の測定結果（令和3年4月分）"));
+    assert!(md.contains("|4月30日|有|81.0|"));
 }
 
 #[test]
@@ -5319,14 +5300,17 @@ fn test_extract_pages_markdown_invalid_buffer() {
 }
 
 #[test]
-fn test_extract_pages_markdown_gid_pages_need_ocr() {
-    // shinagawa_identity_h.pdf has GID-encoded fonts
+fn test_extract_pages_markdown_cid_collection_page_is_native() {
+    // shinagawa_identity_h.pdf has an Identity-H font without ToUnicode whose
+    // CIDFont declares Adobe-Japan1. Its text decodes through the collection's
+    // predefined map, so the page is served natively rather than routed to OCR.
     let buf = std::fs::read("tests/fixtures/shinagawa_identity_h.pdf").unwrap();
     let result = extract_pages_markdown_mem(&buf, Some(&[0])).unwrap();
 
     assert_eq!(result.pages.len(), 1);
-    assert!(result.pages[0].needs_ocr);
-    assert!(result.pages_needing_ocr.contains(&1)); // 1-indexed
+    assert!(!result.pages[0].needs_ocr);
+    assert!(result.pages_needing_ocr.is_empty());
+    assert!(result.pages[0].markdown.contains("羽田空港新飛行経路"));
 }
 
 #[test]
