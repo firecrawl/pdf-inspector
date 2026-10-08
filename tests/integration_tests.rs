@@ -11060,3 +11060,17 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+#[test]
+fn literal_html_is_escaped_without_escaping_engine_markup() {
+    let pdf = std::fs::read("tests/fixtures/literal_html_markup.pdf").unwrap();
+    let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert!(
+        markdown.contains("# &lt;b&gt;Escape &amp; test&lt;/b&gt;"),
+        "{markdown:?}"
+    );
+    assert!(
+        markdown.contains("&lt;a test&gt; &amp; value <u>underline</u> &lt;u&gt;underline&lt;/u&gt;"),
+        "{markdown:?}"
+    );
+}

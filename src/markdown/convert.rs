@@ -1208,7 +1208,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             let heading_text = if options.detect_underline {
                 line.text_with_formatting(false, false, true)
             } else {
-                plain_text.clone()
+                line.text_with_formatting(false, false, false)
             };
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
             if is_toc_marker_heading(plain_trimmed) {
@@ -1627,7 +1627,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 let heading_text = if options.detect_underline {
                     line.text_with_formatting(false, false, true)
                 } else {
-                    plain_text.clone()
+                    line.text_with_formatting(false, false, false)
                 };
                 output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
                 if is_toc_marker_heading(plain_trimmed) {
@@ -1784,6 +1784,21 @@ mod tests {
         let mut item = make_item(text, page, None);
         item.y = y;
         make_line(vec![item])
+    }
+
+    #[test]
+    fn headings_escape_literal_html_without_underline_detection() {
+        let mut heading = make_item("<b>Literal & heading</b>", 1, None);
+        heading.font_size = 24.0;
+        heading.height = 24.0;
+        let lines = vec![make_line(vec![heading]), line_at("Body text", 1, 676.0)];
+        let mut options = MarkdownOptions::default();
+        options.detect_underline = false;
+        let markdown = to_markdown_from_lines(lines, options);
+        assert!(
+            markdown.contains("# &lt;b&gt;Literal &amp; heading&lt;/b&gt;"),
+            "{markdown:?}"
+        );
     }
 
     #[test]
