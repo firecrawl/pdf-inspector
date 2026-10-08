@@ -791,25 +791,34 @@ fn find_relative_valleys(
 }
 
 /// Detect whether a side of a gutter consists predominantly of list-marker
-/// glyphs (•, ●, ○, ◦, ▪, ▫, ◆, ◇). A column of bullets on the left margin
-/// creates a spurious histogram valley between the bullet and the content.
-/// Treating it as a real column splits each list item's text across two
-/// "columns," so we reject these candidates.
+/// glyphs from [`crate::markdown::classify::BULLET_GLYPHS`]. A column of bullets
+/// on the left margin creates a spurious histogram valley between the bullet
+/// and the content. Treating it as a real column splits each list item's text
+/// across two "columns," so we reject these candidates.
 fn is_list_marker_column(items: &[&&TextItem]) -> bool {
-    const LIST_MARKERS: &[char] = &['•', '●', '○', '◦', '▪', '▫', '◆', '◇', '■', '□'];
+    use crate::markdown::classify::is_standalone_bullet_glyph;
+    // Layout-only: large squares/diamonds are excluded from BULLET_GLYPHS so
+    // they do not demote decorative heading prefixes, but repeated left-margin
+    // gutters of these glyphs are still real list markers and must not seed
+    // a column split.
+    const LAYOUT_GUTTER_MARKERS: &[char] = &['◆', '◇', '■', '□'];
+    fn is_layout_gutter_marker(text: &str) -> bool {
+        if is_standalone_bullet_glyph(text) {
+            return true;
+        }
+        let trimmed = text.trim();
+        let mut chars = trimmed.chars();
+        matches!(
+            (chars.next(), chars.next()),
+            (Some(c), None) if LAYOUT_GUTTER_MARKERS.contains(&c)
+        )
+    }
     if items.is_empty() {
         return false;
     }
     let marker_count = items
         .iter()
-        .filter(|i| {
-            let t = i.text.trim();
-            let mut chars = t.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => LIST_MARKERS.contains(&c),
-                _ => false,
-            }
-        })
+        .filter(|i| is_layout_gutter_marker(&i.text))
         .count();
     // Require ≥80% of items on this side to be standalone markers. A handful
     // of non-marker items (stray page numbers, footnote refs) shouldn't
@@ -4118,12 +4127,13 @@ mod tests {
 
     #[test]
     fn is_list_marker_column_detects_bullets() {
-        let items = vec![
-            make_item(1, 90.0, 100.0, "●"),
-            make_item(1, 90.0, 114.0, "●"),
-            make_item(1, 90.0, 128.0, "●"),
-            make_item(1, 90.0, 142.0, "●"),
-        ];
+        // Cover every unambiguous marker, including the newly supported ‣ and ⁃.
+        let markers = ["•", "●", "○", "◦", "▪", "▫", "‣", "⁃", "◆", "◇", "■", "□"];
+        let items: Vec<TextItem> = markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| make_item(1, 90.0, 100.0 + index as f32 * 14.0, marker))
+            .collect();
         let refs: Vec<&TextItem> = items.iter().collect();
         let wrapped: Vec<&&TextItem> = refs.iter().collect();
         assert!(is_list_marker_column(&wrapped));
