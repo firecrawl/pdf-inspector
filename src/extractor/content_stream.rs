@@ -689,7 +689,7 @@ pub(crate) fn extract_page_text_items_with_options(
     let mut actual_text_glyph_font: Option<String> = None; // font that painted the span's first glyph
     let mut actual_text_glyph_font_size: Option<f32> = None; // `Tf` size in force for that glyph, sign included
     let mut actual_text_glyph_paint: Option<TextPaint> = None; // paint state in force for that glyph
-    let mut actual_text_visible_paint: Option<TextPaint> = None; // paint of the span's first glyph shown in a mode other than 3
+    let mut actual_text_glyph_visible = false; // that glyph was shown in a mode other than 3
     let mut actual_text_glyphs_measured: bool = true; // every painted font had width metrics
     let mut actual_text_estimate_ts: f32 = 0.0; // estimate accumulated per painted run, its own size and spacing
                                                 // Glyphs painted inside the current ActualText span: sizes the span's box
@@ -960,8 +960,13 @@ pub(crate) fn extract_page_text_items_with_options(
                     // position (actual_text_start_tm) can be on the previous line.
                     if suppress_glyph_extraction {
                         // The first *painted* glyph decides the span's position
-                        // and state; an empty show is not it.
-                        if actual_text_glyph_tm.is_none() && glyph_count > 0 {
+                        // and state; an empty show is not it. A visible glyph
+                        // takes over from hidden ones shown before it.
+                        if glyph_count > 0
+                            && (actual_text_glyph_tm.is_none()
+                                || (!actual_text_glyph_visible && text_rendering_mode != 3))
+                        {
+                            actual_text_glyph_visible = text_rendering_mode != 3;
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
                             actual_text_glyph_font = Some(current_font.clone());
@@ -970,12 +975,6 @@ pub(crate) fn extract_page_text_items_with_options(
                             actual_text_glyph_scale = Some(horizontal_scale);
                         }
                         actual_text_glyph_count += glyph_count;
-                        if glyph_count > 0
-                            && text_rendering_mode != 3
-                            && actual_text_visible_paint.is_none()
-                        {
-                            actual_text_visible_paint = Some(text_paint.clone());
-                        }
                         actual_text_glyphs_measured &= w_ts_opt.is_some();
                         actual_text_estimate_ts += estimate_ts * horizontal_scale;
                         if glyph_count > 0 {
@@ -1383,8 +1382,13 @@ pub(crate) fn extract_page_text_items_with_options(
                                     );
                                 }
                                 // An ActualText span starts at its first
-                                // painted glyph too.
-                                if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                                // painted glyph too, its first visible one
+                                // when hidden glyphs came before.
+                                if suppress_glyph_extraction
+                                    && (actual_text_glyph_tm.is_none()
+                                        || (!actual_text_glyph_visible && text_rendering_mode != 3))
+                                {
+                                    actual_text_glyph_visible = text_rendering_mode != 3;
                                     actual_text_glyph_tm = Some(advanced_tm(
                                         &text_matrix,
                                         total_width_ts,
@@ -1434,12 +1438,6 @@ pub(crate) fn extract_page_text_items_with_options(
                             }
                             if suppress_glyph_extraction {
                                 actual_text_glyph_count += element_glyphs;
-                                if element_glyphs > 0
-                                    && text_rendering_mode != 3
-                                    && actual_text_visible_paint.is_none()
-                                {
-                                    actual_text_visible_paint = Some(text_paint.clone());
-                                }
                                 actual_text_glyphs_measured &= font_info.is_some();
                                 actual_text_estimate_ts += element_estimate_ts * horizontal_scale;
                                 if element_glyphs > 0 {
@@ -1770,12 +1768,15 @@ pub(crate) fn extract_page_text_items_with_options(
                 }
                 // Capture first-glyph position for ActualText AFTER the
                 // line move — the BDC-entry matrix is on the previous line.
+                // A visible glyph takes over from hidden ones before it.
                 if suppress_glyph_extraction
-                    && actual_text_glyph_tm.is_none()
+                    && (actual_text_glyph_tm.is_none()
+                        || (!actual_text_glyph_visible && text_rendering_mode != 3))
                     && show_operand
                         .and_then(get_operand_bytes)
                         .is_some_and(|raw| !raw.is_empty())
                 {
+                    actual_text_glyph_visible = text_rendering_mode != 3;
                     actual_text_glyph_tm = Some(text_matrix);
                     actual_text_glyph_rise = Some(text_rise);
                     actual_text_glyph_font = Some(current_font.clone());
@@ -1784,15 +1785,10 @@ pub(crate) fn extract_page_text_items_with_options(
                     actual_text_glyph_scale = Some(horizontal_scale);
                 }
                 if suppress_glyph_extraction {
-                    let shown = shown_glyph_count(
+                    actual_text_glyph_count += shown_glyph_count(
                         show_operand.and_then(get_operand_bytes),
                         font_widths.get(&current_font),
                     );
-                    actual_text_glyph_count += shown;
-                    if shown > 0 && text_rendering_mode != 3 && actual_text_visible_paint.is_none()
-                    {
-                        actual_text_visible_paint = Some(text_paint.clone());
-                    }
                     actual_text_glyphs_measured &= font_widths.contains_key(&current_font);
                     actual_text_estimate_ts += estimated_string_advance_ts(
                         show_operand.and_then(get_operand_bytes),
@@ -2155,7 +2151,7 @@ pub(crate) fn extract_page_text_items_with_options(
                     actual_text_glyph_rise = None;
                     actual_text_glyph_font = None;
                     actual_text_glyph_paint = None;
-                    actual_text_visible_paint = None;
+                    actual_text_glyph_visible = false;
                     actual_text_glyph_font_size = None;
                     actual_text_glyphs_measured = true;
                     actual_text_estimate_ts = 0.0;
@@ -2171,7 +2167,10 @@ pub(crate) fn extract_page_text_items_with_options(
                         // Use the first-glyph position (if available) instead of the
                         // BDC-entry position. Td operators between BDC and the first
                         // Tj may have moved the text position to the correct line —
-                        // the BDC-entry position can be on the previous line.
+                        // the BDC-entry position can be on the previous line. In a
+                        // span mixing hidden and visible glyphs, the position, rise,
+                        // font, size, scale, and paint are all its first visible
+                        // glyph's.
                         let glyph_tm = actual_text_glyph_tm.take();
                         let glyph_rise = actual_text_glyph_rise.take();
                         let entry_tm = actual_text_start_tm.take();
@@ -2188,22 +2187,19 @@ pub(crate) fn extract_page_text_items_with_options(
                                 .take()
                                 .unwrap_or(current_font_size);
                             // So does the paint: the item reports the colours
-                            // and render mode its first visible glyph was
-                            // shown with (its first glyph when none was
-                            // visible), and weight added by painting is read
-                            // from the same state, so paint set later in the
-                            // span changes neither.
-                            let visible_paint = actual_text_visible_paint.take();
-                            let painted_any_visible = visible_paint.is_some();
-                            let glyph_paint = visible_paint
-                                .or(actual_text_glyph_paint.take())
+                            // and render mode that glyph was shown with, and
+                            // weight added by painting is read from the same
+                            // state, so paint set later in the span changes
+                            // neither.
+                            let glyph_paint = actual_text_glyph_paint
+                                .take()
                                 .unwrap_or_else(|| text_paint.clone());
                             let paint = glyph_paint.run_paint();
                             // A span is hidden only when every glyph it
                             // painted was invisible; one with no glyphs
                             // follows the mode in force at its end.
                             let hidden = if actual_text_glyph_count > 0 {
-                                !painted_any_visible
+                                !std::mem::take(&mut actual_text_glyph_visible)
                             } else {
                                 paint.render_mode == 3
                             };
@@ -3902,6 +3898,56 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
                 String::from_utf8_lossy(content)
             );
         }
+        // Its position, size, and width come from its first visible glyph,
+        // not from a hidden run shown before it on another line or size.
+        for (content, y) in [
+            (
+                &b"3 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Hello) >> BDC
+                   (x) Tj 0 Tr 0 -40 Td /F1 24 Tf (y) Tj EMC ET"[..],
+                660.0,
+            ),
+            (
+                b"3 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Hello) >> BDC
+                   [(x)] TJ 0 Tr 0 -40 Td /F1 24 Tf [(y)] TJ EMC ET",
+                660.0,
+            ),
+            (
+                b"3 Tr BT /F1 12 Tf 12 TL 72 700 Td /Span << /ActualText (Hello) >> BDC
+                   (x) ' 0 Tr /F1 24 Tf (y) ' EMC ET",
+                676.0,
+            ),
+        ] {
+            let items = extract_simple_items(content);
+            assert_eq!(items.len(), 1, "{items:?}");
+            let item = &items[0];
+            assert_eq!((item.text.as_str(), item.render_mode), ("Hello", Some(0)));
+            assert!((item.x - 72.0).abs() < 0.1, "{item:?}");
+            assert!((item.y - y).abs() < 0.1, "{item:?}");
+            assert!((item.font_size - 24.0).abs() < 0.1, "{item:?}");
+            // One 600-unit glyph at 24pt.
+            assert!((item.width - 14.4).abs() < 0.1, "{item:?}");
+        }
+        // Clip-only (mode 7) glyphs are extracted like any other run in a
+        // mode other than 3, so they keep a mixed span's replacement too.
+        let plain = extract_simple_items(b"3 Tr BT /F1 12 Tf 72 700 Td (xx) Tj 7 Tr (yy) Tj ET");
+        assert_eq!(
+            plain
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["yy"]
+        );
+        let clip_only = extract_simple_items(
+            b"3 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Hello) >> BDC
+              (xx) Tj 7 Tr (yy) Tj EMC ET",
+        );
+        assert_eq!(
+            clip_only
+                .iter()
+                .map(|item| (item.text.as_str(), item.render_mode))
+                .collect::<Vec<_>>(),
+            [("Hello", Some(7))]
+        );
         // A span whose every glyph was hidden is still left out.
         let hidden = extract_simple_items(
             b"3 Tr BT /F1 12 Tf 72 700 Td /Span << /ActualText (Secret) >> BDC
