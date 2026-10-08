@@ -129,6 +129,13 @@ fn resource_chain<'a>(
 
 /// The scan of the page's content streams, followed through `Do`, and
 /// the streams' own counts.
+///
+/// The page's own streams are decoded within one byte budget of
+/// [`crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES`] over them
+/// all, as the extractor reads them. A stream that would exceed what is
+/// left of it — a small Flate stream inflating to gigabytes — is refused
+/// before it is held, and from then on none is read, as the executed-form
+/// budget refuses: the page's evidence is incomplete.
 fn scan_page<'a>(
     doc: &'a Document,
     page_id: ObjectId,
@@ -143,11 +150,20 @@ fn scan_page<'a>(
         .unwrap_or_default();
     let mut state = ContentScanState::new(doc, page_box, true);
     let mut counts = ContentCounts::default();
+    let mut bytes_left = page_content_bytes_budget();
     for content_id in doc.get_page_contents(page_id) {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = stream
-                .decompressed_content()
-                .unwrap_or_else(|_| stream.content.clone());
+            let Some(content) = decoded_within(stream, bytes_left) else {
+                // Sticky, as the form budget is: from the stream that would
+                // pass the budget on, none is read — decoding a bomb again
+                // for each later stream costs the reads the budget forbids.
+                // The page's evidence is incomplete: what the unread streams
+                // show, they still show.
+                bytes_left = 0;
+                state.incomplete = true;
+                continue;
+            };
+            bytes_left = bytes_left.saturating_sub(content.len());
             counts.add(scan_content_stream(
                 &content,
                 unique_chars,
@@ -220,6 +236,33 @@ fn executed_form_bytes_budget() -> usize {
 thread_local! {
     /// The byte budget set in place of `EXECUTED_FORM_BYTES_MAX` on this thread.
     static EXECUTED_FORM_BYTES_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The byte budget over the page's own content streams, whatever their
+/// number: no more than the extractor reads of them
+/// ([`crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES`]).
+#[cfg(not(test))]
+fn page_content_bytes_budget() -> usize {
+    crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES
+}
+
+/// The byte budget over the page's own content streams: what the test on
+/// this thread set in place of
+/// [`crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES`], to reach
+/// the budget without content of that size, or the constant.
+#[cfg(test)]
+fn page_content_bytes_budget() -> usize {
+    PAGE_CONTENT_BYTES_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The byte budget set in place of the page-content budget on this
+    /// thread.
+    static PAGE_CONTENT_BYTES_OVERRIDE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
 }
 
