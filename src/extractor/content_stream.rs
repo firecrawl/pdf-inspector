@@ -966,6 +966,12 @@ pub(crate) fn extract_page_text_items_with_options(
                             && (actual_text_glyph_tm.is_none()
                                 || (!actual_text_glyph_visible && text_rendering_mode != 3))
                         {
+                            // A visible glyph taking over from hidden ones starts the
+                            // span's width afresh: only glyphs from it onward count.
+                            if actual_text_glyph_tm.is_some() {
+                                actual_text_estimate_ts = 0.0;
+                                actual_text_glyphs_measured = true;
+                            }
                             actual_text_glyph_visible = text_rendering_mode != 3;
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
@@ -1388,6 +1394,12 @@ pub(crate) fn extract_page_text_items_with_options(
                                     && (actual_text_glyph_tm.is_none()
                                         || (!actual_text_glyph_visible && text_rendering_mode != 3))
                                 {
+                                    // A visible glyph taking over from hidden ones starts the
+                                    // span's width afresh: only glyphs from it onward count.
+                                    if actual_text_glyph_tm.is_some() {
+                                        actual_text_estimate_ts = 0.0;
+                                        actual_text_glyphs_measured = true;
+                                    }
                                     actual_text_glyph_visible = text_rendering_mode != 3;
                                     actual_text_glyph_tm = Some(advanced_tm(
                                         &text_matrix,
@@ -1776,6 +1788,12 @@ pub(crate) fn extract_page_text_items_with_options(
                         .and_then(get_operand_bytes)
                         .is_some_and(|raw| !raw.is_empty())
                 {
+                    // A visible glyph taking over from hidden ones starts the
+                    // span's width afresh: only glyphs from it onward count.
+                    if actual_text_glyph_tm.is_some() {
+                        actual_text_estimate_ts = 0.0;
+                        actual_text_glyphs_measured = true;
+                    }
                     actual_text_glyph_visible = text_rendering_mode != 3;
                     actual_text_glyph_tm = Some(text_matrix);
                     actual_text_glyph_rise = Some(text_rise);
@@ -4714,6 +4732,28 @@ end"#;
         assert_eq!(items[0].text, "Shalom Alaikum");
         assert!(!items[0].advance_known);
         assert_eq!(items[0].width, 24.0);
+    }
+
+    #[test]
+    fn mixed_mode_actual_text_on_a_width_less_font_is_estimated_from_visible_glyphs() {
+        // A hidden 12pt glyph (6pt estimate) before a visible 24pt one (12pt
+        // estimate): the replacement starts at the visible glyph, so only
+        // its estimate is the width, through `Tj`, `TJ`, and `'`.
+        for content in [
+            &b"3 Tr BT /F1 12 Tf 100 700 Td /Span <</ActualText (Shalom) >> BDC
+               <41> Tj 0 Tr /F1 24 Tf <42> Tj EMC ET"[..],
+            b"3 Tr BT /F1 12 Tf 100 700 Td /Span <</ActualText (Shalom) >> BDC
+               [<41>] TJ 0 Tr /F1 24 Tf [<42>] TJ EMC ET",
+            b"3 Tr BT /F1 12 Tf 14 TL 100 700 Td /Span <</ActualText (Shalom) >> BDC
+               <41> ' 0 Tr /F1 24 Tf <42> ' EMC ET",
+        ] {
+            let items = extract_hebrew_items(content);
+            assert_eq!(items.len(), 1, "{items:?}");
+            assert_eq!(items[0].text, "Shalom");
+            assert!(!items[0].advance_known);
+            assert_eq!(items[0].font_size, 24.0);
+            assert_eq!(items[0].width, 12.0, "{:?}", items[0]);
+        }
     }
 
     #[test]
