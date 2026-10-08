@@ -41,6 +41,7 @@ pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
 mod overlong_numerals;
+mod owner_password;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
@@ -4396,9 +4397,9 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
         // an encryption error. Handle both by re-loading with the password.
-        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password),
+        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password, Some(&doc)),
         Ok(doc) => Ok(doc),
-        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password),
+        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password, None),
         Err(e) => Err(e),
     }
 }
@@ -4406,18 +4407,52 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// Re-load an encrypted PDF, decrypting with `password`. Falls back to the
 /// empty password (owner-only encryption, the common "protected" case) when a
 /// non-empty password was supplied but rejected.
-fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
+///
+/// `loaded` is the structural parse, when that parse succeeded with
+/// `is_encrypted()` still true. Owner-password recovery reads `/O` from it.
+/// When the passwordless parse fails with an encryption error there is no
+/// structural document to recover from, and loading with `password` here would
+/// authenticate and strip `/Encrypt` before Algorithm 7 can run — so recovery
+/// is skipped and the supplied password is used as-is.
+fn decrypt_document_bytes(
+    buf: &[u8],
+    password: Option<&str>,
+    loaded: Option<&Document>,
+) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
+    // lopdf 0.45.0 accepts an owner password, then derives the file key from
+    // that literal password. Algorithm 2 needs the user password, which
+    // Algorithm 7 recovers from `/O` when the two differ. The release that
+    // fixes this inside lopdf is not on crates.io yet (J-F-Liu/lopdf#573,
+    // merged after 0.45.0), so resolve it here before handing the password
+    // back to lopdf. A user password is left unchanged.
+    let resolved = file_key_password(pw, loaded);
     let with_password = |pw: &str| lopdf::LoadOptions {
         password: Some(pw.to_string()),
         ..bounded_load_options()
     };
-    match Document::load_mem_with_options(buf, with_password(pw)) {
+    match Document::load_mem_with_options(buf, with_password(&resolved)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
             Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
         }
         Err(inner) => Err(inner),
+    }
+}
+
+fn file_key_password(password: &str, loaded: Option<&Document>) -> String {
+    if password.is_empty() {
+        return String::new();
+    }
+    // Only the structural passwordless document still has `/Encrypt`. For the
+    // R2–R4 Standard files this recovery targets, that load succeeds with
+    // `is_encrypted()` true (see `load_document_bytes`). A second passwordless
+    // parse cannot succeed after the first already failed, and a passworded
+    // parse strips `/Encrypt`, so leave the supplied password unchanged.
+    match loaded {
+        Some(doc) => owner_password::user_password_for_file_key(doc, password)
+            .unwrap_or_else(|| password.to_string()),
+        None => password.to_string(),
     }
 }
 
