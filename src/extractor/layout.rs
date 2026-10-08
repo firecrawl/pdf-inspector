@@ -2954,6 +2954,84 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
     chaos_ratio > 0.4
 }
 
+/// Horizontal space between two runs. Negative when they overlap.
+/// Which run comes first does not matter, so a right-to-left stream still
+/// sees the gutter.
+fn horizontal_gap(a: &TextItem, b: &TextItem) -> f32 {
+    let a_right = a.x + effective_width(a);
+    let b_right = b.x + effective_width(b);
+    if a.x <= b.x {
+        b.x - a_right
+    } else {
+        a.x - b_right
+    }
+}
+
+/// A front-matter folio (`iii`, `xiv.`) beside a contents entry.
+///
+/// Only `i`/`v`/`x` numerals (1–39) count. A token that needs `l`, `c`,
+/// `d`, or `m` is a word that happens to be roman-shaped (`mix`) or a
+/// body-page number, and the column split must still see it.
+fn is_roman_folio(text: &str) -> bool {
+    let trimmed = text.trim().trim_end_matches(['.', ')']).trim();
+    if trimmed.is_empty()
+        || !trimmed.is_ascii()
+        || trimmed.len() > 8
+        || trimmed.split_whitespace().count() != 1
+    {
+        return false;
+    }
+    let bytes = trimmed.to_ascii_lowercase().into_bytes();
+    if bytes.iter().any(|b| !matches!(b, b'i' | b'v' | b'x')) {
+        return false;
+    }
+    let mut index = 0;
+    let mut tens = 0;
+    while index < bytes.len() && bytes[index] == b'x' && tens < 3 {
+        index += 1;
+        tens += 1;
+    }
+    if index + 1 < bytes.len() && matches!(&bytes[index..index + 2], b"ix" | b"iv") {
+        index += 2;
+    } else {
+        if index < bytes.len() && bytes[index] == b'v' {
+            index += 1;
+        }
+        let mut ones = 0;
+        while index < bytes.len() && bytes[index] == b'i' && ones < 3 {
+            index += 1;
+            ones += 1;
+        }
+    }
+    index == bytes.len() && index > 0
+}
+
+/// A wrapped column leftover is a short token that ends a sentence
+/// (`checksum.`). A contents title may end in `?` or `!` (`Why?`), and a
+/// bold heading keeps its folio even when the title ends with a period.
+fn is_wrapped_fragment(entry: &TextItem, entry_text: &str) -> bool {
+    if entry.is_bold {
+        return false;
+    }
+    let trimmed = entry_text.trim();
+    if trimmed.ends_with(['?', '!']) {
+        return false;
+    }
+    trimmed.ends_with('.')
+        && !trimmed.ends_with("...")
+        && trimmed.split_whitespace().count() <= 3
+}
+
+/// The roman token is the right-hand page number of an entry. A sentence
+/// fragment beside `iii` is the next column, not a folio.
+fn roman_folio_beside_entry(entry: &TextItem, entry_text: &str, folio: &TextItem) -> bool {
+    folio.x > entry.x
+        && is_roman_folio(&folio.text)
+        && !is_roman_folio(entry_text)
+        && entry_text.chars().any(|c| c.is_alphabetic())
+        && !is_wrapped_fragment(entry, entry_text)
+}
+
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
 /// `page_rtl` is the direction of the page the column belongs to, which
@@ -3026,7 +3104,7 @@ fn group_single_column(
             // numbers, dot leaders, and outline-numbered table cells (which
             // start with digits) stay joined.
             if let Some(last_item) = last_line.items.last() {
-                let gap = item.x - (last_item.x + last_item.width);
+                let gap = horizontal_gap(last_item, &item);
                 if gap > (item.font_size.max(last_item.font_size) * 3.0).max(30.0)
                     && item
                         .text
@@ -3048,13 +3126,15 @@ fn group_single_column(
                         .map(|i| i.text.trim())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let line_wordy = line_text.split_whitespace().count() >= 2
+                    let line_words = line_text.split_whitespace().count();
+                    let line_wordy = line_words >= 2
                         && line_text.chars().filter(|c| c.is_alphabetic()).count() >= 8;
                     // Lowercase starts are mid-sentence continuations and
-                    // split on prose signals alone. Uppercase starts also
-                    // need a bold-style mismatch between the runs — a bold
-                    // heading beside regular body text — otherwise same-style
-                    // label rows (feature tiles, legends) would shatter.
+                    // split on prose signals alone. A bold heading beside
+                    // regular body text splits too. Same-style uppercase
+                    // splits only when both runs are full clauses (six or
+                    // more words): a feature-tile row is a few words and
+                    // stays on one line.
                     let starts_lower = item
                         .text
                         .trim()
@@ -3064,7 +3144,30 @@ fn group_single_column(
                     // The whole line must be bold (a heading), not merely
                     // its last run — mixed bold-label/value rows stay joined.
                     let style_mismatch = last_line.items.iter().all(|i| i.is_bold) && !item.is_bold;
-                    if line_wordy && incoming_wordy && (starts_lower || style_mismatch) {
+                    let both_clauses = line_words >= 6 && item.text.split_whitespace().count() >= 6;
+                    // A same-style clause split needs a real gutter. The
+                    // sample column gap is ~59pt at 10pt; a ~30pt hole in
+                    // one justified line stays together.
+                    let clause_gutter =
+                        gap > (item.font_size.max(last_item.font_size) * 5.0).max(50.0);
+                    if line_wordy
+                        && incoming_wordy
+                        && (starts_lower || style_mismatch || (both_clauses && clause_gutter))
+                    {
+                        return false;
+                    }
+                    // Wrapped leftovers ("checksum." / "order.") and a
+                    // right-aligned tag beside a title sit a column-width
+                    // void apart. Table header cells on this scale are
+                    // closer than 8em and 100pt. Digit page numbers never
+                    // reach this branch. A front-matter folio stays on an
+                    // entry that is not a wrapped sentence. `checksum.`
+                    // beside `iii` still splits.
+                    let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
+                        || roman_folio_beside_entry(&item, item.text.trim(), last_item);
+                    if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
+                        && !folio_on_entry
+                    {
                         return false;
                     }
                 }
@@ -3559,6 +3662,247 @@ mod tests {
         ];
         let lines = group_single_column(items, 0.10, false);
         assert_eq!(lines.len(), 1, "numbered table cells stay on one line");
+    }
+
+    #[test]
+    fn same_baseline_same_style_clauses_split() {
+        // Two column sentences, same face, gutter too narrow for column
+        // detection (en-22-mixed-layout.pdf: 42pt run ending near 282, next
+        // run at 318). Both clauses are long, so this is not a label row.
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        // Helvetica at 10pt: the left run ends near x=259, so the gutter
+        // to x=318 is ~59pt.
+        left.width = 217.0;
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        let lines = group_single_column(vec![left, right], 0.10, false);
+        assert_eq!(lines.len(), 2, "same-style column clauses must not fuse");
+    }
+
+    #[test]
+    fn same_style_clauses_with_a_small_hole_stay_one_line() {
+        // Two long runs separated by ~36pt are one justified line, not columns.
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        left.width = 240.0;
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a sub-50pt hole in one line stays joined"
+        );
+    }
+
+    #[test]
+    fn right_to_left_stream_still_splits_the_column_gutter() {
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        left.width = 217.0;
+        let lines = group_single_column(vec![right, left], 0.10, true);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the gutter is the same when the right run arrives first"
+        );
+    }
+
+    #[test]
+    fn roman_folio_stays_on_the_entry_line() {
+        let mut title = make_item(1, 72.0, 700.0, "Preface");
+        title.width = 60.0;
+        let mut folio = make_item(1, 500.0, 700.0, "iii");
+        folio.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![title, folio], 0.10, false).len(),
+            1,
+            "a roman-numeral page number stays on the entry"
+        );
+        assert!(is_roman_folio("xiv."));
+        assert!(!is_roman_folio("order."));
+        assert!(!is_roman_folio("EN-22"));
+        assert!(!is_roman_folio("mix"));
+    }
+
+    #[test]
+    fn roman_numeral_across_a_column_gutter_still_splits() {
+        // Same geometry as the wrapped column leftovers. The period marks
+        // a sentence fragment, so `iii` does not stay attached.
+        let mut left = make_item(1, 42.0, 569.0, "checksum.");
+        left.font_size = 10.0;
+        left.width = 50.0;
+        let mut right = make_item(1, 318.0, 569.0, "iii");
+        right.font_size = 10.0;
+        right.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            2,
+            "a wrapped fragment beside a roman token is not a folio"
+        );
+    }
+
+    #[test]
+    fn closer_front_matter_folio_stays_on_the_entry() {
+        // Gap is about 118pt: over the 100pt void split, under the old
+        // 300pt leader floor. A contents entry still keeps its folio.
+        let mut title = make_item(1, 72.0, 700.0, "Preface");
+        title.width = 60.0;
+        let mut folio = make_item(1, 250.0, 700.0, "xiv");
+        folio.width = 18.0;
+        assert_eq!(
+            group_single_column(vec![title, folio], 0.10, false).len(),
+            1,
+            "a folio within 300pt stays on the entry"
+        );
+    }
+
+    #[test]
+    fn punctuated_contents_title_keeps_its_folio() {
+        // "Why?" is a contents title, not a wrapped sentence fragment.
+        let mut title = make_item(1, 72.0, 700.0, "Why?");
+        title.width = 36.0;
+        let mut folio = make_item(1, 250.0, 700.0, "iii");
+        folio.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![title, folio], 0.10, false).len(),
+            1,
+            "a title that ends in ? keeps its page number"
+        );
+    }
+
+    #[test]
+    fn roman_shaped_word_still_splits_across_a_column_void() {
+        // "mix" is a roman numeral (1009) but not a front-matter folio.
+        let mut left = make_item(1, 42.0, 569.0, "checksum.");
+        left.font_size = 10.0;
+        left.width = 50.0;
+        let mut right = make_item(1, 318.0, 569.0, "mix");
+        right.font_size = 10.0;
+        right.width = 18.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            2,
+            "a roman-shaped column word is not a page number"
+        );
+    }
+
+    #[test]
+    fn negative_width_does_not_invent_a_column_gap() {
+        // A backwards measured width must not push the right edge left of
+        // the glyph. Half an em per character puts these runs 14pt apart;
+        // the raw negative width invents a 160pt void and would split them.
+        let mut left = make_item(1, 40.0, 700.0, "Staff notes");
+        left.font_size = 12.0;
+        left.width = -80.0;
+        let mut right = make_item(1, 120.0, 700.0, "they had no plans");
+        right.font_size = 12.0;
+        right.width = 90.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a zero or negative width is not a wide gutter"
+        );
+    }
+
+    #[test]
+    fn column_sized_void_splits_short_leftovers() {
+        // The wrapped second line of each column is one word, ~230pt apart.
+        let mut left = make_item(1, 42.0, 569.0, "checksum.");
+        left.font_size = 10.0;
+        left.width = 50.0;
+        let mut right = make_item(1, 318.0, 569.0, "order.");
+        right.font_size = 10.0;
+        right.width = 40.0;
+        let lines = group_single_column(vec![left, right], 0.10, false);
+        assert_eq!(lines.len(), 2, "a column-width void is not a word space");
+    }
+
+    #[test]
+    fn right_aligned_tag_does_not_join_a_title() {
+        // "Mixed layout report" at x=42 and "EN-22" at x=544, baselines 1pt apart.
+        let mut title = make_item(1, 42.0, 755.0, "Mixed layout report");
+        title.font_size = 16.0;
+        title.width = 160.0;
+        title.is_bold = true;
+        let mut tag = make_item(1, 544.0, 756.0, "EN-22");
+        tag.font_size = 9.0;
+        tag.width = 36.0;
+        let lines = group_single_column(vec![title, tag], 0.10, false);
+        assert_eq!(lines.len(), 2, "a far tag must not extend the title");
+    }
+
+    #[test]
+    fn same_baseline_table_headers_stay_joined() {
+        // Header cells ~70pt apart stay one row. Digit page numbers on a
+        // title line stay joined too: they never enter the alphabetic branch.
+        let mut cells = Vec::new();
+        for (x, text) in [(47.0, "Status"), (147.0, "Metric"), (247.0, "Value")] {
+            let mut item = make_item(1, x, 459.0, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            item.is_bold = true;
+            cells.push(item);
+        }
+        assert_eq!(group_single_column(cells, 0.10, false).len(), 1);
+
+        let mut title = make_item(1, 72.0, 700.0, "Introduction");
+        title.width = 90.0;
+        let mut page_no = make_item(1, 500.0, 700.0, "12");
+        page_no.width = 16.0;
+        assert_eq!(
+            group_single_column(vec![title, page_no], 0.10, false).len(),
+            1,
+            "a TOC page number stays on the entry line"
+        );
+    }
+
+    #[test]
+    fn same_style_label_row_stays_joined() {
+        let mut left = make_item(1, 40.0, 500.0, "Fast setup");
+        left.width = 70.0;
+        let mut right = make_item(1, 160.0, 500.0, "Live preview");
+        right.width = 80.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a short same-style label row stays one line"
+        );
     }
 
     #[test]
