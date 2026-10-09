@@ -838,6 +838,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
     let mut prev_x = 0.0f32;
+    let mut prev_font_size = 0.0f32;
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
@@ -1012,9 +1013,22 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
-        let (prior_y, prior_x) = (prev_y, prev_x);
+        let (prior_y, prior_x, prior_font_size) = (prev_y, prev_x, prev_font_size);
+        // A line that carries on the paragraph above it — line spacing, the
+        // same size, the same left edge (or the margin under an indented
+        // first line) — is that paragraph's text, whatever its size says:
+        // a size-based heading stands out from the text above it. A bold
+        // line keeps its own heading signal.
+        let line_font_size = line.items.first().map_or(0.0, |i| i.font_size);
+        let continues_paragraph = in_paragraph
+            && !is_para_break
+            && !line_all_bold
+            && (line_font_size - prev_font_size).abs() <= 0.5
+            && line_x <= prev_x + 3.0
+            && line_x >= prev_x - 40.0;
         prev_y = line.y;
         prev_x = line_x;
+        prev_font_size = line_font_size;
 
         // Get text with optional bold/italic formatting
         let text = line.text_with_formatting(
@@ -1066,6 +1080,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // band from the text line, not from the tail.
             prev_y = prior_y;
             prev_x = prior_x;
+            prev_font_size = prior_font_size;
             continue;
         }
 
@@ -1128,6 +1143,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && !wrapped_quoted_paragraph_lines.contains(&line_idx)
             && !is_code_line
             && !looks_like_list_continuation
+            && !continues_paragraph
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !starts_with_bullet_marker(plain_trimmed)
@@ -1264,7 +1280,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 // 2. Y gap is not too large (max ~5 line heights)
                 // 3. Not a new list item
                 let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
-                let y_ok = y_gap < base_size * 7.0;
+                let y_ok = y_gap < base_size * 7.0 && y_gap <= para_threshold;
                 x_ok && y_ok && !is_list_item(plain_trimmed) && !has_dot_leaders(plain_trimmed)
             } else {
                 false
@@ -1280,6 +1296,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 output.push('\n');
                 continue;
             } else {
+                // Past a paragraph gap the list is over: close it with a blank
+                // line, or GFM reads this line as a lazy continuation of the
+                // last item. Tighter gaps keep the lazy join, which is what
+                // reads right for wrapped text after a falsely detected item.
+                if is_para_break {
+                    output.push('\n');
+                }
                 in_list = false;
                 last_list_x = None;
             }
@@ -1660,7 +1683,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 // 2. Y gap is not too large (max ~5 line heights)
                 // 3. Not a new list item
                 let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
-                let y_ok = y_gap < base_size * 7.0;
+                let y_ok = y_gap < base_size * 7.0 && y_gap <= para_threshold;
                 x_ok && y_ok && !is_list_item(plain_trimmed) && !has_dot_leaders(plain_trimmed)
             } else {
                 false
@@ -1676,6 +1699,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 output.push('\n');
                 continue;
             } else {
+                // Past a paragraph gap the list is over: close it with a blank
+                // line, or GFM reads this line as a lazy continuation of the
+                // last item. Tighter gaps keep the lazy join, which is what
+                // reads right for wrapped text after a falsely detected item.
+                if is_para_break {
+                    output.push('\n');
+                }
                 in_list = false;
                 last_list_x = None;
             }
@@ -2014,6 +2044,106 @@ mod tests {
         assert!(
             !md.contains("- to a second line here."),
             "continuation line should not get its own bullet: {md}"
+        );
+    }
+
+    #[test]
+    fn test_list_item_ends_at_paragraph_gap() {
+        // Regression: a resume's next job title sits a paragraph gap below
+        // the last bullet, at nearly the bullet's x. The continuation check
+        // allowed gaps up to 7x the body size, so it joined the item.
+        // Wrapped lines at normal spacing must still join, whether they sit
+        // at the text's hanging indent or flush under the bullet.
+        let make = |text: &str, x: f32, y: f32| {
+            let mut item = make_item(text, 1, None);
+            item.x = x;
+            item.y = y;
+            item
+        };
+        let lines = vec![
+            make_line(vec![
+                make("•", 36.2, 400.0),
+                make("Hanging item text that wraps", 45.5, 399.3),
+            ]),
+            make_line(vec![make("at the hanging indent.", 45.5, 385.8)]),
+            make_line(vec![
+                make("•", 36.2, 371.6),
+                make("Flush item text that wraps", 45.5, 370.9),
+            ]),
+            make_line(vec![make("back under the bullet.", 36.2, 357.4)]),
+            make_line(vec![make("Software Developer (Java)", 38.4, 334.0)]),
+            make_line(vec![make("Enterprise Tech Solutions", 38.4, 320.4)]),
+            make_line(vec![
+                make("•", 36.2, 306.0),
+                make("Developed core microservices using Java.", 45.5, 305.3),
+            ]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            md.contains("- Hanging item text that wraps at the hanging indent.\n"),
+            "hanging wrapped line should join the item: {md:?}"
+        );
+        assert!(
+            md.contains("- Flush item text that wraps back under the bullet.\n\nSoftware Developer (Java)"),
+            "flush wrapped line should join the item, and the job title after a paragraph gap should start a new block: {md:?}"
+        );
+    }
+
+    #[test]
+    fn test_paragraph_continuation_is_not_a_size_heading() {
+        // Regression: a report set mostly in 9pt has an 11pt prose section.
+        // Its short second line passed the size test for a heading and split
+        // the paragraph; a line carrying on the paragraph above it at line
+        // spacing, size and indent is that paragraph's text.
+        let make = |text: &str, size: f32, y: f32| {
+            let mut item = make_item(text, 1, None);
+            item.x = 72.0;
+            item.y = y;
+            item.font_size = size;
+            item.height = size;
+            item
+        };
+        let mut lines: Vec<TextLine> = (0..8)
+            .map(|i| {
+                let body =
+                    "Body text set in the report's usual nine point size for tables and notes.";
+                make_line(vec![make(body, 9.0, 700.0 - 11.0 * i as f32)])
+            })
+            .collect();
+        lines.push(make_line(vec![make(
+            "An option to faculty will be provided to avail extraordinary leave without pay for up to 2",
+            11.04,
+            580.0,
+        )]));
+        lines.push(make_line(vec![make(
+            "years at a time subject to:",
+            11.04,
+            567.4,
+        )]));
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            md.contains("for up to 2 years at a time subject to:"),
+            "the short line should continue its paragraph: {md:?}"
         );
     }
 

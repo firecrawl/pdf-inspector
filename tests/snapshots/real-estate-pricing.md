@@ -20,12 +20,16 @@ CENTER
 
 * Based on 25 years of data for the 10-yrT & S&P DivYld; and 14 years for BBB.
 **Figure 1:** NCREIF cap rates vs. 10-yearTreasury
- 12 10 8 Percent 6 4 2 1982 1986 1990 1994 1998 2002 2006
-Apartment Retail ndustrial 10-yr reasury CBD Office
+ 12
+
+Percent 6
+
+2 1982 1986 1990 1994 1998 2002 2006 Apartment Retail ndustrial 10-yr reasury CBD Office
 
 most of the past twenty-five years (Table
 
 I). Such a relationship defies investment theory,asrealestatepricingshouldchange as property risks and the returns of alter- nativeinvestmentschange. Figure1displaysNCREIFcapratesby property type compared to the ten-year Treasury yield. Because the National Council of Real Estate Investment Fiduciaries (NCREIF) cap rate data is seriouslyflawedduetoappraisallags,itis
+
 presented in Figure 2 with an eighteen- monthlag.Thisdataprovidesanoverview ofthepricingofinstitutionalqualityreal estate.Figure2reflectsthesecapratesnet of the ten-year Treasury yield. Since cap rate spreads are highly correlated across propertytypes(TableII),wecanspeakof “cap rates” without reference to property type with little loss of insight. Cap rate spreadswerenegativeintheearlytomid- 1980s, when purchasing real estate was
 
 REVIEW 8 5
@@ -63,5 +67,6 @@ ingdebtspreadswerepartoforiginalpro formamodels.Thiscapratespreadcom- pressionof
 returns. That is, cap rate compression from 9 percent to 6 percent increased IRR on leveraged stabilized properties by 250 percent, to a staggering 57 percent. Who needs to take on value add riskatthisreturnforstabilizedassets? Intheearly1980s,moneywasmadein real estate by mastering the creation and syndication of tax gimmicks. In the late 1980s, one made money by mastering bank and S&L connections to over-leverage.Intheearly1990s,onemademoneyin realestatebyhavingaccesstoequity—the morethebetter.Duringthelate1990s,one made money from real estate by realizing large spreads between cap rates and debt costs.And,overthepastfiveyears,theway to make money in real estate was to own realestateonahighlyleveragedbasisascap ratesplunged. Theclassicassetpricingmodelisthe capital asset pricing model (CAPM). CAPM is a simple, yet elegant, model that relates asset pricing to the risk-free rate(F),theabilityofanassettoreduce portfolio variance (B), and the expected rate of return on the market bundle of investableassets(M).CAPMisfarfrom perfect,butprovidesacrudebenchmark for asset pricing, around which discrep- ancies and novelties arise. Specifically, CAPM states that an asset’s price is set suchthattheexpectedreturnforanasset
 
 (R)is R=F+ β(M-F).
+
 REVIEW 8 7
 

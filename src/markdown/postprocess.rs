@@ -39,6 +39,7 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
     collapse_consecutive_spaces(&mut text);
     remove_spaces_before_closing_brackets(&mut text);
     remove_spaces_before_sentence_punctuation(&mut text);
+    escape_rule_lines(&mut text);
 
     // Remove excessive newlines (more than 2 in a row)
     while text.contains("\n\n\n") {
@@ -354,6 +355,49 @@ fn dehyphenate_line_breaks(text: &str) -> String {
         out.push_str(&current);
     }
     out
+}
+
+/// Escape a line of PDF text that Markdown would read as markup instead of
+/// text: three or more of the same `-`, `*` or `_` (a thematic break, or
+/// under a paragraph a setext heading), or a run of `=` (a setext heading).
+/// The converter writes no rules of its own, so such a line is the
+/// document's text — a "---" table cell, a "* * * * *" omission mark.
+fn escape_rule_lines(text: &mut String) {
+    // Up to three spaces of indent: a tab or a fourth space makes a code line.
+    let is_rule = |line: &str| {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let marks: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+        indent <= 3
+            && !line[indent..].starts_with('\t')
+            && marks.first().is_some_and(|&first| {
+                marks.iter().all(|&c| c == first)
+                    && (first == '=' || (matches!(first, '-' | '*' | '_') && marks.len() >= 3))
+            })
+    };
+    if !text.lines().any(is_rule) {
+        return;
+    }
+    let mut in_code = false;
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+        }
+        if !in_code && is_rule(line.trim_end_matches('\n')) {
+            // A list item of dashes ("- --") keeps its marker; its text is
+            // what gets escaped.
+            let mut indent = line.len() - line.trim_start().len();
+            if line[indent..].starts_with("- ") {
+                indent += 2;
+            }
+            out.push_str(&line[..indent]);
+            out.push('\\');
+            out.push_str(&line[indent..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+    *text = out;
 }
 
 /// Remove isolated page-number expressions from Markdown.
@@ -793,6 +837,17 @@ mod tests {
         assert_eq!(
             fix_hyphenation("one - two and three - four"),
             "one-two and three-four"
+        );
+    }
+
+    #[test]
+    fn test_escape_rule_lines() {
+        let mut text =
+            "7.62\n\n---\n\n* * * * *\nTitle\n===\n|---|---|\n```\n---\n```\n--\n- --\n\t---\n    ---\n".to_string();
+        escape_rule_lines(&mut text);
+        assert_eq!(
+            text,
+            "7.62\n\n\\---\n\n\\* * * * *\nTitle\n\\===\n|---|---|\n```\n---\n```\n--\n- \\--\n\t---\n    ---\n"
         );
     }
 
