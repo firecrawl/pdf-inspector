@@ -50,7 +50,9 @@ fn after_token_break(data: &[u8], i: usize) -> bool {
 
 /// Whether `byte` ends the operator token before it: whitespace, or an
 /// opening delimiter, since a stream may run one token into the next
-/// (`BI/W`, `ID<`).
+/// (`BI/W`). The `ID` operator itself must be followed by whitespace:
+/// the spec gives it a single whitespace separator before the data, and
+/// lopdf parses `ID` with a mandatory space, so the pre-pass does too.
 fn ends_token(byte: u8) -> bool {
     is_pdf_whitespace(byte) || matches!(byte, b'/' | b'[' | b'(' | b'<' | b'%')
 }
