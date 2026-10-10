@@ -812,12 +812,24 @@ impl TextLine {
             // would shatter into `*<sub>t</sub>*` fragments) — but a run
             // carrying its own DECORATION, an underlined link marker in plain
             // text, keeps it: decorations are drawn ink, not font styling.
+            // Bold or italic on a run of no letters or digits (a "·"
+            // separator in a slanted math font, a styled bullet) emphasizes
+            // nothing: such a run may stay inside an open bold or italic run
+            // ("**Label:**") but never opens one ("*·*", "*•*").
+            let style_neutral = !text_trimmed.chars().any(char::is_alphanumeric);
             let (item_strikeout, item_underline, item_bold, item_italic) = if is_script {
                 (
                     current_strikeout,
                     current_underline,
                     current_bold,
                     current_italic,
+                )
+            } else if style_neutral {
+                (
+                    own_strikeout,
+                    own_underline,
+                    own_bold && current_bold,
+                    own_italic && current_italic,
                 )
             } else {
                 (own_strikeout, own_underline, own_bold, own_italic)

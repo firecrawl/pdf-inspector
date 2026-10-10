@@ -3138,31 +3138,23 @@ mod tests {
     #[test]
     fn bold_numeric_fragments_keep_line_assembly_spacing() {
         for (parts, gap, expected) in [
-            (
-                vec![("0", false), (".", true), ("86", false)],
-                1.2,
-                "0**.**86",
-            ),
+            (vec![("0", false), (".", true), ("86", false)], 1.2, "0.86"),
             (vec![("0.", true), ("86", false)], 1.2, "**0.**86"),
-            (vec![(".", true), ("42", false)], 1.2, "**.**42"),
+            (vec![(".", true), ("42", false)], 1.2, ".42"),
             (
                 vec![("12 ", false), (".", true), ("55", false)],
                 1.2,
-                "12 **.**55",
+                "12 .55",
             ),
             (
                 vec![("12", false), (" .", true), ("55", false)],
                 1.2,
-                "12 **.**55",
+                "12 .55",
             ),
             (vec![("1", false), ("23", true)], 1.2, "1**23**"),
             (vec![("12", true), ("%", false)], 1.2, "**12**%"),
-            (vec![("+", true), ("12", false)], 1.2, "**+**12"),
-            (
-                vec![("1", false), (",", true), ("25", false)],
-                1.2,
-                "1**,**25",
-            ),
+            (vec![("+", true), ("12", false)], 1.2, "+12"),
+            (vec![("1", false), (",", true), ("25", false)], 1.2, "1,25"),
             (vec![("Done.", true), ("2", false)], 1.2, "**Done.** 2"),
             (vec![("0. ", true), ("86", false)], 1.2, "**0.** 86"),
             (vec![("0.", true), ("86", false)], 4.8, "**0.** 86"),
@@ -3189,6 +3181,57 @@ mod tests {
             assert_eq!(line.text_with_formatting(true, false, false), expected);
             assert_eq!(line.text(), expected.replace("**", ""));
         }
+    }
+
+    #[test]
+    fn style_on_a_run_of_no_letters_or_digits() {
+        // (text, bold, italic, gap before the run); a word space is 3.0.
+        let line = |parts: &[(&str, bool, bool, f32)]| {
+            let mut x = 100.0;
+            let items = parts
+                .iter()
+                .map(|&(text, bold, italic, gap)| {
+                    x += gap;
+                    let width = text.len() as f32 * 6.0;
+                    let mut item = make_merge_item(text, x, width);
+                    item.is_bold = bold;
+                    item.is_italic = italic;
+                    x += width;
+                    item
+                })
+                .collect();
+            TextLine {
+                items,
+                y: 100.0,
+                page: 1,
+                adaptive_threshold: 0.1,
+            }
+            .text_with_formatting(true, true, false)
+        };
+        // Never opens: a styled separator or bullet reads as plain text.
+        let separator = [
+            ("City", false, false, 0.0),
+            ("·", false, true, 3.0),
+            ("Phone", false, false, 3.0),
+        ];
+        assert_eq!(line(&separator), "City · Phone");
+        let italic_bullet = [("•", false, true, 0.0), ("Architected", false, false, 3.0)];
+        assert_eq!(line(&italic_bullet), "• Architected");
+        let bold_bullet = [("•", true, false, 0.0), ("Built", false, false, 3.0)];
+        assert_eq!(line(&bold_bullet), "• Built");
+        // Stays inside a run that is already open.
+        let label = [
+            ("Label", true, false, 0.0),
+            (":", true, false, 0.0),
+            ("rest", false, false, 3.0),
+        ];
+        assert_eq!(line(&label), "**Label:** rest");
+        let italic_run = [
+            ("see", false, true, 0.0),
+            ("·", false, true, 3.0),
+            ("also", false, true, 3.0),
+        ];
+        assert_eq!(line(&italic_run), "*see · also*");
     }
 
     #[test]
