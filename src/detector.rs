@@ -107,6 +107,10 @@ pub struct DetectionConfig {
     pub min_text_ops_per_page: u32,
     /// Threshold ratio of text pages to total pages for classification
     pub text_page_ratio_threshold: f32,
+    /// Read a page whose only text is an invisible layer under a covering
+    /// image (an OCR layer) as a text page, and extract that layer, instead
+    /// of flagging the page `invisible_text_layer` for OCR. Off by default.
+    pub read_invisible_text_layer: bool,
 }
 
 impl Default for DetectionConfig {
@@ -117,6 +121,7 @@ impl Default for DetectionConfig {
             strategy: ScanStrategy::Sample(8),
             min_text_ops_per_page: 3,
             text_page_ratio_threshold: 0.6,
+            read_invisible_text_layer: false,
         }
     }
 }
@@ -254,7 +259,7 @@ pub(crate) fn detect_from_document(
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content(doc, page_id);
+            let analysis = analyze_page_content_with(doc, page_id, config);
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} form_bytes={} form_bytes_exceeded={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -439,7 +444,7 @@ pub(crate) fn detect_from_document(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content(doc, page_id);
+                    let a = analyze_page_content_with(doc, page_id, config);
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -493,7 +498,7 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
+                let analysis = analyze_page_content_with(doc, page_id, config);
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -528,7 +533,8 @@ pub(crate) fn detect_from_document(
                             page_num, executed.form_bytes
                         );
                     }
-                    if executed.shows_only_a_hidden_text_layer {
+                    if executed.shows_only_a_hidden_text_layer && !config.read_invisible_text_layer
+                    {
                         vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
                     } else {
                         vec![crate::OCR_REASON_SCANNED]
@@ -864,6 +870,20 @@ fn resolve_with_shadowing(
             }
         }
     }
+}
+
+/// [`analyze_page_content`] with the invisible-layer signal dropped when
+/// the configuration reads such layers as text.
+fn analyze_page_content_with(
+    doc: &Document,
+    page_id: ObjectId,
+    config: &DetectionConfig,
+) -> PageAnalysis {
+    let mut analysis = analyze_page_content(doc, page_id);
+    if config.read_invisible_text_layer {
+        analysis.has_invisible_text_layer = false;
+    }
+    analysis
 }
 
 /// Analyze a page's content stream for text operators and images

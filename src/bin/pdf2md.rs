@@ -821,6 +821,8 @@ fn main() {
         options.page_filter = Some(pages);
     }
     options.password = password;
+    options.detection.read_invisible_text_layer =
+        args.iter().any(|a| a == "--read-invisible-text-layer");
 
     match process_pdf_with_options(pdf_path, options) {
         Ok(result) => {

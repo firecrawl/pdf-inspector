@@ -9,6 +9,16 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `processPdf(buffer, pages, { readInvisibleTextLayer: true })`, and the same
+  option on `processPdfAsync`, `DetectionConfig::read_invisible_text_layer`
+  and `pdf2md --read-invisible-text-layer`, read the invisible OCR text layer
+  (render mode 3) of a scanned page as its text. The page is not flagged
+  `invisible_text_layer`, and a page whose only visible text is a small
+  stamp over such a layer, like an archive's download footer, returns the
+  layer too. Off by default; output without the option is unchanged.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that

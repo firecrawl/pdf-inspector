@@ -115,6 +115,7 @@ impl PositionOptions {
     pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
         TextExtractionOptions {
             include_invisible,
+            invisible_layer_fallback: false,
             bold_from_weight: self.bold_from_weight,
             bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
             // The position readers report no CMap coverage.
@@ -519,8 +520,15 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    invisible_layer_fallback: bool,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        invisible_layer_fallback,
+    )
 }
 
 /// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
@@ -529,7 +537,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true, false)
 }
 
 fn extract_positioned_text_with_folio_context_impl(
@@ -537,11 +545,13 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    invisible_layer_fallback: bool,
 ) -> Result<DocumentExtraction, PdfError> {
     // The selected pages report their CMap coverage; the context pages
     // gathered below for their folio evidence do not.
     let options = TextExtractionOptions {
         include_invisible,
+        invisible_layer_fallback,
         cmap_coverage: true,
         ..TextExtractionOptions::default()
     };
@@ -638,6 +648,75 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     )
 }
 
+type PageExtractionResult = (
+    PageExtraction,
+    bool,
+    geometry::PageRotation,
+    bool,
+    Vec<RunCoverage>,
+);
+
+/// A page whose visible pass skipped invisible (Tr 3) text is read again
+/// with the invisible layer. That reading is kept when the layer adds real
+/// text (`OCR_LAYER_MIN_ALNUM`) and the visible text is at most a quarter
+/// of that gain, such as a download footer over an OCR scan. The ratio
+/// keeps an OCR layer from doubling a page's visible words.
+fn read_invisible_layer_if_dominant(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    style_cache: &mut FontStyleCache,
+    visible: PageExtractionResult,
+) -> PageExtractionResult {
+    let skipped_invisible = visible.3;
+    let alnum_of = |items: &[TextItem]| -> usize {
+        items
+            .iter()
+            .filter(|it| !matches!(it.item_type, ItemType::Image))
+            .map(|it| it.text.chars().filter(|c| c.is_alphanumeric()).count())
+            .sum()
+    };
+    let visible_alnum = alnum_of(&visible.0 .0);
+    if !skipped_invisible {
+        return visible;
+    }
+    let Ok(layer) = extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        TextExtractionOptions {
+            include_invisible: true,
+            ..options
+        },
+        style_cache,
+        &mut FormWalkBudget::new(),
+    ) else {
+        return visible;
+    };
+    let text: String = layer
+        .0
+         .0
+        .iter()
+        .filter(|it| !matches!(it.item_type, ItemType::Image))
+        .map(|it| it.text.as_str())
+        .collect();
+    // The with-invisible pass also holds the visible items, so this is
+    // what the hidden layer adds. Adopt it when that is real text and the
+    // visible text is only a minor stamp beside it (a JSTOR footer).
+    let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);
+    if gained >= crate::OCR_LAYER_MIN_ALNUM
+        && visible_alnum * 4 <= gained
+        && !crate::text_quality::is_garbage_text(&text)
+    {
+        layer
+    } else {
+        visible
+    }
+}
+
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
@@ -682,6 +761,20 @@ fn extract_positioned_text_impl(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
+        let page_result = match page_result {
+            Ok(extraction) if options.invisible_layer_fallback => {
+                Ok(read_invisible_layer_if_dominant(
+                    doc,
+                    page_id,
+                    *page_num,
+                    font_cmaps,
+                    options,
+                    &mut style_cache,
+                    extraction,
+                ))
+            }
+            other => other,
+        };
         let (
             (mut items, mut rects, mut lines),
             has_gid_fonts,
