@@ -41,6 +41,20 @@ fn is_pdf_whitespace(b: u8) -> bool {
     matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
 }
 
+/// Whether an operator token may begin at `i`: at the stream start, or
+/// after whitespace or a closing delimiter (`Tf]ID` runs one token into
+/// the next). Same rule as the detector's content mask.
+fn after_token_break(data: &[u8], i: usize) -> bool {
+    i == 0 || is_pdf_whitespace(data[i - 1]) || matches!(data[i - 1], b')' | b']' | b'>')
+}
+
+/// Whether `byte` ends the operator token before it: whitespace, or an
+/// opening delimiter, since a stream may run one token into the next
+/// (`BI/W`, `ID<`).
+fn ends_token(byte: u8) -> bool {
+    is_pdf_whitespace(byte) || matches!(byte, b'/' | b'[' | b'(' | b'<' | b'%')
+}
+
 fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
@@ -58,6 +72,9 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // scanning for the operator between whitespace bytes, so the pre-pass
     // uses the same delimiter rule to stay aligned with the parser.
     let mut in_image_data = false;
+    // `ID` begins image data only inside an inline image, which `BI` opens;
+    // a bare `ID` elsewhere (or the name `/ID`) is left alone.
+    let mut bi_open = false;
 
     while i < data.len() {
         let b = data[i];
@@ -76,14 +93,29 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
         }
         if in_string == 0
             && !in_hex_string
+            && b == b'B'
+            && data.get(i + 1) == Some(&b'I')
+            && after_token_break(data, i)
+            && data.get(i + 2).is_none_or(|&n| ends_token(n))
+        {
+            result.push(b'B');
+            result.push(b'I');
+            bi_open = true;
+            i += 2;
+            continue;
+        }
+        if in_string == 0
+            && !in_hex_string
+            && bi_open
             && b == b'I'
             && data.get(i + 1) == Some(&b'D')
-            && data.get(i + 2).is_some_and(|&n| is_pdf_whitespace(n))
-            && (i == 0 || is_pdf_whitespace(data[i - 1]))
+            && after_token_break(data, i)
+            && data.get(i + 2).is_none_or(|&n| is_pdf_whitespace(n))
         {
             result.push(b'I');
             result.push(b'D');
             in_image_data = true;
+            bi_open = false;
             i += 2;
             continue;
         }
@@ -4690,6 +4722,53 @@ end"#;
         let input = b"(x\\\\) Tj % comment\nET\n";
         let output = strip_pdf_comments(input);
         assert_eq!(output, b"(x\\\\) Tj  \nET\n");
+    }
+
+    #[test]
+    fn test_strip_pdf_comments_bare_id_does_not_open_image_data() {
+        // A bare `ID` with no preceding `BI` is not an inline-image opener:
+        // the comment after it must still be stripped.
+        let input = b"q 1 0 0 1 0 0 cm ID\n% comment (with paren\nQ\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"q 1 0 0 1 0 0 cm ID\n \nQ\n");
+
+        // The name `/ID` is not an opener either.
+        let input = b"/ID % comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"/ID  \n");
+
+        // And a later real inline image still enters verbatim mode.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"ID\nBI /W 1 /H 1 /BPC 8 ID\n");
+        input.extend_from_slice(&[b'%']);
+        input.extend_from_slice(b"\nEI\n");
+        let output = strip_pdf_comments(&input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_strip_pdf_comments_id_after_closing_delimiter() {
+        // The `ID` operator may run against a closing delimiter with no
+        // whitespace, e.g. an array-valued header entry: `[/Fl]ID`.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 /F [/Fl]ID\n");
+        input.extend_from_slice(&[b'%', b'%']);
+        input.extend_from_slice(b"\nEI\n% stripped\n");
+        let output = strip_pdf_comments(&input);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 /F [/Fl]ID\n");
+        expected.extend_from_slice(&[b'%', b'%']);
+        expected.extend_from_slice(b"\nEI\n \n");
+        assert_eq!(output, expected);
+
+        // `BI` itself may run against a delimiter too (`q[...]` no; the
+        // realistic case is after a `)` string or `]` array operand).
+        let mut input = Vec::new();
+        input.extend_from_slice(b"(x) Tj\nBI/W 1/H 1/BPC 8 ID\n");
+        input.extend_from_slice(&[b'%']);
+        input.extend_from_slice(b"\nEI\n");
+        let output = strip_pdf_comments(&input);
+        assert_eq!(output, input);
     }
 
     #[test]
