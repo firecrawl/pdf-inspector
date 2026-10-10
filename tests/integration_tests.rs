@@ -11060,3 +11060,96 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+/// Three-page PDF whose page 2 draws an uncompressed 1-pixel-high inline
+/// image with `image_data` as its raw bytes - the repro shape from issue
+/// #617 (AutoCAD plots draw gradient strips this way).
+fn make_pdf_with_inline_image_page(image_data: &[u8]) -> Vec<u8> {
+    let text = |label: &str| {
+        format!("BT /F1 12 Tf 72 720 Td ({label}: a page of ordinary text.) Tj ET\n").into_bytes()
+    };
+    let mut page2 = text("Page 2");
+    page2.extend_from_slice(b"q 72 0 0 24 72 600 cm\nBI /CS /DeviceGray /W ");
+    page2.extend_from_slice(image_data.len().to_string().as_bytes());
+    page2.extend_from_slice(b" /H 1 /BPC 8 ID\n");
+    page2.extend_from_slice(image_data);
+    page2.extend_from_slice(b"\nEI\nQ\n");
+    page2.extend_from_slice(&text("Text after the image"));
+
+    let page_contents = [text("Page 1"), page2, text("Page 3")];
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        Vec::new(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    let mut kids = Vec::new();
+    for content in page_contents {
+        let mut stream_obj = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream_obj.extend_from_slice(&content);
+        stream_obj.extend_from_slice(b"\nendstream");
+        objects.push(stream_obj);
+        let contents_id = objects.len();
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {contents_id} 0 R >>"
+            )
+            .into_bytes(),
+        );
+        kids.push(format!("{} 0 R", objects.len()));
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        kids.len()
+    )
+    .into_bytes();
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_inline_image_percent_byte_does_not_fail_document() {
+    // Issue #617: a `%` byte in unfiltered inline image data must survive
+    // the comment pre-pass; before the fix it was stripped to end-of-line,
+    // the image data came up short, and the whole document call failed.
+    let pdf = make_pdf_with_inline_image_page(&[0x80, b'%', 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+    let extraction = extract_pages_markdown_mem(&pdf, None)
+        .expect("document with a `%` byte in inline image data extracts");
+    assert_eq!(extraction.pages.len(), 3);
+
+    // Subset extraction that skips the image page worked before the fix and
+    // must keep working.
+    let subset = extract_pages_markdown_mem(&pdf, Some(&[0, 2])).expect("subset extraction");
+    assert_eq!(subset.pages.len(), 2);
+}
+
+#[test]
+fn test_inline_image_gray_control_still_extracts() {
+    // Control row from the issue's repro matrix: plain gray bytes extracted
+    // fine before the fix and must keep extracting.
+    let pdf = make_pdf_with_inline_image_page(&[0x80, 0x80, 0x80]);
+    let extraction = extract_pages_markdown_mem(&pdf, None).expect("control case extracts");
+    assert_eq!(extraction.pages.len(), 3);
+}
