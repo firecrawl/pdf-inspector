@@ -675,11 +675,18 @@ where
 // Shared implementations (single body behind sync and async entry points)
 // ---------------------------------------------------------------------------
 
-fn process_pdf_impl(bytes: &[u8], pages: Option<Vec<u32>>) -> Result<PdfResult> {
+fn process_pdf_impl(
+    bytes: &[u8],
+    pages: Option<Vec<u32>>,
+    options: Option<ProcessOptions>,
+) -> Result<PdfResult> {
     let mut opts = pdf_inspector::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
+    opts.detection.read_invisible_text_layer = options
+        .and_then(|o| o.read_invisible_text_layer)
+        .unwrap_or(false);
     let result = pdf_inspector::process_pdf_mem_with_options(bytes, opts)
         .map_err(|e| to_napi_err(e, "process_pdf"))?;
     Ok(to_napi_result(result))
@@ -709,9 +716,23 @@ fn classify_pdf_impl(bytes: &[u8]) -> Result<PdfClassification> {
 
 /// Process a PDF from a Buffer: detect type, extract text, and convert to Markdown.
 #[napi]
-pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult> {
+pub fn process_pdf(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<ProcessOptions>,
+) -> Result<PdfResult> {
     let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("process_pdf", move || process_pdf_impl(&bytes, pages))
+    catch_panic("process_pdf", move || process_pdf_impl(&bytes, pages, options))
+}
+
+/// Options for `processPdf`.
+#[napi(object)]
+#[derive(Clone, Default)]
+pub struct ProcessOptions {
+    /// Read a page whose only text is an invisible layer under a covering
+    /// image (the OCR layer of a scan) as text, instead of flagging it
+    /// `invisible_text_layer` in `pagesNeedingOcr`. `false` by default.
+    pub read_invisible_text_layer: Option<bool>,
 }
 
 /// Fast detection only — no text extraction or markdown.
@@ -1421,6 +1442,7 @@ fn to_page_region_texts(results: Vec<pdf_inspector::PageRegionResult>) -> Vec<Pa
 pub struct ProcessPdfTask {
     bytes: Vec<u8>,
     pages: Option<Vec<u32>>,
+    options: Option<ProcessOptions>,
 }
 
 impl Task for ProcessPdfTask {
@@ -1430,11 +1452,12 @@ impl Task for ProcessPdfTask {
     fn compute(&mut self) -> Result<Self::Output> {
         let bytes = std::mem::take(&mut self.bytes);
         let pages = self.pages.take();
+        let options = self.options.take();
         // AssertUnwindSafe: `bytes`/`pages` are moved into the closure and
         // dropped on unwind — no shared state can be observed broken.
         catch_panic(
             "process_pdf",
-            panic::AssertUnwindSafe(move || process_pdf_impl(&bytes, pages)),
+            panic::AssertUnwindSafe(move || process_pdf_impl(&bytes, pages, options)),
         )
     }
 
@@ -1450,10 +1473,15 @@ impl Task for ProcessPdfTask {
 // ts_return_type is required: napi-rs emits `Promise<unknown>` for
 // `AsyncTask<T>` returns without it.
 #[napi(ts_return_type = "Promise<PdfResult>")]
-pub fn process_pdf_async(buffer: Buffer, pages: Option<Vec<u32>>) -> AsyncTask<ProcessPdfTask> {
+pub fn process_pdf_async(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<ProcessOptions>,
+) -> AsyncTask<ProcessPdfTask> {
     AsyncTask::new(ProcessPdfTask {
         bytes: buffer.to_vec(),
         pages,
+        options,
     })
 }
 

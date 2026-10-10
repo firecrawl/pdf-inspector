@@ -420,6 +420,7 @@ fn test_detection_config_custom() {
         strategy: ScanStrategy::Sample(10),
         min_text_ops_per_page: 5,
         text_page_ratio_threshold: 0.8,
+        read_invisible_text_layer: false,
     };
     assert!(matches!(config.strategy, ScanStrategy::Sample(10)));
     assert_eq!(config.min_text_ops_per_page, 5);
@@ -3411,6 +3412,50 @@ fn test_visible_caption_over_covering_image_stays_text() {
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
     assert!(!pages.pages[0].needs_ocr);
     assert!(pages.pages[0].markdown.contains("Figure 1"));
+}
+
+/// With `read_invisible_text_layer`, a scan's invisible layer is read as
+/// its text: alone, and under a visible footer such as an archive's
+/// download stamp. A page with a visible body extracts as it does
+/// without the option.
+#[test]
+fn test_read_invisible_text_layer_reads_the_layer_of_a_scan() {
+    let read = |page: GlyphLayerPage| {
+        let mut options = PdfOptions::new();
+        options.detection.read_invisible_text_layer = true;
+        process_pdf_mem_with_options(&make_pdf_with_glyph_layer(&[page]), options).unwrap()
+    };
+    let layer_letters = |markdown: &str| markdown.matches(['y', 'b']).count();
+
+    let alone = read(SCAN_WITH_INVISIBLE_LAYER);
+    assert!(alone.pages_needing_ocr.is_empty());
+    assert!(alone.ocr_reasons_by_page.is_empty());
+    let markdown = alone.markdown.unwrap_or_default();
+    assert!(layer_letters(&markdown) >= 12, "{markdown}");
+
+    // OCR tools often draw the layer from a Form XObject.
+    for layer_in_form in [false, true] {
+        let footer = read(GlyphLayerPage {
+            caption: Some("Downloaded from an archive"),
+            layer_in_form,
+            invoke_form: layer_in_form,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        });
+        assert!(footer.pages_needing_ocr.is_empty());
+        let markdown = footer.markdown.unwrap_or_default();
+        assert!(
+            markdown.contains("Downloaded from an archive"),
+            "{markdown}"
+        );
+        assert!(layer_letters(&markdown) >= 12, "{markdown}");
+    }
+
+    let body = GlyphLayerPage {
+        body_lines: 12,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let default = process_pdf_mem(&make_pdf_with_glyph_layer(&[body])).unwrap();
+    assert_eq!(read(body).markdown, default.markdown);
 }
 
 /// An image alone is a scan with the `scanned` reason, as before.

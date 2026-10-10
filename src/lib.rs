@@ -1166,7 +1166,7 @@ pub struct PageRegionResult {
 /// Minimum alphanumeric mass an invisible (Tr 3) text layer must carry for
 /// the OCR-layer fallback in [`extract_text_in_regions_mem`] to adopt it. A
 /// real OCR layer carries far more; a stray watermark or artifact does not.
-const OCR_LAYER_MIN_ALNUM: usize = 40;
+pub(crate) const OCR_LAYER_MIN_ALNUM: usize = 40;
 
 /// Alphanumeric mass of extracted items, ignoring raster placeholders.
 /// `[Image: ...]` items (ItemType::Image) are synthesized for image
@@ -4653,6 +4653,7 @@ fn process_document(
             &doc,
             &font_cmaps,
             options.page_filter.as_ref(),
+            options.detection.read_invisible_text_layer,
         );
 
         // For Mixed/template PDFs: if normal extraction produces garbage text
