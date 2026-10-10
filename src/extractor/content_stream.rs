@@ -37,6 +37,10 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
 /// (parentheses) are NOT stripped — only top-level comments.
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+
 fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
@@ -47,9 +51,42 @@ fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     let mut i = 0;
     let mut in_string = 0i32; // parenthesis nesting depth
     let mut in_hex_string = false;
+    // Inside `BI ... ID <data> EI` the bytes between the `ID` operator's
+    // whitespace separator and the terminating `EI` are raw image data, not
+    // content-stream tokens: a `%` there is a pixel value, not a comment,
+    // and `(`/`<` must not move the string state. lopdf locates `EI` by
+    // scanning for the operator between whitespace bytes, so the pre-pass
+    // uses the same delimiter rule to stay aligned with the parser.
+    let mut in_image_data = false;
 
     while i < data.len() {
         let b = data[i];
+        if in_image_data {
+            result.push(b);
+            if b == b'I'
+                && data.get(i.wrapping_sub(1)) == Some(&b'E')
+                && i >= 2
+                && is_pdf_whitespace(data[i - 2])
+                && data.get(i + 1).is_none_or(|&n| is_pdf_whitespace(n))
+            {
+                in_image_data = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string == 0
+            && !in_hex_string
+            && b == b'I'
+            && data.get(i + 1) == Some(&b'D')
+            && data.get(i + 2).is_some_and(|&n| is_pdf_whitespace(n))
+            && (i == 0 || is_pdf_whitespace(data[i - 1]))
+        {
+            result.push(b'I');
+            result.push(b'D');
+            in_image_data = true;
+            i += 2;
+            continue;
+        }
         match b {
             // Inside a string literal, a backslash escapes the next byte —
             // `\(`, `\)`, and `\\` must not touch the nesting depth, or a
@@ -4602,6 +4639,51 @@ end"#;
         let input = b"(x\\(y) Tj % real comment\nET\n";
         let output = strip_pdf_comments(input);
         assert_eq!(output, b"(x\\(y) Tj  \nET\n");
+    }
+
+    #[test]
+    fn test_strip_pdf_comments_skips_inline_image_data() {
+        // Issue #617: a `%` byte in unfiltered inline image data is image
+        // content, not a comment - stripping to end-of-line truncates the
+        // image data and the content stream no longer decodes.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"BI /CS /DeviceGray /W 8 /H 1 /BPC 8 ID\n");
+        input.extend_from_slice(&[0x80, b'%', 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        input.extend_from_slice(b"\nEI\nQ\n% real comment\n");
+        let output = strip_pdf_comments(&input);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"BI /CS /DeviceGray /W 8 /H 1 /BPC 8 ID\n");
+        expected.extend_from_slice(&[0x80, b'%', 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        expected.extend_from_slice(b"\nEI\nQ\n \n");
+        assert_eq!(output, expected);
+
+        // A `(` byte in image data must not open string state that shields a
+        // real comment after the `EI` operator.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 ID\n");
+        input.extend_from_slice(&[b'(', b'%']);
+        input.extend_from_slice(b"\nEI\n% stripped\n");
+        let output = strip_pdf_comments(&input);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 ID\n");
+        expected.extend_from_slice(&[b'(', b'%']);
+        expected.extend_from_slice(b"\nEI\n \n");
+        assert_eq!(output, expected);
+
+        // `ID` inside a string literal is text, not an image delimiter.
+        let input = b"(ID %) Tj\n% comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(ID %) Tj\n \n");
+
+        // Multiple images in one stream stay verbatim.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"BI /W 1 /H 1 /BPC 8 ID\n");
+        input.extend_from_slice(&[b'%']);
+        input.extend_from_slice(b"\nEI\nBI /W 1 /H 1 /BPC 8 ID\n");
+        input.extend_from_slice(&[b'%']);
+        input.extend_from_slice(b"\nEI\n");
+        let output = strip_pdf_comments(&input);
+        assert_eq!(output, input);
 
         // Escaped backslash before a real close-paren: `\\` ends the escape,
         // the `)` does close the string, and the comment is stripped.
