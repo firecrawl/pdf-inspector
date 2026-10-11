@@ -3458,6 +3458,22 @@ fn test_read_invisible_text_layer_reads_the_layer_of_a_scan() {
     assert_eq!(read(body).markdown, default.markdown);
 }
 
+/// With `read_invisible_text_layer`, a layer too short for extraction to
+/// read (under `OCR_LAYER_MIN_ALNUM`) keeps the page on the OCR path.
+#[test]
+fn test_read_invisible_text_layer_keeps_a_short_layer_for_ocr() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    let short = GlyphLayerPage {
+        layer_glyphs: 30,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let result =
+        process_pdf_mem_with_options(&make_pdf_with_glyph_layer(&[short]), options).unwrap();
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+}
+
 /// An image alone is a scan with the `scanned` reason, as before.
 #[test]
 fn test_covering_image_alone_stays_scanned() {

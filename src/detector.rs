@@ -259,7 +259,7 @@ pub(crate) fn detect_from_document(
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content_with(doc, page_id, config);
+            let analysis = analyze_page_content_with(doc, *page_num, page_id, config);
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} form_bytes={} form_bytes_exceeded={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -444,7 +444,7 @@ pub(crate) fn detect_from_document(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content_with(doc, page_id, config);
+                    let a = analyze_page_content_with(doc, page_num, page_id, config);
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -498,7 +498,7 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content_with(doc, page_id, config);
+                let analysis = analyze_page_content_with(doc, page_num, page_id, config);
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -533,7 +533,11 @@ pub(crate) fn detect_from_document(
                             page_num, executed.form_bytes
                         );
                     }
-                    if executed.shows_only_a_hidden_text_layer && !config.read_invisible_text_layer
+                    if executed.shows_only_a_hidden_text_layer
+                        && !(config.read_invisible_text_layer
+                            && crate::extractor::invisible_layer_is_readable(
+                                doc, page_id, page_num,
+                            ))
                     {
                         vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
                     } else {
@@ -873,17 +877,28 @@ fn resolve_with_shadowing(
 }
 
 /// [`analyze_page_content`] with the invisible-layer signal dropped when
-/// the configuration reads such layers as text.
+/// the configuration reads such layers as text and extraction would accept
+/// the page's layer.
 fn analyze_page_content_with(
     doc: &Document,
+    page_num: u32,
     page_id: ObjectId,
     config: &DetectionConfig,
 ) -> PageAnalysis {
     let mut analysis = analyze_page_content(doc, page_id);
-    if config.read_invisible_text_layer {
+    if config.read_invisible_text_layer
+        && analysis.has_invisible_text_layer
+        && crate::extractor::invisible_layer_is_readable(doc, page_id, page_num)
+    {
         analysis.has_invisible_text_layer = false;
     }
     analysis
+}
+
+/// Whether the images a page's content draws cover the page — see
+/// `PageAnalysis::has_covering_image`.
+pub(crate) fn page_has_covering_image(doc: &Document, page_id: ObjectId) -> bool {
+    content_scan::page_executed_content(doc, page_id).covers_page
 }
 
 /// Analyze a page's content stream for text operators and images

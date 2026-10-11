@@ -1556,7 +1556,9 @@ pub(crate) fn get_form_fonts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extractor::content_stream::extract_page_text_items;
+    use crate::extractor::content_stream::{
+        extract_page_text_items, extract_page_text_items_with_options,
+    };
     use lopdf::{dictionary, Dictionary, Stream};
 
     /// Build an acyclic Form XObject DAG: `levels` form objects, each non-leaf
@@ -1802,6 +1804,68 @@ mod tests {
             "second pass must not get a fresh invocation budget"
         );
         assert!(budget.was_truncated());
+    }
+
+    /// A covering inline image when `scan`, a short visible line, and a
+    /// hidden (Tr 3) layer in form `X1`.
+    fn page_with_hidden_layer(scan: bool) -> (Document, ObjectId) {
+        let image = if scan {
+            "q 612 0 0 792 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI Q "
+        } else {
+            ""
+        };
+        doc_with_page_and_forms(
+            format!("{image}BT /F1 12 Tf 72 40 Td (Page one) Tj ET /X1 Do").as_bytes(),
+            &[
+                b"BT 3 Tr /F1 10 Tf 72 720 Td (the page carries a layer nobody sees) Tj \
+                0 -14 Td (and a second line of the same hidden text) Tj ET",
+            ],
+        )
+    }
+
+    /// Whether the invisible-layer retry adopts the layer of the page.
+    fn reads_hidden_layer(doc: &Document, page_id: ObjectId, mut budget: FormWalkBudget) -> bool {
+        let font_cmaps = FontCMaps::from_doc(doc);
+        let options = crate::extractor::TextExtractionOptions::default();
+        let mut style_cache = FontStyleCache::new();
+        let visible = extract_page_text_items_with_options(
+            doc,
+            page_id,
+            1,
+            &font_cmaps,
+            options,
+            &mut style_cache,
+            &mut budget,
+        )
+        .unwrap();
+        let ((items, _, _), ..) = super::super::read_invisible_layer_if_dominant(
+            doc,
+            page_id,
+            1,
+            &font_cmaps,
+            options,
+            &mut style_cache,
+            &mut budget,
+            visible,
+        );
+        items.iter().any(|item| item.text.contains("nobody"))
+    }
+
+    #[test]
+    fn invisible_layer_retry_reads_only_a_scan() {
+        let (doc, page_id) = page_with_hidden_layer(true);
+        assert!(reads_hidden_layer(&doc, page_id, FormWalkBudget::new()));
+        let (doc, page_id) = page_with_hidden_layer(false);
+        assert!(!reads_hidden_layer(&doc, page_id, FormWalkBudget::new()));
+    }
+
+    #[test]
+    fn invisible_layer_retry_shares_the_page_form_budget() {
+        let (doc, page_id) = page_with_hidden_layer(true);
+        // The visible pass spends the page's one form invocation, so the
+        // retry has none left.
+        let budget = FormWalkBudget::with_limits(1, MAX_FORM_XOBJECT_OPERATIONS);
+        assert!(!reads_hidden_layer(&doc, page_id, budget));
     }
 
     /// Build a document whose page draws *all* of its content through a single
