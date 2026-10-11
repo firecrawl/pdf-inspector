@@ -539,7 +539,10 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     // Track which page first shows each candidate (to preserve first occurrence)
     let mut first_page_individual: HashMap<String, u32> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
-        if !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
+        // A one- or two-row page adds no candidates, but a header already
+        // confirmed on full pages is still furniture there.
+        let sparse_page = page_rows.get(&line.page).is_some_and(|r| r.len() <= 2);
+        if !sparse_page && !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
             continue;
         }
         let text = line.text();
@@ -1356,13 +1359,7 @@ mod tests {
         let mut lines = Vec::new();
         for page in [1u32, 2, 5] {
             for (row, text) in story.iter().enumerate() {
-                lines.push(make_line(
-                    text,
-                    10.0,
-                    page,
-                    700.0 - row as f32 * 40.0,
-                    None,
-                ));
+                lines.push(make_line(text, 10.0, page, 700.0 - row as f32 * 40.0, None));
             }
         }
         for page in [3u32, 4, 6] {
@@ -1385,7 +1382,9 @@ mod tests {
             "short-page body must keep its interior rows"
         );
         assert!(
-            result.iter().any(|l| l.page == 2 && l.text().contains("next sentence")),
+            result
+                .iter()
+                .any(|l| l.page == 2 && l.text().contains("next sentence")),
             "an interior sentence must survive on the repeated page"
         );
     }
@@ -1522,6 +1521,46 @@ mod tests {
                 .count(),
             1,
             "a header above a real interior must still strip"
+        );
+    }
+
+    #[test]
+    fn running_header_on_a_near_empty_page_still_strips() {
+        // Five full pages confirm the header as furniture. Page 6 holds only
+        // the header and one body line; two rows are not a margin, but a
+        // header already confirmed on full pages must not leak back in.
+        let mut lines = Vec::new();
+        for page in 1..=6u32 {
+            lines.push(make_line(
+                "Quarterly Bulletin running header text",
+                10.0,
+                page,
+                760.0,
+                None,
+            ));
+            let rows = if page == 6 { 1 } else { 10 };
+            for row in 0..rows {
+                lines.push(make_line(
+                    &format!("unique body words page {page} row {row} lorem ipsum"),
+                    10.0,
+                    page,
+                    700.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert!(
+            !result
+                .iter()
+                .any(|l| l.page == 6 && l.text().contains("Quarterly Bulletin")),
+            "a confirmed running header must strip on a near-empty page"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|l| l.page == 6 && l.text().contains("page 6 row 0")),
+            "the near-empty page body must stay"
         );
     }
 }
