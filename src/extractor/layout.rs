@@ -3017,9 +3017,7 @@ fn is_wrapped_fragment(entry: &TextItem, entry_text: &str) -> bool {
     if trimmed.ends_with(['?', '!']) {
         return false;
     }
-    trimmed.ends_with('.')
-        && !trimmed.ends_with("...")
-        && trimmed.split_whitespace().count() <= 3
+    trimmed.ends_with('.') && !trimmed.ends_with("...") && trimmed.split_whitespace().count() <= 3
 }
 
 /// The roman token is the right-hand page number of an entry. A sentence
@@ -3165,7 +3163,11 @@ fn group_single_column(
                     // beside `iii` still splits.
                     let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
                         || roman_folio_beside_entry(&item, item.text.trim(), last_item);
+                    // Only a run that continues in reading order: an
+                    // out-of-order stream fills the void in later.
+                    let continues_line = (item.x > last_item.x) != page_rtl;
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
+                        && continues_line
                         && !folio_on_entry
                     {
                         return false;
@@ -3903,6 +3905,63 @@ mod tests {
             1,
             "a short same-style label row stays one line"
         );
+    }
+
+    #[test]
+    fn out_of_order_runs_on_one_line_still_join() {
+        // Stream order is middle, right, left. Each run sits a normal word
+        // space from its neighbor, so the symmetric gap stays small and the
+        // runs join and sort back into reading order.
+        let mut middle = make_item(1, 130.0, 600.0, "quarter rose steadily");
+        middle.width = 120.0;
+        let mut right = make_item(1, 254.0, 600.0, "across every region");
+        right.width = 110.0;
+        let mut left = make_item(1, 40.0, 600.0, "Revenue this");
+        left.width = 86.0;
+        let lines = group_single_column(vec![middle, right, left], 0.10, false);
+        assert_eq!(lines.len(), 1, "out-of-order runs on one baseline join");
+        let texts: Vec<&str> = lines[0].items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Revenue this",
+                "quarter rose steadily",
+                "across every region"
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_table_row_splits_at_the_void_rule() {
+        // Documents current behaviour: same-baseline header cells more than
+        // 8em and 100pt apart split into separate lines, even though they
+        // are one table row.
+        let mut cells = Vec::new();
+        for (x, text) in [(47.0, "Status"), (200.0, "Description"), (400.0, "Owner")] {
+            let mut item = make_item(1, x, 459.0, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            item.is_bold = true;
+            cells.push(item);
+        }
+        assert_eq!(group_single_column(cells, 0.10, false).len(), 3);
+    }
+
+    #[test]
+    fn digit_page_numbers_skip_the_void_rule() {
+        // The void split only runs for an incoming run that starts with a
+        // letter, so a far digit page number stays on its entry line.
+        for folio in ["12", "12.", "112"] {
+            let mut title = make_item(1, 72.0, 700.0, "Introduction");
+            title.width = 90.0;
+            let mut page_no = make_item(1, 540.0, 700.0, folio);
+            page_no.width = 16.0;
+            assert_eq!(
+                group_single_column(vec![title, page_no], 0.10, false).len(),
+                1,
+                "{folio} stays on the entry line"
+            );
+        }
     }
 
     #[test]
