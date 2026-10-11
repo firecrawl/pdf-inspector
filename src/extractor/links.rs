@@ -1,5 +1,6 @@
 //! Hyperlink and AcroForm field extraction.
 
+use crate::text_utils::decode_pdf_text_string;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -305,7 +306,9 @@ pub(crate) fn walk_form_fields(
         .get(b"T")
         .ok()
         .and_then(|o| o.as_str().ok())
-        .map(|s| String::from_utf8_lossy(s).to_string())
+        // A field name is a PDF text string (PDF 32000-1 §7.9.2.2): UTF-16 with a byte-order mark, or
+        // PDFDocEncoding. Read as UTF-8 it turns into U+FFFD, and the page then counts as garbled text.
+        .map(decode_pdf_text_string)
         .unwrap_or_default();
 
     let full_name = if parent_name.is_empty() {
@@ -378,7 +381,7 @@ pub(crate) fn walk_form_fields(
             // Text or Choice field — value is a string or array of strings
             match value {
                 Object::String(s, _) => {
-                    let s = String::from_utf8_lossy(s).to_string();
+                    let s = decode_pdf_text_string(s);
                     if s.is_empty() {
                         return;
                     }
@@ -389,7 +392,7 @@ pub(crate) fn walk_form_fields(
                         .iter()
                         .filter_map(|o| {
                             if let Object::String(s, _) = o {
-                                Some(String::from_utf8_lossy(s).to_string())
+                                Some(decode_pdf_text_string(s))
                             } else {
                                 None
                             }
@@ -484,6 +487,32 @@ pub(crate) fn walk_form_fields(
 mod tests {
     use super::*;
     use lopdf::{dictionary, Object};
+
+    #[test]
+    fn field_names_and_values_are_decoded_as_pdf_text_strings() {
+        // A name in PDFDocEncoding (ß = 0xDF, ö = 0xF6) and a value in UTF-16BE with a BOM, as Acrobat
+        // writes non-ASCII values. Both used to be read as UTF-8 and came back as U+FFFD.
+        let mut value = vec![0xFE, 0xFF];
+        value.extend("Jürgen Groß".encode_utf16().flat_map(u16::to_be_bytes));
+        let mut doc = Document::new();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page" });
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => Object::String(b"Stra\xDFe und Gr\xF6\xDFe".to_vec(), lopdf::StringFormat::Literal),
+            "V" => Object::String(value, lopdf::StringFormat::Hexadecimal),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+            "P" => Object::Reference(page_id),
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! { "Fields" => vec![Object::Reference(widget_id)] },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let items = extract_form_fields(&doc, &HashMap::from([(page_id, 1)]));
+        assert_eq!(items[0].text, "Straße und Größe: Jürgen Groß");
+    }
 
     #[test]
     fn widget_without_page_reference_uses_owning_page_annotation() {
