@@ -562,6 +562,7 @@ fn print_usage(argv0: &str) {
     eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
     eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
     eprintln!("  --password PW       Password for an encrypted PDF");
+    eprintln!("  --read-invisible-text-layer  Read a scan's invisible OCR text layer as its text");
     eprintln!("  --detect-only       Only detect PDF type (no extraction)");
     eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
     eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");

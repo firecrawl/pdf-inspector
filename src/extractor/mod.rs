@@ -547,14 +547,7 @@ fn extract_positioned_text_with_folio_context_impl(
     include_invisible: bool,
     invisible_layer_fallback: bool,
 ) -> Result<DocumentExtraction, PdfError> {
-    // The selected pages report their CMap coverage; the context pages
-    // gathered below for their folio evidence do not.
-    let options = TextExtractionOptions {
-        include_invisible,
-        invisible_layer_fallback,
-        cmap_coverage: true,
-        ..TextExtractionOptions::default()
-    };
+    let options = document_text_options(include_invisible, invisible_layer_fallback);
     let Some(required_pages) = page_filter else {
         return extract_positioned_text_impl(
             doc,
@@ -665,12 +658,31 @@ fn alnum_of(items: &[TextItem]) -> usize {
         .sum()
 }
 
-/// The page read again with its invisible (Tr 3) layer, when that layer
-/// adds real text (`OCR_LAYER_MIN_ALNUM`) and the visible text is at most a
-/// quarter of that gain, such as a download footer over an OCR scan. The
-/// ratio keeps an OCR layer from doubling a page's visible words.
-#[allow(clippy::too_many_arguments)]
-fn read_invisible_layer(
+/// The options document extraction reads its selected pages with. The
+/// selected pages report their CMap coverage; the context pages gathered
+/// for their folio evidence do not.
+fn document_text_options(
+    include_invisible: bool,
+    invisible_layer_fallback: bool,
+) -> TextExtractionOptions {
+    TextExtractionOptions {
+        include_invisible,
+        invisible_layer_fallback,
+        cmap_coverage: true,
+        ..TextExtractionOptions::default()
+    }
+}
+
+/// A page as document extraction reads it: the visible pass, then, with
+/// `invisible_layer_fallback`, a page whose visible pass skipped invisible
+/// (Tr 3) text under a covering image (a scan) is read again with that
+/// layer on the same form budget. That reading is kept when the layer adds
+/// real text (`OCR_LAYER_MIN_ALNUM`) and the visible text is at most a
+/// quarter of that gain, such as a download footer over an OCR scan; the
+/// ratio keeps an OCR layer from doubling a page's visible words. A page
+/// without a covering image keeps its visible text, whatever it hides.
+/// The flag tells whether the layer's reading was kept.
+fn extract_page(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
@@ -678,9 +690,24 @@ fn read_invisible_layer(
     options: TextExtractionOptions,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-    visible_alnum: usize,
-) -> Option<PageExtractionResult> {
-    let layer = extract_page_text_items_with_options(
+) -> Result<(PageExtractionResult, bool), PdfError> {
+    let visible = extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        options,
+        style_cache,
+        form_budget,
+    )?;
+    let skipped_invisible = visible.3;
+    if !options.invisible_layer_fallback
+        || !skipped_invisible
+        || !crate::detector::page_has_covering_image(doc, page_id)
+    {
+        return Ok((visible, false));
+    }
+    let Ok(layer) = extract_page_text_items_with_options(
         doc,
         page_id,
         page_num,
@@ -691,8 +718,9 @@ fn read_invisible_layer(
         },
         style_cache,
         form_budget,
-    )
-    .ok()?;
+    ) else {
+        return Ok((visible, false));
+    };
     let text: String = layer
         .0
          .0
@@ -702,66 +730,42 @@ fn read_invisible_layer(
         .collect();
     // The with-invisible pass also holds the visible items, so this is
     // what the hidden layer adds.
-    let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);
-    (gained >= crate::OCR_LAYER_MIN_ALNUM
-        && visible_alnum * 4 <= gained
-        && !crate::text_quality::is_garbage_text(&text))
-    .then_some(layer)
-}
-
-/// Whether a page that shows only an invisible text layer would have that
-/// layer read by `read_invisible_text_layer` extraction. Detection asks
-/// this before it counts such a page as text, so a layer extraction would
-/// reject keeps the page on the OCR path.
-pub(crate) fn invisible_layer_is_readable(
-    doc: &Document,
-    page_id: ObjectId,
-    page_num: u32,
-) -> bool {
-    read_invisible_layer(
-        doc,
-        page_id,
-        page_num,
-        &FontCMaps::from_doc_pages(doc, Some(&HashSet::from([page_num]))),
-        TextExtractionOptions::default(),
-        &mut FontStyleCache::new(),
-        &mut FormWalkBudget::new(),
-        0,
-    )
-    .is_some()
-}
-
-/// A page whose visible pass skipped invisible text under a covering
-/// image (a scan) is read again with that layer, and the reading is kept
-/// when [`read_invisible_layer`] accepts it. A page without a covering
-/// image keeps its visible text, whatever it hides.
-#[allow(clippy::too_many_arguments)]
-fn read_invisible_layer_if_dominant(
-    doc: &Document,
-    page_id: ObjectId,
-    page_num: u32,
-    font_cmaps: &FontCMaps,
-    options: TextExtractionOptions,
-    style_cache: &mut FontStyleCache,
-    form_budget: &mut FormWalkBudget,
-    visible: PageExtractionResult,
-) -> PageExtractionResult {
-    let skipped_invisible = visible.3;
-    if !skipped_invisible || !crate::detector::page_has_covering_image(doc, page_id) {
-        return visible;
-    }
     let visible_alnum = alnum_of(&visible.0 .0);
-    read_invisible_layer(
-        doc,
-        page_id,
-        page_num,
-        font_cmaps,
-        options,
-        style_cache,
-        form_budget,
-        visible_alnum,
-    )
-    .unwrap_or(visible)
+    let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);
+    if gained >= crate::OCR_LAYER_MIN_ALNUM
+        && visible_alnum * 4 <= gained
+        && !crate::text_quality::is_garbage_text(&text)
+    {
+        Ok((layer, true))
+    } else {
+        Ok((visible, false))
+    }
+}
+
+/// Whether `read_invisible_text_layer` extraction keeps a page's invisible
+/// layer, asked by detection through [`extract_page`] itself so the two
+/// agree. The document's fonts are read once, for the first page asked.
+#[derive(Default)]
+pub(crate) struct InvisibleLayerProbe {
+    fonts: Option<(FontCMaps, FontStyleCache)>,
+}
+
+impl InvisibleLayerProbe {
+    pub(crate) fn keeps_layer(&mut self, doc: &Document, page_id: ObjectId, page_num: u32) -> bool {
+        let (font_cmaps, style_cache) = self
+            .fonts
+            .get_or_insert_with(|| (FontCMaps::from_doc(doc), FontStyleCache::new()));
+        extract_page(
+            doc,
+            page_id,
+            page_num,
+            font_cmaps,
+            document_text_options(false, true),
+            style_cache,
+            &mut FormWalkBudget::new(),
+        )
+        .is_ok_and(|(_, kept)| kept)
+    }
 }
 
 fn extract_positioned_text_impl(
@@ -799,32 +803,16 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        // One form-walk budget for the page, shared by both passes.
-        let mut form_budget = FormWalkBudget::new();
-        let page_result = extract_page_text_items_with_options(
+        let page_result = extract_page(
             doc,
             page_id,
             *page_num,
             font_cmaps,
             options,
             &mut style_cache,
-            &mut form_budget,
-        );
-        let page_result = match page_result {
-            Ok(extraction) if options.invisible_layer_fallback => {
-                Ok(read_invisible_layer_if_dominant(
-                    doc,
-                    page_id,
-                    *page_num,
-                    font_cmaps,
-                    options,
-                    &mut style_cache,
-                    &mut form_budget,
-                    extraction,
-                ))
-            }
-            other => other,
-        };
+            &mut FormWalkBudget::new(),
+        )
+        .map(|(extraction, _)| extraction);
         let (
             (mut items, mut rects, mut lines),
             has_gid_fonts,

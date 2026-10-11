@@ -1556,9 +1556,7 @@ pub(crate) fn get_form_fonts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extractor::content_stream::{
-        extract_page_text_items, extract_page_text_items_with_options,
-    };
+    use crate::extractor::content_stream::extract_page_text_items;
     use lopdf::{dictionary, Dictionary, Stream};
 
     /// Build an acyclic Form XObject DAG: `levels` form objects, each non-leaf
@@ -1825,29 +1823,17 @@ mod tests {
 
     /// Whether the invisible-layer retry adopts the layer of the page.
     fn reads_hidden_layer(doc: &Document, page_id: ObjectId, mut budget: FormWalkBudget) -> bool {
-        let font_cmaps = FontCMaps::from_doc(doc);
-        let options = crate::extractor::TextExtractionOptions::default();
-        let mut style_cache = FontStyleCache::new();
-        let visible = extract_page_text_items_with_options(
+        let ((items, _, _), ..) = super::super::extract_page(
             doc,
             page_id,
             1,
-            &font_cmaps,
-            options,
-            &mut style_cache,
+            &FontCMaps::from_doc(doc),
+            super::super::document_text_options(false, true),
+            &mut FontStyleCache::new(),
             &mut budget,
         )
-        .unwrap();
-        let ((items, _, _), ..) = super::super::read_invisible_layer_if_dominant(
-            doc,
-            page_id,
-            1,
-            &font_cmaps,
-            options,
-            &mut style_cache,
-            &mut budget,
-            visible,
-        );
+        .unwrap()
+        .0;
         items.iter().any(|item| item.text.contains("nobody"))
     }
 

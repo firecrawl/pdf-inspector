@@ -256,10 +256,13 @@ pub(crate) fn detect_from_document(
     let mut pages_actually_sampled = 0u32;
     // Pages read whose form content ran past the scan's byte budget.
     let mut pages_past_form_budget = 0u32;
+    // Reads hidden layers as `read_invisible_text_layer` extraction does.
+    let mut layer_probe = crate::extractor::InvisibleLayerProbe::default();
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content_with(doc, *page_num, page_id, config);
+            let analysis =
+                analyze_page_content_with(doc, *page_num, page_id, config, &mut layer_probe);
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} form_bytes={} form_bytes_exceeded={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -314,9 +317,13 @@ pub(crate) fn detect_from_document(
             // A page whose text is all invisible under an image covering
             // the page is a scan however many operators the layer has:
             // the page shows its raster, and the layer only describes it.
+            // A layer read as text keeps the page a scan here, so the
+            // document is Mixed and each page, sampled or not, is judged
+            // on its own below.
             if (analysis.has_template_image
                 && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok))
                 || analysis.has_invisible_text_layer
+                || analysis.has_readable_invisible_text_layer
             {
                 pages_with_template_images += 1;
             }
@@ -444,7 +451,8 @@ pub(crate) fn detect_from_document(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content_with(doc, page_num, page_id, config);
+                    let a =
+                        analyze_page_content_with(doc, page_num, page_id, config, &mut layer_probe);
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -498,7 +506,7 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content_with(doc, page_num, page_id, config);
+                let analysis = analyze_page_content(doc, page_id);
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -533,12 +541,7 @@ pub(crate) fn detect_from_document(
                             page_num, executed.form_bytes
                         );
                     }
-                    if executed.shows_only_a_hidden_text_layer
-                        && !(config.read_invisible_text_layer
-                            && crate::extractor::invisible_layer_is_readable(
-                                doc, page_id, page_num,
-                            ))
-                    {
+                    if executed.shows_only_a_hidden_text_layer {
                         vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
                     } else {
                         vec![crate::OCR_REASON_SCANNED]
@@ -649,6 +652,10 @@ struct PageAnalysis {
     /// sees. What the layer says is not what the page shows, so the page
     /// is read from its raster.
     has_invisible_text_layer: bool,
+    /// With `read_invisible_text_layer`, the page's invisible layer is one
+    /// extraction keeps, so the page is read as text and
+    /// `has_invisible_text_layer` is cleared.
+    has_readable_invisible_text_layer: bool,
     /// Bytes of Form XObject and pattern-cell content the page's content
     /// executed, and whether a form went unread because the page's budget
     /// of them ran out — the page then keeps the classification it had
@@ -876,21 +883,23 @@ fn resolve_with_shadowing(
     }
 }
 
-/// [`analyze_page_content`] with the invisible-layer signal dropped when
-/// the configuration reads such layers as text and extraction would accept
-/// the page's layer.
+/// [`analyze_page_content`] with the invisible-layer signal moved to
+/// `has_readable_invisible_text_layer` when the configuration reads such
+/// layers as text and extraction keeps the page's layer.
 fn analyze_page_content_with(
     doc: &Document,
     page_num: u32,
     page_id: ObjectId,
     config: &DetectionConfig,
+    layer_probe: &mut crate::extractor::InvisibleLayerProbe,
 ) -> PageAnalysis {
     let mut analysis = analyze_page_content(doc, page_id);
     if config.read_invisible_text_layer
         && analysis.has_invisible_text_layer
-        && crate::extractor::invisible_layer_is_readable(doc, page_id, page_num)
+        && layer_probe.keeps_layer(doc, page_id, page_num)
     {
         analysis.has_invisible_text_layer = false;
+        analysis.has_readable_invisible_text_layer = true;
     }
     analysis
 }
@@ -1050,6 +1059,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_template_image,
         has_covering_image,
         has_invisible_text_layer,
+        has_readable_invisible_text_layer: false,
         executed_form_bytes,
         form_bytes_exceeded,
         total_image_area,
