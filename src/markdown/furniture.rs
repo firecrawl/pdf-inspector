@@ -384,8 +384,9 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         }
         // On a short page the full N-row zones meet and would mark the body
         // as furniture. Keep only the outermost row, which is still enough
-        // for a running header or footer. Tall pages keep the N-row zone.
-        let edge = if count <= n * 2 { 1 } else { n };
+        // for a running header or footer, and grow the zone one row per row
+        // past 2 * N so it never jumps to cover nearly the whole page.
+        let edge = count.saturating_sub(n * 2).clamp(1, n);
         let pos = match rows.iter().position(|&py| (py - y).abs() < 0.1) {
             Some(p) => p,
             None => return false,
@@ -1522,6 +1523,44 @@ mod tests {
             1,
             "a header above a real interior must still strip"
         );
+    }
+
+    #[test]
+    fn repeated_body_just_past_the_short_page_cutoff_is_kept() {
+        // Eleven and twelve rows used to switch straight to the five-row
+        // zones, which left only the middle row or two of a repeated passage.
+        for rows in [11u32, 12] {
+            let mut lines = Vec::new();
+            for page in [1u32, 2, 5] {
+                for row in 0..rows {
+                    lines.push(make_line(
+                        &format!("repeated passage sentence number {row} of the story"),
+                        10.0,
+                        page,
+                        700.0 - row as f32 * 20.0,
+                        None,
+                    ));
+                }
+            }
+            for page in [3u32, 4, 6] {
+                for row in 0..rows {
+                    lines.push(make_line(
+                        &format!("different page {page} body sentence number {row} here"),
+                        10.0,
+                        page,
+                        700.0 - row as f32 * 20.0,
+                        None,
+                    ));
+                }
+            }
+            let result = strip_repeated_lines(lines, 6);
+            let edge = (rows - 10) as usize;
+            assert_eq!(
+                result.iter().filter(|l| l.page == 2).count(),
+                rows as usize - 2 * edge,
+                "a {rows}-row page must keep its repeated interior"
+            );
+        }
     }
 
     #[test]
