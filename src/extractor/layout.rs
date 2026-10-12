@@ -3080,7 +3080,9 @@ fn same_style_header_row(
     cells.extend(line.items.iter());
     cells.push(incoming);
     for next in upcoming.iter().flatten() {
-        if next.page != incoming.page || (next.line_y() - incoming.line_y()).abs() >= y_tolerance {
+        // Grouping measures each run against the line anchor, so the
+        // lookahead does too.
+        if next.page != incoming.page || (next.line_y() - line.y).abs() >= y_tolerance {
             // Stop at the next baseline. A later cell on this baseline cannot
             // join the line once a lower row is the current one, so it is not
             // evidence for keeping the cells already seen together.
@@ -3975,6 +3977,27 @@ mod tests {
         tag.width = 36.0;
         let lines = group_single_column(vec![title, tag], 0.10, false);
         assert_eq!(lines.len(), 2, "a far tag must not extend the title");
+    }
+
+    #[test]
+    fn header_cells_on_either_side_of_the_anchor_stay_one_row() {
+        // Each cell is within 3pt of the line anchor at 459, but the second
+        // and third are 4.7pt apart. The row must still count three cells.
+        let mut cells = Vec::new();
+        for (x, y, text) in [
+            (47.0, 459.0, "Status"),
+            (200.0, 461.5, "Description"),
+            (400.0, 456.8, "Owner"),
+        ] {
+            let mut item = make_item(1, x, y, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            item.is_bold = true;
+            cells.push(item);
+        }
+        let lines = group_single_column(cells, 0.10, false);
+        assert_eq!(lines.len(), 1, "a slightly uneven header row stays joined");
+        assert_eq!(lines[0].items.len(), 3);
     }
 
     #[test]
