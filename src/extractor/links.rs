@@ -1,6 +1,6 @@
 //! Hyperlink and AcroForm field extraction.
 
-use crate::text_utils::decode_pdf_text_string;
+use crate::text_utils::decode_form_field_text;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -306,7 +306,7 @@ pub(crate) fn walk_form_fields(
         .get(b"T")
         .ok()
         .and_then(|o| o.as_str().ok())
-        .map(decode_pdf_text_string)
+        .map(decode_form_field_text)
         .unwrap_or_default();
 
     let full_name = if parent_name.is_empty() {
@@ -379,7 +379,7 @@ pub(crate) fn walk_form_fields(
             // Text or Choice field — value is a string or array of strings
             match value {
                 Object::String(s, _) => {
-                    let s = decode_pdf_text_string(s);
+                    let s = decode_form_field_text(s);
                     if s.is_empty() {
                         return;
                     }
@@ -390,7 +390,7 @@ pub(crate) fn walk_form_fields(
                         .iter()
                         .filter_map(|o| {
                             if let Object::String(s, _) = o {
-                                Some(decode_pdf_text_string(s))
+                                Some(decode_form_field_text(s))
                             } else {
                                 None
                             }
@@ -786,6 +786,42 @@ mod tests {
                 .map(|item| item.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["Prénom: Zoë", "price: €, 5"]
+        );
+    }
+
+    #[test]
+    fn pdf_doc_field_bytes_that_are_also_utf8_stay_pdf_doc() {
+        // C2 A0 is valid UTF-8 (U+00A0) and PDFDoc Â + euro. /T, a text
+        // /V, and a choice /V all take the PDFDoc reading.
+        let mut doc = Document::new();
+        let text_field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => pdf_text(vec![0xC2, 0xA0]),
+            "V" => pdf_text(vec![0xC2, 0xA0]),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let choice_field = doc.add_object(dictionary! {
+            "FT" => "Ch",
+            "T" => Object::string_literal("choice"),
+            "V" => vec![pdf_text(vec![0xC2, 0xA0])],
+            "Rect" => vec![10.into(), 50.into(), 110.into(), 70.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(text_field), Object::Reference(choice_field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut items = extract_form_fields(&doc, &HashMap::new());
+        items.sort_by(|a, b| a.text.cmp(&b.text));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["choice: Â€", "Â€: Â€"]
         );
     }
 }
