@@ -9,6 +9,31 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `processPdf(buffer, pages, { readInvisibleTextLayer: true })`, and the same
+  option on `processPdfAsync`, `DetectionConfig::read_invisible_text_layer`
+  and `pdf2md --read-invisible-text-layer`, read the invisible OCR text layer
+  (render mode 3) of a scanned page as its text. A page with a covering
+  image whose visible pass skipped invisible text is read again with its
+  layer. The layer is kept when it adds at least 40 letters or digits, at
+  least four times the page's visible text, and is neither garbage nor
+  case-shifted gibberish, like Tesseract's reading of a page scanned upside
+  down. A small stamp over the layer, like an archive's download footer, is
+  returned with it. A scan page whose visible text is at most a stamp (160
+  letters or digits) and whose layer is not kept is listed in
+  `pages_needing_ocr`: with the `invisible_text_layer` reason when it has a
+  layer, and `scanned` when it has none. A kept layer removes only the
+  page's `invisible_text_layer` reason. Detection alone lists every page
+  whose only text is a hidden layer, so pages extraction does not read keep
+  detection's listing: pages outside the page filter, which may still be
+  read for page-number context, are listed when detection listed them, and
+  not at all in a stamped book detection reads as text. A book of
+  hidden-layer pages reports `Mixed`: route on `pages_needing_ocr`. Off by
+  default; output without the option is unchanged. Rust code that builds
+  `DetectionConfig` with a struct literal must add
+  `read_invisible_text_layer` or end with `..Default::default()`.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that

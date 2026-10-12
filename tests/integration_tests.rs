@@ -420,6 +420,7 @@ fn test_detection_config_custom() {
         strategy: ScanStrategy::Sample(10),
         min_text_ops_per_page: 5,
         text_page_ratio_threshold: 0.8,
+        read_invisible_text_layer: false,
     };
     assert!(matches!(config.strategy, ScanStrategy::Sample(10)));
     assert_eq!(config.min_text_ops_per_page, 5);
@@ -2586,6 +2587,11 @@ struct GlyphLayerPage {
     /// for no layer.
     layer_mode: Option<u8>,
     layer_glyphs: usize,
+    /// Set the render mode inside each text object instead of once before
+    /// the layer.
+    tr_in_text_object: bool,
+    /// The glyphs the layer shows, repeated.
+    layer_text: &'static str,
     /// Put the layer in a Form XObject `Fm0` instead of the page's content,
     /// invoked from the page when `invoke_form`, else bound and never run.
     layer_in_form: bool,
@@ -2619,6 +2625,8 @@ struct GlyphLayerPage {
     marked_content_id: bool,
     /// A line of visible text at the foot of the page.
     caption: Option<&'static str>,
+    /// A running footer with the page's number beside it.
+    folio: bool,
     /// Lines of ordinary visible body text.
     body_lines: usize,
 }
@@ -2671,7 +2679,7 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
         )
     });
     let mut kids = Vec::new();
-    for page in pages {
+    for (index, page) in pages.iter().enumerate() {
         let mut xobjects = String::new();
         let mut content = String::new();
         let draws =
@@ -2749,15 +2757,18 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
             }
         }
         if let Some(mode) = page.layer_mode {
-            let mut layer = format!("{mode} Tr\n");
-            let glyphs = "thepagecarriesalayernobodysees"
-                .chars()
-                .cycle()
-                .take(page.layer_glyphs);
+            // Before the layer, or inside each text object as OCR tools
+            // write it: the extractor resets the mode at `BT`.
+            let (mut layer, tr) = if page.tr_in_text_object {
+                (String::new(), format!("{mode} Tr "))
+            } else {
+                (format!("{mode} Tr\n"), String::new())
+            };
+            let glyphs = page.layer_text.chars().cycle().take(page.layer_glyphs);
             if page.quote_operators {
                 // One glyph per line, `'` and `"` in turn, under a leading
                 // small enough to keep every line on the page.
-                layer.push_str("BT /F1 10 Tf 5 TL 72 720 Td\n");
+                layer.push_str(&format!("BT {tr}/F1 10 Tf 5 TL 72 720 Td\n"));
                 for (n, glyph) in glyphs.enumerate() {
                     if n % 2 == 0 {
                         layer.push_str(&format!("({glyph}) '\n"));
@@ -2771,7 +2782,7 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
                     let x = 72 + (n % 40) * 12;
                     let y = 720 - (n / 40) * 14;
                     layer.push_str(&format!(
-                        "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
+                        "BT {tr}1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
                     ));
                 }
             }
@@ -2802,6 +2813,13 @@ fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
         }
         if let Some(caption) = page.caption {
             content.push_str(&format!("BT 0 Tr /F1 12 Tf 72 40 Td ({caption}) Tj ET\n"));
+        }
+        if page.folio {
+            let number = index + 1;
+            content.push_str(&format!(
+                "BT 0 Tr /F1 12 Tf 1 0 0 1 25 30 Tm ({number}) Tj \
+                 1 0 0 1 41 30 Tm (Journal of Scans) Tj ET\n"
+            ));
         }
         let contents = add(&mut objects, stream("", content.as_bytes()));
         let xobject_entry = if xobjects.is_empty() {
@@ -2859,6 +2877,8 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     spare_large_image: false,
     layer_mode: Some(3),
     layer_glyphs: 120,
+    tr_in_text_object: false,
+    layer_text: "thepagecarriesalayernobodysees",
     layer_in_form: false,
     invoke_form: false,
     image_after_layer: false,
@@ -2872,6 +2892,7 @@ const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
     quote_operators: false,
     marked_content_id: false,
     caption: None,
+    folio: false,
     body_lines: 0,
 };
 
@@ -3411,6 +3432,435 @@ fn test_visible_caption_over_covering_image_stays_text() {
     let pages = extract_pages_markdown_mem(&buf, None).unwrap();
     assert!(!pages.pages[0].needs_ocr);
     assert!(pages.pages[0].markdown.contains("Figure 1"));
+}
+
+/// A scan with the text layer an OCR tool writes: the render mode set in
+/// each text object.
+const OCR_TOOL_SCAN: GlyphLayerPage = GlyphLayerPage {
+    tr_in_text_object: true,
+    ..SCAN_WITH_INVISIBLE_LAYER
+};
+
+/// With `read_invisible_text_layer`, a scan's invisible layer is read as
+/// its text: alone, and under a visible footer such as an archive's
+/// download stamp. A page with a visible body extracts as it does
+/// without the option.
+#[test]
+fn test_read_invisible_text_layer_reads_the_layer_of_a_scan() {
+    let read = |page: GlyphLayerPage| {
+        let mut options = PdfOptions::new();
+        options.detection.read_invisible_text_layer = true;
+        process_pdf_mem_with_options(&make_pdf_with_glyph_layer(&[page]), options).unwrap()
+    };
+    let layer_letters = |markdown: &str| markdown.matches(['y', 'b']).count();
+
+    let alone = read(OCR_TOOL_SCAN);
+    assert!(alone.pages_needing_ocr.is_empty());
+    assert!(alone.ocr_reasons_by_page.is_empty());
+    let markdown = alone.markdown.unwrap_or_default();
+    assert!(layer_letters(&markdown) >= 12, "{markdown}");
+
+    // OCR tools often draw the layer from a Form XObject.
+    for layer_in_form in [false, true] {
+        let footer = read(GlyphLayerPage {
+            caption: Some("Downloaded from an archive"),
+            layer_in_form,
+            invoke_form: layer_in_form,
+            ..OCR_TOOL_SCAN
+        });
+        assert!(footer.pages_needing_ocr.is_empty());
+        let markdown = footer.markdown.unwrap_or_default();
+        assert!(
+            markdown.contains("Downloaded from an archive"),
+            "{markdown}"
+        );
+        assert!(layer_letters(&markdown) >= 12, "{markdown}");
+    }
+
+    let body = GlyphLayerPage {
+        body_lines: 12,
+        ..OCR_TOOL_SCAN
+    };
+    let default = process_pdf_mem(&make_pdf_with_glyph_layer(&[body])).unwrap();
+    let read_body = read(body);
+    assert_eq!(read_body.markdown, default.markdown);
+    assert!(read_body.pages_needing_ocr.is_empty());
+}
+
+/// With `read_invisible_text_layer`, a layer too short for extraction to
+/// read (under `OCR_LAYER_MIN_ALNUM`) keeps the page on the OCR path.
+#[test]
+fn test_read_invisible_text_layer_keeps_a_short_layer_for_ocr() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    let short = GlyphLayerPage {
+        layer_glyphs: 30,
+        ..OCR_TOOL_SCAN
+    };
+    let result =
+        process_pdf_mem_with_options(&make_pdf_with_glyph_layer(&[short]), options).unwrap();
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+}
+
+/// With `read_invisible_text_layer`, a book whose sampled pages read as
+/// text still sends a page the sample left out to OCR when that page has
+/// no layer, or one too short or too garbled to read.
+#[test]
+fn test_read_invisible_text_layer_sends_unsampled_scans_to_ocr() {
+    // The default sample of 12 pages reads pages 1–7 and 12.
+    let mut pages = vec![OCR_TOOL_SCAN; 12];
+    pages[8].layer_mode = None;
+    pages[9].layer_glyphs = 30;
+    pages[10] = GARBAGE_LAYER_SCAN;
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pages_needing_ocr, vec![9, 10, 11]);
+    let markdown = result.markdown.unwrap_or_default();
+    assert!(markdown.matches(['y', 'b']).count() >= 12, "{markdown}");
+}
+
+/// An OCR layer of a scan whose glyphs are mostly punctuation.
+const GARBAGE_LAYER_SCAN: GlyphLayerPage = GlyphLayerPage {
+    layer_glyphs: 400,
+    layer_text: "x!%@",
+    ..OCR_TOOL_SCAN
+};
+
+/// A download stamp of about JSTOR's size: 88 letters and digits.
+const ARCHIVE_STAMP: &str =
+    "This content downloaded from 73.71.249.111 on Sat, 01 Jun 2024 18:31:07 UTC; \
+     all use subject to the archive terms";
+
+/// A scan stamped with `ARCHIVE_STAMP` over an OCR layer four times longer.
+const STAMPED_SCAN: GlyphLayerPage = GlyphLayerPage {
+    caption: Some(ARCHIVE_STAMP),
+    layer_glyphs: 600,
+    ..OCR_TOOL_SCAN
+};
+
+fn read_invisible_text_layer(
+    pages: &[GlyphLayerPage],
+    filter: Option<&[u32]>,
+) -> pdf_inspector::PdfProcessResult {
+    let mut options = PdfOptions::new();
+    if let Some(filter) = filter {
+        options = options.pages(filter.iter().copied());
+    }
+    options.detection.read_invisible_text_layer = true;
+    process_pdf_mem_with_options(&make_pdf_with_glyph_layer(pages), options).unwrap()
+}
+
+/// A scan with a caller-supplied hidden stream and Courier's measured
+/// six-point glyph advances at 10 points, rather than a wide glyph grid.
+fn make_pdf_with_positioned_layer(layer: &str) -> Vec<u8> {
+    let mut doc = lopdf::Document::load_mem(&make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_glyphs: 0,
+        ..OCR_TOOL_SCAN
+    }]))
+    .unwrap();
+    let page = doc.get_pages()[&1];
+    let (resources, _) = doc.get_page_resources(page).unwrap();
+    let font = resources
+        .unwrap()
+        .get(b"Font")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"F1")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.get_object_mut(font)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("BaseFont", lopdf::Object::Name(b"Courier".to_vec()));
+    let mut content = doc.get_page_content(page);
+    content.extend_from_slice(layer.as_bytes());
+    let stream = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), content));
+    doc.get_object_mut(page)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Contents", stream);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_read_invisible_text_layer_preserves_positioned_word_boundaries() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    for filename in ["title-runs.pdf", "title-runs-spaced.pdf"] {
+        let bytes =
+            std::fs::read(format!("tests/fixtures/invisible-layer-quality/{filename}")).unwrap();
+        let result = process_pdf_mem_with_options(&bytes, options.clone()).unwrap();
+        assert!(
+            result.pages_needing_ocr.is_empty(),
+            "{filename}: {result:?}"
+        );
+        let markdown = result.markdown.unwrap();
+        assert_eq!(markdown.matches("Hello").count(), 20, "{filename}");
+        assert_eq!(markdown.matches("World").count(), 20, "{filename}");
+    }
+}
+
+#[test]
+fn test_read_invisible_text_layer_checks_realistic_glyph_fragments() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    for (words, kept) in [
+        ("Hello World", true),
+        (
+            "文字内容测试文字内容测试文字内容测试 eBay iPhone GitHub",
+            true,
+        ),
+        ("12345678901234567890123456789012345678901234", true),
+        ("ouLIpayda", false),
+    ] {
+        let mut layer = String::new();
+        for line in 0..20 {
+            for (column, glyph) in words.chars().enumerate() {
+                layer.push_str(&format!(
+                    "BT 3 Tr /F1 10 Tf 1 0 0 1 {} {} Tm ({glyph}) Tj ET\n",
+                    72 + column * 6,
+                    720 - line * 14
+                ));
+            }
+        }
+        let bytes = make_pdf_with_positioned_layer(&layer);
+        let result = process_pdf_mem_with_options(&bytes, options.clone()).unwrap();
+        if kept {
+            assert!(result.pages_needing_ocr.is_empty(), "{result:?}");
+            let markdown = result.markdown.unwrap();
+            let text = markdown
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>();
+            for word in words.split_whitespace() {
+                assert_eq!(text.matches(word).count(), 20, "{markdown}");
+            }
+        } else {
+            assert_eq!(result.pages_needing_ocr, vec![1]);
+            assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+            assert!(result.markdown.unwrap_or_default().is_empty());
+        }
+    }
+}
+
+#[test]
+fn test_read_invisible_text_layer_checks_short_tesseract_layers() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    for (case, sentence) in [
+        (
+            2,
+            "The physical properties of matter depend on the motion of atoms.",
+        ),
+        (
+            3,
+            "Several physical quantities are used to describe the motion of objects.",
+        ),
+    ] {
+        for rotated in [false, true] {
+            let direction = if rotated { "rotated" } else { "upright" };
+            let bytes = std::fs::read(format!(
+                "tests/fixtures/invisible-layer-quality/{direction}-short-{case}.pdf"
+            ))
+            .unwrap();
+            let off = process_pdf_mem(&bytes).unwrap();
+            assert_eq!(off.pages_needing_ocr, vec![1]);
+            let result = process_pdf_mem_with_options(&bytes, options.clone()).unwrap();
+            if rotated {
+                assert_eq!(result.pages_needing_ocr, vec![1], "case {case}");
+                assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+                assert!(result.markdown.unwrap_or_default().is_empty());
+            } else {
+                assert!(
+                    result.pages_needing_ocr.is_empty(),
+                    "case {case}: {result:?}"
+                );
+                let text = result
+                    .markdown
+                    .unwrap()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(text.contains(sentence), "case {case}: {text}");
+            }
+        }
+    }
+}
+
+/// With `read_invisible_text_layer`, a stamped book returns the layers
+/// extraction keeps and sends each scan page whose layer it does not keep,
+/// or that has none, to OCR, though detection reads the book as text.
+#[test]
+fn test_read_invisible_text_layer_sends_stamped_short_layers_to_ocr() {
+    let mut pages = vec![STAMPED_SCAN; 12];
+    pages[8].layer_glyphs = 200;
+    pages[9].layer_glyphs = 200;
+    // A scan the OCR tool skipped: a stamp over the raster, no layer.
+    pages[10].layer_mode = None;
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pages_needing_ocr, vec![9, 10, 11]);
+    assert_eq!(
+        result.ocr_reasons_by_page,
+        [
+            invisible_text_layer_reasons(9),
+            invisible_text_layer_reasons(10),
+            vec![PageOcrReasons {
+                page: 11,
+                reasons: vec![OCR_REASON_SCANNED.to_string()],
+            }],
+        ]
+        .concat()
+    );
+    let markdown = result.markdown.unwrap_or_default();
+    assert!(markdown.matches(['y', 'b']).count() >= 60, "{markdown}");
+
+    let one = read_invisible_text_layer(&[pages[8]], None);
+    assert_eq!(one.pages_needing_ocr, vec![1]);
+    assert_eq!(one.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+}
+
+/// With `read_invisible_text_layer`, extraction's verdicts join
+/// detection's list in page order, and a page that needs OCR for its layer
+/// names `invisible_text_layer` first.
+#[test]
+fn test_read_invisible_text_layer_merges_verdicts_with_detection() {
+    let pages = [
+        // A stamp and a short layer over a scan-size raster: detection
+        // names it `scanned`.
+        GlyphLayerPage {
+            large_image: true,
+            layer_glyphs: 5,
+            ..STAMPED_SCAN
+        },
+        GlyphLayerPage {
+            layer_glyphs: 200,
+            ..STAMPED_SCAN
+        },
+        GlyphLayerPage {
+            layer_glyphs: 30,
+            ..OCR_TOOL_SCAN
+        },
+        OCR_TOOL_SCAN,
+    ];
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    assert_eq!(result.pages_needing_ocr, vec![1, 2, 3]);
+    assert_eq!(
+        result.ocr_reasons_by_page[0].reasons,
+        [OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED]
+    );
+}
+
+/// With `read_invisible_text_layer`, a kept layer answers only the page's
+/// `invisible_text_layer` reason: vector text on the same page still needs
+/// OCR.
+#[test]
+fn test_read_invisible_text_layer_keeps_other_reasons() {
+    let pages = [
+        OCR_TOOL_SCAN,
+        GlyphLayerPage {
+            vector_paths: 5000,
+            ..OCR_TOOL_SCAN
+        },
+    ];
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pages_needing_ocr, vec![2]);
+    assert_eq!(
+        result.ocr_reasons_by_page,
+        vec![PageOcrReasons {
+            page: 2,
+            reasons: vec![OCR_REASON_VECTOR_TEXT.to_string()],
+        }]
+    );
+}
+
+/// With `read_invisible_text_layer`, a kept layer answers nothing when the
+/// document's markdown is dropped as garbage: its page stays listed.
+#[test]
+fn test_read_invisible_text_layer_keeps_pages_listed_without_markdown() {
+    // Visible letters first, so the first items are text and extraction
+    // reads the layer with its verdict, then pages of symbols that make the
+    // document's markdown garbage.
+    let text = GlyphLayerPage {
+        covering_image: false,
+        layer_mode: Some(0),
+        layer_glyphs: 300,
+        ..OCR_TOOL_SCAN
+    };
+    let mut pages = vec![text, OCR_TOOL_SCAN];
+    for symbols in ["!%@&", "@&!%", "&!%@", "%@&!"] {
+        pages.push(GlyphLayerPage {
+            caption: Some(symbols.repeat(60).leak()),
+            layer_mode: None,
+            ..text
+        });
+    }
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pdf_type, PdfType::Scanned);
+    assert_eq!(result.markdown, None);
+    assert!(result.pages_needing_ocr.contains(&2));
+}
+
+/// With `read_invisible_text_layer`, the layer Tesseract writes for a page
+/// scanned upside down is gibberish of mostly letters; it is not kept, and
+/// the page goes to OCR.
+#[test]
+fn test_read_invisible_text_layer_rejects_an_upside_down_page() {
+    let upside_down = GlyphLayerPage {
+        layer_glyphs: 600,
+        layer_text: "AIIeUI oom YQUN IM ouLIpayda oyrpureeso ystyofop dred ojul os uooYyeEp \
+            jou Yoru wreuued wsidoyn appnos ploullje ou YIM ejoSiad ooys suo Asdaae aroy sty \
+            inoqe stsAydida sty se wOMmep AToUTe Jey AIOUI UNSO se OYISEIS oURGTeDg UBY e104 \
+            JO UO 2OPUIOSI SSUNOOJ YSIs IeMoUTA st ABUT BOUTS azlporjed Aue pue oy Surutol ",
+        ..OCR_TOOL_SCAN
+    };
+    let mut layer = String::new();
+    let words = upside_down
+        .layer_text
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    for (line, words) in words.chunks(8).enumerate() {
+        layer.push_str(&format!("BT 3 Tr /F1 10 Tf 72 {} Td ", 720 - line * 14));
+        for glyph in words.join(" ").chars() {
+            layer.push_str(&format!("({glyph}) Tj "));
+        }
+        layer.push_str("ET\n");
+    }
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    let result =
+        process_pdf_mem_with_options(&make_pdf_with_positioned_layer(&layer), options).unwrap();
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+}
+
+/// With `read_invisible_text_layer` and a page filter, only the selected
+/// pages are read: their verdicts decide them, and the other pages keep
+/// what detection said.
+#[test]
+fn test_read_invisible_text_layer_decides_only_the_selected_pages() {
+    let mut pages = vec![OCR_TOOL_SCAN; 12];
+    pages[9].layer_glyphs = 30;
+    let result = read_invisible_text_layer(&pages, Some(&[5, 10]));
+    let others: Vec<u32> = (1..=12).filter(|&page| page != 5).collect();
+    assert_eq!(result.pages_needing_ocr, others);
+    let markdown = result.markdown.unwrap_or_default();
+    assert!(markdown.matches(['y', 'b']).count() >= 12, "{markdown}");
+
+    // A running footer with a folio has the other pages read for
+    // page-number evidence; their verdicts do not decide them.
+    for page in &mut pages {
+        page.folio = true;
+    }
+    pages[2].layer_glyphs = 30;
+    let result = read_invisible_text_layer(&pages, Some(&[5, 10]));
+    assert_eq!(result.pages_needing_ocr, vec![10]);
 }
 
 /// An image alone is a scan with the `scanned` reason, as before.

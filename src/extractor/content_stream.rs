@@ -348,6 +348,10 @@ impl ActualTextBounds {
 pub(crate) struct TextExtractionOptions {
     /// Keep invisible (Tr 3) text instead of skipping it.
     pub(crate) include_invisible: bool,
+    /// Per page of a document extraction: when the visible pass skipped
+    /// invisible text, read the page again with its invisible layer (the
+    /// OCR layer of a scan) and keep that when it dominates the page.
+    pub(crate) invisible_layer_fallback: bool,
     /// Read bold from the weight class too — see
     /// `PositionOptions::bold_from_weight`.
     pub(crate) bold_from_weight: bool,
@@ -366,6 +370,7 @@ impl Default for TextExtractionOptions {
     fn default() -> Self {
         Self {
             include_invisible: false,
+            invisible_layer_fallback: false,
             bold_from_weight: false,
             bold_weight_threshold: DEFAULT_BOLD_WEIGHT_THRESHOLD,
             cmap_coverage: false,

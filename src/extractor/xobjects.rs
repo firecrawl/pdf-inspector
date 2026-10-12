@@ -1804,6 +1804,81 @@ mod tests {
         assert!(budget.was_truncated());
     }
 
+    const HIDDEN_LAYER: &[u8] =
+        b"BT 3 Tr /F1 10 Tf 72 720 Td (the page carries a layer nobody sees) Tj \
+        0 -14 Td (and a second line of the same hidden text) Tj ET";
+
+    /// A covering inline image when `scan`, a short visible line, and the
+    /// hidden (Tr 3) `layer` in form `X1`.
+    fn page_with_hidden_layer(scan: bool, layer: &[u8]) -> (Document, ObjectId) {
+        let image = if scan {
+            "q 612 0 0 792 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI Q "
+        } else {
+            ""
+        };
+        doc_with_page_and_forms(
+            format!("{image}BT /F1 12 Tf 72 40 Td (Page one) Tj ET /X1 Do").as_bytes(),
+            &[layer],
+        )
+    }
+
+    /// Whether the invisible-layer retry reads the page's layer, and its
+    /// verdict.
+    fn read_hidden_layer(
+        doc: &Document,
+        page_id: ObjectId,
+        mut budget: FormWalkBudget,
+    ) -> (bool, Option<super::super::InvisibleLayerVerdict>) {
+        let (((items, _, _), ..), verdict) = super::super::extract_page(
+            doc,
+            page_id,
+            1,
+            &FontCMaps::from_doc(doc),
+            super::super::document_text_options(false, true),
+            &mut FontStyleCache::new(),
+            &mut budget,
+        )
+        .unwrap();
+        (
+            items.iter().any(|item| item.text.contains("nobody")),
+            verdict,
+        )
+    }
+
+    #[test]
+    fn invisible_layer_retry_gives_scan_pages_a_verdict() {
+        use super::super::InvisibleLayerVerdict::{Kept, NeedsOcr};
+        let (doc, page_id) = page_with_hidden_layer(true, HIDDEN_LAYER);
+        assert_eq!(
+            read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
+            (true, Some(Kept))
+        );
+        let (doc, page_id) =
+            page_with_hidden_layer(true, b"BT 3 Tr /F1 10 Tf 72 720 Td (nobody sees) Tj ET");
+        assert_eq!(
+            read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
+            (
+                false,
+                Some(NeedsOcr(crate::OCR_REASON_INVISIBLE_TEXT_LAYER))
+            )
+        );
+        // Hidden text on a page without a covering image is no scan's layer.
+        let (doc, page_id) = page_with_hidden_layer(false, HIDDEN_LAYER);
+        assert_eq!(
+            read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn invisible_layer_retry_shares_the_page_form_budget() {
+        let (doc, page_id) = page_with_hidden_layer(true, HIDDEN_LAYER);
+        // The visible pass spends the page's one form invocation, so the
+        // retry has none left.
+        let budget = FormWalkBudget::with_limits(1, MAX_FORM_XOBJECT_OPERATIONS);
+        assert!(!read_hidden_layer(&doc, page_id, budget).0);
+    }
+
     /// Build a document whose page draws *all* of its content through a single
     /// Form XObject — the shape emitted by print-to-PDF producers like PDFlib,
     /// where the page stream itself is only `q /X1 Do Q`.

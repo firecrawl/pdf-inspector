@@ -115,6 +115,7 @@ impl PositionOptions {
     pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
         TextExtractionOptions {
             include_invisible,
+            invisible_layer_fallback: false,
             bold_from_weight: self.bold_from_weight,
             bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
             // The position readers report no CMap coverage.
@@ -233,7 +234,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage) =
+    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage, _verdicts) =
         extract_positioned_text_from_doc_in_page_box(
             &doc,
             &font_cmaps,
@@ -342,7 +343,7 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations, _cmap_coverage) =
+    let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations, _cmap_coverage, _) =
         extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
     if options.frame == PositionFrame::Display {
         display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
@@ -449,16 +450,36 @@ pub(crate) type PageThresholds = HashMap<u32, f32>;
 /// are upright.
 pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
 
+/// What `invisible_layer_fallback` extraction made of a scan page — see
+/// [`extract_page`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InvisibleLayerVerdict {
+    /// The page's invisible layer was read as its text.
+    Kept,
+    /// The page shows at most a stamp over its raster and no layer was
+    /// kept, so it needs OCR, for this reason.
+    NeedsOcr(&'static str),
+}
+
+/// The most letters and digits a scan page may show in visible text and
+/// still be a scan with a stamp on it, like an archive's download footer.
+const STAMP_MAX_ALNUM: usize = 4 * crate::OCR_LAYER_MIN_ALNUM;
+
+/// Per page, what `invisible_layer_fallback` extraction made of its layer.
+pub(crate) type LayerVerdicts = HashMap<u32, InvisibleLayerVerdict>;
+
 /// What a document-level extraction returns: the text, rectangles and lines
 /// of the extracted pages, their join thresholds, the pages with gid-encoded
-/// fonts, their frame rotations and, per font, the two-byte codes shown
-/// through the font's CMap and how many of them the CMap had no entry for.
+/// fonts, their frame rotations, per font, the two-byte codes shown
+/// through the font's CMap and how many of them the CMap had no entry for,
+/// and the invisible-layer verdicts of the scan pages.
 pub(crate) type DocumentExtraction = (
     PageExtraction,
     PageThresholds,
     HashSet<u32>,
     PageRotations,
     CMapCoverageByFont,
+    LayerVerdicts,
 );
 
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
@@ -519,8 +540,15 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    invisible_layer_fallback: bool,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        invisible_layer_fallback,
+    )
 }
 
 /// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
@@ -529,7 +557,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true, false)
 }
 
 fn extract_positioned_text_with_folio_context_impl(
@@ -537,14 +565,9 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    invisible_layer_fallback: bool,
 ) -> Result<DocumentExtraction, PdfError> {
-    // The selected pages report their CMap coverage; the context pages
-    // gathered below for their folio evidence do not.
-    let options = TextExtractionOptions {
-        include_invisible,
-        cmap_coverage: true,
-        ..TextExtractionOptions::default()
-    };
+    let options = document_text_options(include_invisible, invisible_layer_fallback);
     let Some(required_pages) = page_filter else {
         return extract_positioned_text_impl(
             doc,
@@ -562,6 +585,7 @@ fn extract_positioned_text_with_folio_context_impl(
         mut gid_encoded_pages,
         mut page_rotations,
         cmap_coverage,
+        mut layer_verdicts,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -577,6 +601,7 @@ fn extract_positioned_text_with_folio_context_impl(
             gid_encoded_pages,
             page_rotations,
             cmap_coverage,
+            layer_verdicts,
         ));
     }
 
@@ -595,6 +620,7 @@ fn extract_positioned_text_with_folio_context_impl(
         context_gid_pages,
         context_rotations,
         _context_coverage,
+        context_verdicts,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -612,12 +638,14 @@ fn extract_positioned_text_with_folio_context_impl(
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
     page_rotations.extend(context_rotations);
+    layer_verdicts.extend(context_verdicts);
     Ok((
         (selected_items, selected_rects, selected_lines),
         page_thresholds,
         gid_encoded_pages,
         page_rotations,
         cmap_coverage,
+        layer_verdicts,
     ))
 }
 
@@ -638,6 +666,122 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     )
 }
 
+type PageExtractionResult = (
+    PageExtraction,
+    bool,
+    geometry::PageRotation,
+    bool,
+    Vec<RunCoverage>,
+);
+
+/// Alphanumeric characters of the text items, without image placeholders.
+fn alnum_of(items: &[TextItem]) -> usize {
+    items
+        .iter()
+        .filter(|it| !matches!(it.item_type, ItemType::Image))
+        .map(|it| it.text.chars().filter(|c| c.is_alphanumeric()).count())
+        .sum()
+}
+
+/// The options document extraction reads its selected pages with. The
+/// selected pages report their CMap coverage; the context pages gathered
+/// for their folio evidence do not.
+fn document_text_options(
+    include_invisible: bool,
+    invisible_layer_fallback: bool,
+) -> TextExtractionOptions {
+    TextExtractionOptions {
+        include_invisible,
+        invisible_layer_fallback,
+        cmap_coverage: true,
+        ..TextExtractionOptions::default()
+    }
+}
+
+/// A page as document extraction reads it: the visible pass, then, with
+/// `invisible_layer_fallback`, a verdict for a page with a covering image (a
+/// scan). When its visible pass skipped invisible (Tr 3) text, the page is
+/// read again with that layer on the same form budget, and the reading is
+/// kept when the layer adds real text (`OCR_LAYER_MIN_ALNUM`), the visible
+/// text is at most a quarter of that gain, such as a download footer over
+/// an OCR scan, and the layer is neither garbage nor case-shifted gibberish
+/// (the layer of a page scanned upside down). A scan whose layer is not kept
+/// needs OCR when its visible text is at most a stamp; a page with more
+/// visible text keeps it and gets no verdict.
+fn extract_page(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<(PageExtractionResult, Option<InvisibleLayerVerdict>), PdfError> {
+    let visible = extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        options,
+        style_cache,
+        form_budget,
+    )?;
+    let skipped_invisible = visible.3;
+    let visible_alnum = alnum_of(&visible.0 .0);
+    let stamp_only = visible_alnum <= STAMP_MAX_ALNUM;
+    if !options.invisible_layer_fallback
+        || !(skipped_invisible || stamp_only)
+        || !crate::detector::page_has_covering_image(doc, page_id)
+    {
+        return Ok((visible, None));
+    }
+    let needs_ocr = |visible, reason| {
+        let verdict = stamp_only.then_some(InvisibleLayerVerdict::NeedsOcr(reason));
+        Ok((visible, verdict))
+    };
+    if !skipped_invisible {
+        return needs_ocr(visible, crate::OCR_REASON_SCANNED);
+    }
+    let layer_not_kept = crate::OCR_REASON_INVISIBLE_TEXT_LAYER;
+    let Ok(layer) = extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        TextExtractionOptions {
+            include_invisible: true,
+            ..options
+        },
+        style_cache,
+        form_budget,
+    ) else {
+        return needs_ocr(visible, layer_not_kept);
+    };
+    // The content parser has already merged adjacent glyph fragments with
+    // its spacing rules. Keep boundaries between the resulting runs and
+    // lines instead of making word starts look like mid-word case flips.
+    let text = layer
+        .0
+         .0
+        .iter()
+        .filter(|it| !matches!(it.item_type, ItemType::Image))
+        .map(|it| it.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The with-invisible pass also holds the visible items, so this is
+    // what the hidden layer adds.
+    let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);
+    if gained >= crate::OCR_LAYER_MIN_ALNUM
+        && visible_alnum * 4 <= gained
+        && !crate::text_quality::is_garbage_text(&text)
+        && !crate::text_quality::has_case_shifted_words(&text)
+    {
+        Ok((layer, Some(InvisibleLayerVerdict::Kept)))
+    } else {
+        needs_ocr(visible, layer_not_kept)
+    }
+}
+
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
@@ -652,6 +796,7 @@ fn extract_positioned_text_impl(
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    let mut layer_verdicts = LayerVerdicts::new();
     // Per font, the codes shown through its CMap over every extracted page.
     let mut cmap_coverage = CMapCoverageByFont::new();
     // Embedded-font style flags are document-scoped: the same font program
@@ -673,7 +818,7 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = extract_page_text_items_with_options(
+        let page_result = extract_page(
             doc,
             page_id,
             *page_num,
@@ -681,7 +826,13 @@ fn extract_positioned_text_impl(
             options,
             &mut style_cache,
             &mut FormWalkBudget::new(),
-        );
+        )
+        .map(|(extraction, verdict)| {
+            if let Some(verdict) = verdict {
+                layer_verdicts.insert(*page_num, verdict);
+            }
+            extraction
+        });
         let (
             (mut items, mut rects, mut lines),
             has_gid_fonts,
@@ -897,6 +1048,7 @@ fn extract_positioned_text_impl(
         gid_encoded_pages,
         page_rotations,
         cmap_coverage,
+        layer_verdicts,
     ))
 }
 
@@ -5353,7 +5505,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations, _) =
+        let ((items, _, _), _, _, page_rotations, _, _) =
             extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items
