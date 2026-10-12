@@ -3017,7 +3017,23 @@ fn is_wrapped_fragment(entry: &TextItem, entry_text: &str) -> bool {
     if trimmed.ends_with(['?', '!']) {
         return false;
     }
-    trimmed.ends_with('.') && !trimmed.ends_with("...") && trimmed.split_whitespace().count() <= 3
+    // An outline number (`1.`, `2.3`, `A.`) opens a contents entry, so
+    // `1. Introduction.` is a title, not a wrapped sentence.
+    let mut words = trimmed.split_whitespace();
+    let numbered = match (words.next(), words.next()) {
+        (Some(first), Some(_)) => {
+            let label = first.trim_end_matches(['.', ')']);
+            let marked = label.len() < first.len() || label.contains('.');
+            let digits = !label.is_empty() && label.chars().all(|c| c.is_ascii_digit() || c == '.');
+            let letter = label.len() == 1 && label.chars().all(|c| c.is_ascii_uppercase());
+            marked && (digits || letter)
+        }
+        _ => false,
+    };
+    !numbered
+        && trimmed.ends_with('.')
+        && !trimmed.ends_with("...")
+        && trimmed.split_whitespace().count() <= 3
 }
 
 /// The roman token is the right-hand page number of an entry. A sentence
@@ -3806,6 +3822,21 @@ mod tests {
             1,
             "a title that ends in ? keeps its page number"
         );
+    }
+
+    #[test]
+    fn numbered_period_terminated_title_keeps_its_folio() {
+        for entry in ["1. Introduction.", "2.3 Scope.", "A. Notes."] {
+            let mut title = make_item(1, 72.0, 700.0, entry);
+            title.width = 110.0;
+            let mut folio = make_item(1, 500.0, 700.0, "iii");
+            folio.width = 16.0;
+            assert_eq!(
+                group_single_column(vec![title, folio], 0.10, false).len(),
+                1,
+                "{entry} keeps its roman page number"
+            );
+        }
     }
 
     #[test]
