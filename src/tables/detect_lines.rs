@@ -268,6 +268,87 @@ fn collect_anchored_rows<'a>(
     rows
 }
 
+/// The rows a table's final cells are filled from, with each super/subscript
+/// run moved into the row of the value it hangs off, or `None` when the rows
+/// hold no run.
+///
+/// `collect_anchored_rows` clusters on raw glyph baselines, so an exponent
+/// raised off a value ("2.3 × 10" + "19") forms a row of its own above it.
+/// Assigned as is, that row renders as a phantom table row holding only the
+/// exponent, and the value loses it. Detection keeps the raw-baseline rows;
+/// only the final cells see the runs moved. A run moves only to a row at its
+/// `line_y()` that holds a value beside it; any other run stays where it was.
+fn settle_script_runs<'a>(rows: &[AnchoredRow<'a>]) -> Option<Vec<AnchoredRow<'a>>> {
+    if !rows
+        .iter()
+        .flat_map(|(_, row)| row)
+        .any(|(_, item)| item.is_script())
+    {
+        return None;
+    }
+    let mut rows = rows.to_vec();
+    let mut moved: Vec<(usize, (usize, &TextItem))> = Vec::new();
+    let targets: Vec<Option<usize>> = rows
+        .iter()
+        .flat_map(|(_, row)| row)
+        .filter(|(_, item)| item.is_script())
+        .map(|(_, item)| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, (y, row))| {
+                    (y - item.line_y()).abs() <= TEXT_ROW_TOLERANCE
+                        && row
+                            .iter()
+                            .any(|(_, anchor)| super::script_anchor_gap(item, anchor).is_some())
+                })
+                .min_by(|left, right| {
+                    (left.1 .0 - item.line_y())
+                        .abs()
+                        .total_cmp(&(right.1 .0 - item.line_y()).abs())
+                })
+                .map(|(index, _)| index)
+        })
+        .collect();
+    let mut script = 0;
+    for (row_index, (_, row)) in rows.iter_mut().enumerate() {
+        row.retain(|&(item_index, item)| {
+            if !item.is_script() {
+                return true;
+            }
+            let target = targets[script];
+            script += 1;
+            match target {
+                Some(target) if target != row_index => {
+                    moved.push((target, (item_index, item)));
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
+    for (target, entry) in moved {
+        rows[target].1.push(entry);
+    }
+    rows.retain(|(_, row)| !row.is_empty());
+    for (_, row) in &mut rows {
+        row.sort_by(|left, right| left.1.x.total_cmp(&right.1.x));
+    }
+    Some(rows)
+}
+
+/// The x a run is placed into a column by: a super/subscript run's anchor's
+/// when the row holds the value it hangs off, so an exponent past the end of
+/// a wide value still lands in the value's column.
+fn script_anchor_x(item: &TextItem, row: &[(usize, &TextItem)]) -> f32 {
+    if !item.is_script() {
+        return item.x;
+    }
+    row.iter()
+        .filter_map(|(_, anchor)| super::script_anchor_gap(item, anchor).map(|gap| (anchor.x, gap)))
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map_or(item.x, |(x, _)| x)
+}
+
 fn rules_are_uniform_grid(rules: &[HorizontalRule]) -> bool {
     if rules.len() < 5 {
         return false;
@@ -444,40 +525,12 @@ fn build_text_anchor_table(
     columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
     columns.push(x_max);
 
-    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
-    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
-    let mut item_indices = Vec::new();
-    let mut wide_items = 0usize;
-    let mut measured_items = 0usize;
-    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
-    for (row_index, (_, row)) in rows.iter().enumerate() {
-        for (item_index, item) in row {
-            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
-                continue;
-            }
-            let column = anchors
-                .iter()
-                .enumerate()
-                .min_by(|left, right| (left.1 - item.x).abs().total_cmp(&(right.1 - item.x).abs()))
-                .map(|(index, _)| index)?;
-            let column_width = columns[column + 1] - columns[column];
-            if column_width > 0.0 {
-                measured_items += 1;
-                if item.width.max(0.0) > column_width * 0.72 {
-                    wide_items += 1;
-                }
-            }
-            push_cell_item(
-                &mut cells[row_index][column],
-                &mut last_items[row_index][column],
-                item,
-                item.text.trim(),
-            );
-            item_indices.push(*item_index);
-        }
-    }
-    item_indices.sort_unstable();
-    item_indices.dedup();
+    let AnchorCells {
+        cells,
+        item_indices,
+        measured_items,
+        wide_items,
+    } = fill_anchor_cells(&rows, &anchors, &columns, false)?;
 
     let occupied_rows = cells
         .iter()
@@ -559,12 +612,85 @@ fn build_text_anchor_table(
         return None;
     }
 
+    // Scripts move to their value's row and column only once the table has
+    // passed every check above, so the checks see the same rows and cells as
+    // before.
+    let (rows, cells, item_indices) = match settle_script_runs(&rows) {
+        Some(settled) => {
+            let filled = fill_anchor_cells(&settled, &anchors, &columns, true)?;
+            (settled, filled.cells, filled.item_indices)
+        }
+        None => (rows, cells, item_indices),
+    };
     Some(Table::new(
         columns,
         rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
     ))
+}
+
+struct AnchorCells {
+    cells: Vec<Vec<String>>,
+    item_indices: Vec<usize>,
+    measured_items: usize,
+    wide_items: usize,
+}
+
+/// Fill a text-anchor table's cells from its rows. With
+/// `scripts_by_anchor`, a super/subscript run takes the column of the value
+/// it hangs off rather than the one nearest its own x.
+fn fill_anchor_cells(
+    rows: &[AnchoredRow<'_>],
+    anchors: &[f32],
+    columns: &[f32],
+    scripts_by_anchor: bool,
+) -> Option<AnchorCells> {
+    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
+    let mut item_indices = Vec::new();
+    let mut wide_items = 0usize;
+    let mut measured_items = 0usize;
+    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
+    for (row_index, (_, row)) in rows.iter().enumerate() {
+        for (item_index, item) in row {
+            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
+                continue;
+            }
+            let x = if scripts_by_anchor {
+                script_anchor_x(item, row)
+            } else {
+                item.x
+            };
+            let column = anchors
+                .iter()
+                .enumerate()
+                .min_by(|left, right| (left.1 - x).abs().total_cmp(&(right.1 - x).abs()))
+                .map(|(index, _)| index)?;
+            let column_width = columns[column + 1] - columns[column];
+            if column_width > 0.0 {
+                measured_items += 1;
+                if item.width.max(0.0) > column_width * 0.72 {
+                    wide_items += 1;
+                }
+            }
+            push_cell_item(
+                &mut cells[row_index][column],
+                &mut last_items[row_index][column],
+                item,
+                item.text.trim(),
+            );
+            item_indices.push(*item_index);
+        }
+    }
+    item_indices.sort_unstable();
+    item_indices.dedup();
+    Some(AnchorCells {
+        cells,
+        item_indices,
+        measured_items,
+        wide_items,
+    })
 }
 
 fn detect_text_anchor_rule_tables(
@@ -3647,5 +3773,113 @@ mod tests {
             tables.is_empty(),
             "Single-column grid should not be a table"
         );
+    }
+
+    #[test]
+    fn test_booktabs_exponent_stays_in_its_value_row() {
+        // Rows cluster on raw glyph baselines, so a raised exponent forms a
+        // row of its own. It belongs after its value, not in a phantom row.
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+        ];
+        // The value is wide enough that its exponent lies nearer the next
+        // column's anchor than its own.
+        let mut value = make_item("2.3 × 10", 220.0, 465.0, 1);
+        value.width = 62.0;
+        let mut exponent = make_item("19", 283.0, 469.0, 1);
+        exponent.width = 6.0;
+        exponent.height = 7.0;
+        exponent.font_size = 7.0;
+        exponent.baseline_shift = 4.0;
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("FLOPs", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            value,
+            exponent,
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].cells,
+            vec![
+                vec!["Model", "FLOPs", "Latency"],
+                vec!["Alpha", "2.3 × 10<sup>19</sup>", "12"],
+                vec!["Beta", "89.7", "9"],
+            ]
+        );
+        assert!(tables[0].item_indices.contains(&5));
+    }
+
+    fn booktabs_with_wide_value(extra: TextItem) -> Vec<TextItem> {
+        let mut value = make_item("2.3 × 10", 220.0, 465.0, 1);
+        value.width = 62.0;
+        vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("FLOPs", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            value,
+            extra,
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ]
+    }
+
+    fn booktabs_rules() -> Vec<PdfLine> {
+        vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+        ]
+    }
+
+    #[test]
+    fn test_booktabs_slightly_raised_exponent_takes_its_values_column() {
+        // Raised by less than the row tolerance, the exponent already shares
+        // its value's row; past the end of a wide value it is still nearer
+        // the next column's anchor.
+        let mut exponent = make_item("19", 283.0, 467.0, 1);
+        exponent.width = 6.0;
+        exponent.height = 7.0;
+        exponent.font_size = 7.0;
+        exponent.baseline_shift = 2.0;
+        let tables =
+            detect_tables_from_lines(&booktabs_with_wide_value(exponent), &booktabs_rules(), 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].cells[1],
+            vec!["Alpha", "2.3 × 10<sup>19</sup>", "12"]
+        );
+    }
+
+    #[test]
+    fn test_booktabs_script_with_no_value_beside_it_is_not_moved_into_a_row() {
+        // A marker on a row's line but far from every value in it annotates
+        // none of them, so it stays where raw-baseline clustering put it.
+        let mut marker = make_item("*", 380.0, 469.0, 1);
+        marker.width = 4.0;
+        marker.height = 7.0;
+        marker.font_size = 7.0;
+        marker.baseline_shift = 4.0;
+        let tables =
+            detect_tables_from_lines(&booktabs_with_wide_value(marker), &booktabs_rules(), 1);
+        assert_eq!(tables.len(), 1);
+        let alpha = tables[0]
+            .cells
+            .iter()
+            .find(|row| row[0] == "Alpha")
+            .unwrap();
+        assert_eq!(alpha, &vec!["Alpha", "2.3 × 10", "12"]);
     }
 }
