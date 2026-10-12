@@ -43,6 +43,13 @@ pub(crate) fn user_password_bytes_for_file_key(doc: &Document, supplied: &str) -
         return None;
     }
     let bytes = if doc.authenticate_user_password(supplied).is_ok() {
+        // Revisions 5 and 6 hash the UTF-8 password. PDFDocEncoding is only
+        // the revision 2–4 input; converting a non-ASCII password here would
+        // change the bytes the file key is derived from.
+        let revision = doc.get_encrypted().ok()?.get(b"R").ok()?.as_i64().ok()?;
+        if !(2..=4).contains(&revision) {
+            return None;
+        }
         pdf_doc_password_bytes(supplied)
     } else {
         let recovered = recover_padded_user_password(doc, supplied.as_bytes())?;
@@ -161,4 +168,40 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
         out.push(byte ^ k);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_password_bytes_for_file_key;
+    use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
+    use lopdf::{dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn revision_6_authenticated_password_is_not_pdf_doc_encoded() {
+        let mut doc = Document::with_version("2.0");
+        let id = Object::String(b"0123456789abcdef".to_vec(), lopdf::StringFormat::Literal);
+        doc.trailer.set("ID", vec![id.clone(), id]);
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog" });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let file_encryption_key = *b"0123456789abcdef0123456789abcdef";
+        let state = EncryptionState::try_from(EncryptionVersion::V5 {
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
+            file_encryption_key: &file_encryption_key,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "OwnerKey",
+            user_password: "José",
+            permissions: Permissions::all(),
+        })
+        .expect("revision 6 encryption state");
+        doc.encrypt(&state).expect("encrypt");
+
+        assert!(user_password_bytes_for_file_key(&doc, "José").is_none());
+        assert!(user_password_bytes_for_file_key(&doc, "OwnerKey").is_none());
+    }
 }

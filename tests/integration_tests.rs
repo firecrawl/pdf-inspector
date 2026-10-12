@@ -6671,6 +6671,92 @@ fn owner_password_decrypts_when_it_differs_from_the_user_password() {
     );
 }
 
+/// Revision 6 hashes the UTF-8 password. Rewriting it as PDFDocEncoding
+/// would change `José` before the file key is derived.
+#[test]
+fn revision_6_user_password_keeps_its_utf8_bytes() {
+    let pdf = pdf_encrypted_revision_6("OwnerKey", "José");
+
+    let as_user = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("José"))
+        .expect("user password should open the revision 6 file");
+    let md = as_user.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Password Protected Content"),
+        "user password yielded type={:?} md={md:?}",
+        as_user.pdf_type
+    );
+
+    let as_owner = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("OwnerKey"))
+        .expect("owner password should open the revision 6 file");
+    assert!(as_owner
+        .markdown
+        .unwrap_or_default()
+        .contains("Password Protected Content"));
+}
+
+fn pdf_encrypted_revision_6(owner_password: &str, user_password: &str) -> Vec<u8> {
+    use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
+    use lopdf::{
+        dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let mut doc = Document::with_version("2.0");
+    let id = Object::String(b"0123456789abcdef".to_vec(), lopdf::StringFormat::Literal);
+    doc.trailer.set("ID", vec![id.clone(), id]);
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content = b"BT /F1 24 Tf 72 720 Td (Password Protected Content) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let page_id = doc.new_object_id();
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![Object::Reference(page_id)],
+        "Count" => 1,
+    });
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Reference(resources_id),
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+    let file_encryption_key = *b"0123456789abcdef0123456789abcdef";
+    let state = EncryptionState::try_from(EncryptionVersion::V5 {
+        encrypt_metadata: true,
+        crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
+        file_encryption_key: &file_encryption_key,
+        stream_filter: b"StdCF".to_vec(),
+        string_filter: b"StdCF".to_vec(),
+        owner_password,
+        user_password,
+        permissions: Permissions::all(),
+    })
+    .expect("revision 6 encryption state");
+    doc.encrypt(&state).expect("encrypt");
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save");
+    out
+}
+
 /// 31 ASCII `a`s plus `é` is 32 PDFDoc bytes ending in 0xE9. Reading those
 /// bytes as UTF-8 fails, and the owner password then decrypts with the wrong key.
 #[test]
