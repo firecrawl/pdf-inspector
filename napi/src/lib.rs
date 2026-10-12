@@ -729,9 +729,12 @@ pub fn process_pdf(
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct ProcessOptions {
-    /// Read a page whose only text is an invisible layer under a covering
-    /// image (the OCR layer of a scan) as text, instead of flagging it
-    /// `invisible_text_layer` in `pagesNeedingOcr`. `false` by default.
+    /// Read the invisible layer under a covering image (the OCR layer of a
+    /// scan) as the page's text when it adds at least 40 letters or digits,
+    /// at least four times the visible text, and is not garbage. A page
+    /// whose layer is not kept is listed in `pagesNeedingOcr` with the
+    /// `invisible_text_layer` reason; route on `pagesNeedingOcr`, since a
+    /// book of such pages reports `Mixed`. `false` by default.
     pub read_invisible_text_layer: Option<bool>,
 }
 

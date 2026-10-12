@@ -1804,9 +1804,13 @@ mod tests {
         assert!(budget.was_truncated());
     }
 
-    /// A covering inline image when `scan`, a short visible line, and a
-    /// hidden (Tr 3) layer in form `X1`.
-    fn page_with_hidden_layer(scan: bool) -> (Document, ObjectId) {
+    const HIDDEN_LAYER: &[u8] =
+        b"BT 3 Tr /F1 10 Tf 72 720 Td (the page carries a layer nobody sees) Tj \
+        0 -14 Td (and a second line of the same hidden text) Tj ET";
+
+    /// A covering inline image when `scan`, a short visible line, and the
+    /// hidden (Tr 3) `layer` in form `X1`.
+    fn page_with_hidden_layer(scan: bool, layer: &[u8]) -> (Document, ObjectId) {
         let image = if scan {
             "q 612 0 0 792 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI Q "
         } else {
@@ -1814,16 +1818,18 @@ mod tests {
         };
         doc_with_page_and_forms(
             format!("{image}BT /F1 12 Tf 72 40 Td (Page one) Tj ET /X1 Do").as_bytes(),
-            &[
-                b"BT 3 Tr /F1 10 Tf 72 720 Td (the page carries a layer nobody sees) Tj \
-                0 -14 Td (and a second line of the same hidden text) Tj ET",
-            ],
+            &[layer],
         )
     }
 
-    /// Whether the invisible-layer retry adopts the layer of the page.
-    fn reads_hidden_layer(doc: &Document, page_id: ObjectId, mut budget: FormWalkBudget) -> bool {
-        let ((items, _, _), ..) = super::super::extract_page(
+    /// Whether the invisible-layer retry reads the page's layer, and its
+    /// verdict.
+    fn read_hidden_layer(
+        doc: &Document,
+        page_id: ObjectId,
+        mut budget: FormWalkBudget,
+    ) -> (bool, Option<super::super::InvisibleLayerVerdict>) {
+        let (((items, _, _), ..), verdict) = super::super::extract_page(
             doc,
             page_id,
             1,
@@ -1832,26 +1838,42 @@ mod tests {
             &mut FontStyleCache::new(),
             &mut budget,
         )
-        .unwrap()
-        .0;
-        items.iter().any(|item| item.text.contains("nobody"))
+        .unwrap();
+        (
+            items.iter().any(|item| item.text.contains("nobody")),
+            verdict,
+        )
     }
 
     #[test]
-    fn invisible_layer_retry_reads_only_a_scan() {
-        let (doc, page_id) = page_with_hidden_layer(true);
-        assert!(reads_hidden_layer(&doc, page_id, FormWalkBudget::new()));
-        let (doc, page_id) = page_with_hidden_layer(false);
-        assert!(!reads_hidden_layer(&doc, page_id, FormWalkBudget::new()));
+    fn invisible_layer_retry_gives_scan_pages_a_verdict() {
+        use super::super::InvisibleLayerVerdict::{Kept, Rejected};
+        let (doc, page_id) = page_with_hidden_layer(true, HIDDEN_LAYER);
+        assert_eq!(
+            read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
+            (true, Some(Kept))
+        );
+        let (doc, page_id) =
+            page_with_hidden_layer(true, b"BT 3 Tr /F1 10 Tf 72 720 Td (nobody sees) Tj ET");
+        assert_eq!(
+            read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
+            (false, Some(Rejected))
+        );
+        // Hidden text on a page without a covering image is no scan's layer.
+        let (doc, page_id) = page_with_hidden_layer(false, HIDDEN_LAYER);
+        assert_eq!(
+            read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
+            (false, None)
+        );
     }
 
     #[test]
     fn invisible_layer_retry_shares_the_page_form_budget() {
-        let (doc, page_id) = page_with_hidden_layer(true);
+        let (doc, page_id) = page_with_hidden_layer(true, HIDDEN_LAYER);
         // The visible pass spends the page's one form invocation, so the
         // retry has none left.
         let budget = FormWalkBudget::with_limits(1, MAX_FORM_XOBJECT_OPERATIONS);
-        assert!(!reads_hidden_layer(&doc, page_id, budget));
+        assert!(!read_hidden_layer(&doc, page_id, budget).0);
     }
 
     /// Build a document whose page draws *all* of its content through a single

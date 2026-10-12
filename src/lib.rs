@@ -135,6 +135,8 @@ pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 /// nothing painted through the clip — while an image covers at least half
 /// of the page: a scan carrying a text layer nobody sees. What that layer
 /// says is not what the page shows, so the page is read from its raster.
+/// With `DetectionConfig::read_invisible_text_layer`, also a page whose
+/// invisible layer under a covering image extraction read and did not keep.
 pub const OCR_REASON_INVISIBLE_TEXT_LAYER: &str = "invisible_text_layer";
 
 // =========================================================================
@@ -644,7 +646,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _, _) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -4593,7 +4595,7 @@ fn process_document(
     let creation_date = detection.creation_date;
     let mod_date = detection.mod_date;
     let confidence = detection.confidence;
-    let detection_ocr_reasons = detection.ocr_reasons_by_page;
+    let mut detection_ocr_reasons = detection.ocr_reasons_by_page;
 
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
@@ -4660,7 +4662,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, ..)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4728,6 +4730,7 @@ fn process_document(
         text_quality_pages,
         text_quality_reasons_by_page,
         cmap_gaps,
+        layer_verdicts,
     ) = match extracted {
         Some((
             (items, rects, lines),
@@ -4735,6 +4738,7 @@ fn process_document(
             gid_encoded_pages,
             _page_rotations,
             cmap_coverage,
+            layer_verdicts,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
@@ -4818,6 +4822,10 @@ fn process_document(
                 .into_iter()
                 .filter(|page| selected_page(*page))
                 .collect();
+            let layer_verdicts: BTreeMap<_, _> = layer_verdicts
+                .into_iter()
+                .filter(|(page, _)| selected_page(*page))
+                .collect();
             let FolioFilteredItems {
                 items,
                 layout_items,
@@ -4876,6 +4884,7 @@ fn process_document(
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
                 font_cmap_gaps(cmap_coverage),
+                layer_verdicts,
             )
         }
         None => (
@@ -4886,6 +4895,7 @@ fn process_document(
             Vec::new(),
             BTreeMap::new(),
             Vec::new(),
+            BTreeMap::new(),
         ),
     };
 
@@ -4915,6 +4925,27 @@ fn process_document(
     // When ALL pages have gid-encoded fonts, suppress unreliable markdown.
     let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
     let mut pages_needing_ocr = pages_needing_ocr;
+    // With `read_invisible_text_layer`, extraction decided each scan page it
+    // read: a kept layer is the page's text, and a page whose layer was not
+    // kept needs OCR, whatever detection sampled or saw.
+    for (page, verdict) in layer_verdicts {
+        match verdict {
+            extractor::InvisibleLayerVerdict::Kept => {
+                pages_needing_ocr.retain(|&p| p != page);
+                detection_ocr_reasons.remove(&page);
+            }
+            extractor::InvisibleLayerVerdict::Rejected => {
+                if !pages_needing_ocr.contains(&page) {
+                    pages_needing_ocr.push(page);
+                }
+                let reasons = detection_ocr_reasons.entry(page).or_default();
+                if !reasons.iter().any(|r| r == OCR_REASON_INVISIBLE_TEXT_LAYER) {
+                    reasons.insert(0, OCR_REASON_INVISIBLE_TEXT_LAYER.to_string());
+                }
+            }
+        }
+    }
+    pages_needing_ocr.sort_unstable();
     if force_ocr_all {
         pages_needing_ocr = (1..=page_count).collect();
     }

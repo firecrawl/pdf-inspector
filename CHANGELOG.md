@@ -14,11 +14,16 @@ version and date. Earlier releases are described in their
 - `processPdf(buffer, pages, { readInvisibleTextLayer: true })`, and the same
   option on `processPdfAsync`, `DetectionConfig::read_invisible_text_layer`
   and `pdf2md --read-invisible-text-layer`, read the invisible OCR text layer
-  (render mode 3) of a scanned page as its text. A layer of at least 40
-  letters or digits that is not garbage is read, and its page is not
-  flagged `invisible_text_layer`; a shorter layer keeps the page on the OCR
-  path. A page whose only visible text is a small stamp over such a layer,
-  like an archive's download footer, returns the layer too. Off by
+  (render mode 3) of a scanned page as its text. A page with a covering
+  image whose visible pass skipped invisible text is read again with its
+  layer. The layer is kept when it adds at least 40 letters or digits, at
+  least four times the page's visible text, and is not garbage, so a small
+  stamp over the layer, like an archive's download footer, is returned with
+  it. A page whose layer is not kept is listed in `pages_needing_ocr` with
+  the `invisible_text_layer` reason, including pages a detection sample
+  left out and pages with a visible stamp; pages outside the page filter
+  are not read and stay listed. The document type is detection's, so a book
+  of such pages reports `Mixed`: route on `pages_needing_ocr`. Off by
   default; output without the option is unchanged. Rust code that builds
   `DetectionConfig` with a struct literal must add
   `read_invisible_text_layer` or end with `..Default::default()`.
