@@ -3081,7 +3081,9 @@ fn same_style_header_row(
     cells.push(incoming);
     for next in upcoming.iter().flatten() {
         if next.page != incoming.page || (next.line_y() - incoming.line_y()).abs() >= y_tolerance {
-            continue;
+            // Same-baseline cells are adjacent: y-sorting puts them together,
+            // and a row-major stream does not come back up to this line.
+            break;
         }
         if !is_header_cell(next) {
             break;
@@ -3090,8 +3092,12 @@ fn same_style_header_row(
     }
     let mut clusters = 1u32;
     for pair in cells.windows(2) {
-        let void = (pair[0].font_size.max(pair[1].font_size) * 8.0).max(100.0);
-        if horizontal_gap(pair[0], pair[1]) > void {
+        // A cell boundary is wider than a word space or a small hole in one
+        // line. It is narrower than the void split, so a header whose first
+        // gap is under 100pt and whose next gap is over it still counts as
+        // three cells.
+        let cell_gap = (pair[0].font_size.max(pair[1].font_size) * 5.0).max(50.0);
+        if horizontal_gap(pair[0], pair[1]) > cell_gap {
             clusters += 1;
             if clusters >= 3 {
                 return true;
@@ -4052,6 +4058,20 @@ mod tests {
                 "bold={bold} wide header stays one row"
             );
         }
+
+        // The first gap is under the 100pt void floor; the second is over it.
+        let mut uneven = Vec::new();
+        for (x, text) in [(47.0, "Status"), (147.0, "Metric"), (350.0, "Description")] {
+            let mut item = make_item(1, x, 459.0, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            uneven.push(item);
+        }
+        assert_eq!(
+            group_single_column(uneven, 0.10, false).len(),
+            1,
+            "a three-cell header with one narrow gap stays one row"
+        );
 
         // Two short unpunctuated runs a column apart are the leftovers of
         // two columns, not a header row.
