@@ -450,15 +450,20 @@ pub(crate) type PageThresholds = HashMap<u32, f32>;
 /// are upright.
 pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
 
-/// What `invisible_layer_fallback` extraction made of a scan page's
-/// invisible layer — see [`extract_page`].
+/// What `invisible_layer_fallback` extraction made of a scan page — see
+/// [`extract_page`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InvisibleLayerVerdict {
-    /// The layer was read as the page's text.
+    /// The page's invisible layer was read as its text.
     Kept,
-    /// The layer was not read, so the page needs OCR.
-    Rejected,
+    /// The page shows at most a stamp over its raster and no layer was
+    /// kept, so it needs OCR, for this reason.
+    NeedsOcr(&'static str),
 }
+
+/// The most letters and digits a scan page may show in visible text and
+/// still be a scan with a stamp on it, like an archive's download footer.
+const STAMP_MAX_ALNUM: usize = 4 * crate::OCR_LAYER_MIN_ALNUM;
 
 /// Per page, what `invisible_layer_fallback` extraction made of its layer.
 pub(crate) type LayerVerdicts = HashMap<u32, InvisibleLayerVerdict>;
@@ -694,14 +699,15 @@ fn document_text_options(
 }
 
 /// A page as document extraction reads it: the visible pass, then, with
-/// `invisible_layer_fallback`, a page whose visible pass skipped invisible
-/// (Tr 3) text under a covering image (a scan) is read again with that
-/// layer on the same form budget. That reading is kept when the layer adds
-/// real text (`OCR_LAYER_MIN_ALNUM`) and the visible text is at most a
-/// quarter of that gain, such as a download footer over an OCR scan; the
-/// ratio keeps an OCR layer from doubling a page's visible words. A page
-/// without a covering image keeps its visible text, whatever it hides, and
-/// gets no verdict.
+/// `invisible_layer_fallback`, a verdict for a page with a covering image (a
+/// scan). When its visible pass skipped invisible (Tr 3) text, the page is
+/// read again with that layer on the same form budget, and the reading is
+/// kept when the layer adds real text (`OCR_LAYER_MIN_ALNUM`), the visible
+/// text is at most a quarter of that gain, such as a download footer over
+/// an OCR scan, and the layer is neither garbage nor case-shifted gibberish
+/// (the layer of a page scanned upside down). A scan whose layer is not kept
+/// needs OCR when its visible text is at most a stamp; a page with more
+/// visible text keeps it and gets no verdict.
 fn extract_page(
     doc: &Document,
     page_id: ObjectId,
@@ -721,13 +727,22 @@ fn extract_page(
         form_budget,
     )?;
     let skipped_invisible = visible.3;
+    let visible_alnum = alnum_of(&visible.0 .0);
+    let stamp_only = visible_alnum <= STAMP_MAX_ALNUM;
     if !options.invisible_layer_fallback
-        || !skipped_invisible
+        || !(skipped_invisible || stamp_only)
         || !crate::detector::page_has_covering_image(doc, page_id)
     {
         return Ok((visible, None));
     }
-    let rejected = |visible| Ok((visible, Some(InvisibleLayerVerdict::Rejected)));
+    let needs_ocr = |visible, reason| {
+        let verdict = stamp_only.then_some(InvisibleLayerVerdict::NeedsOcr(reason));
+        Ok((visible, verdict))
+    };
+    if !skipped_invisible {
+        return needs_ocr(visible, crate::OCR_REASON_SCANNED);
+    }
+    let layer_not_kept = crate::OCR_REASON_INVISIBLE_TEXT_LAYER;
     let Ok(layer) = extract_page_text_items_with_options(
         doc,
         page_id,
@@ -740,7 +755,7 @@ fn extract_page(
         style_cache,
         form_budget,
     ) else {
-        return rejected(visible);
+        return needs_ocr(visible, layer_not_kept);
     };
     let text: String = layer
         .0
@@ -751,15 +766,15 @@ fn extract_page(
         .collect();
     // The with-invisible pass also holds the visible items, so this is
     // what the hidden layer adds.
-    let visible_alnum = alnum_of(&visible.0 .0);
     let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);
     if gained >= crate::OCR_LAYER_MIN_ALNUM
         && visible_alnum * 4 <= gained
         && !crate::text_quality::is_garbage_text(&text)
+        && !crate::text_quality::has_case_shifted_words(&text)
     {
         Ok((layer, Some(InvisibleLayerVerdict::Kept)))
     } else {
-        rejected(visible)
+        needs_ocr(visible, layer_not_kept)
     }
 }
 

@@ -225,6 +225,22 @@ impl CipherGarbleStats {
     }
 }
 
+/// The most lowercase-to-uppercase flips per letter pair that real text
+/// shows: documents stay at or below 0.021 (see
+/// [`CipherGarbleStats::looks_garbled`]), while Tesseract's reading of a
+/// page scanned upside down measures 0.06–0.11.
+const CASE_SHIFT_LIMIT: f64 = 0.04;
+
+/// Whether `text` flips from lowercase to uppercase inside words more than
+/// real text does: OCR of a page scanned sideways or upside down, which is
+/// mostly letters and so passes [`is_garbage_text`].
+pub(crate) fn has_case_shifted_words(text: &str) -> bool {
+    let mut stats = CipherGarbleStats::default();
+    stats.add_text(text);
+    stats.letter_bigrams >= 100
+        && stats.case_shift_bigrams as f64 > stats.letter_bigrams as f64 * CASE_SHIFT_LIMIT
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TextQualityReport {
     pub(crate) pages_needing_ocr: Vec<u32>,

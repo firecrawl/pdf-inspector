@@ -4926,21 +4926,29 @@ fn process_document(
     let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
     let mut pages_needing_ocr = pages_needing_ocr;
     // With `read_invisible_text_layer`, extraction decided each scan page it
-    // read: a kept layer is the page's text, and a page whose layer was not
-    // kept needs OCR, whatever detection sampled or saw.
+    // read. A kept layer answers the page's `invisible_text_layer` reason,
+    // and the page leaves the list when no other reason is left; it answers
+    // nothing when the markdown was dropped. A page that showed at most a
+    // stamp and kept no layer needs OCR, whatever detection sampled or saw.
     for (page, verdict) in layer_verdicts {
         match verdict {
-            extractor::InvisibleLayerVerdict::Kept => {
-                pages_needing_ocr.retain(|&p| p != page);
-                detection_ocr_reasons.remove(&page);
+            extractor::InvisibleLayerVerdict::Kept if markdown.is_some() => {
+                if let Some(reasons) = detection_ocr_reasons.get_mut(&page) {
+                    reasons.retain(|reason| reason != OCR_REASON_INVISIBLE_TEXT_LAYER);
+                    if reasons.is_empty() {
+                        detection_ocr_reasons.remove(&page);
+                        pages_needing_ocr.retain(|&p| p != page);
+                    }
+                }
             }
-            extractor::InvisibleLayerVerdict::Rejected => {
+            extractor::InvisibleLayerVerdict::Kept => {}
+            extractor::InvisibleLayerVerdict::NeedsOcr(reason) => {
                 if !pages_needing_ocr.contains(&page) {
                     pages_needing_ocr.push(page);
                 }
                 let reasons = detection_ocr_reasons.entry(page).or_default();
-                if !reasons.iter().any(|r| r == OCR_REASON_INVISIBLE_TEXT_LAYER) {
-                    reasons.insert(0, OCR_REASON_INVISIBLE_TEXT_LAYER.to_string());
+                if !reasons.iter().any(|r| r == reason) {
+                    reasons.insert(0, reason.to_string());
                 }
             }
         }

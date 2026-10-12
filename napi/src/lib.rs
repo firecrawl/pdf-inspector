@@ -731,10 +731,14 @@ pub fn process_pdf(
 pub struct ProcessOptions {
     /// Read the invisible layer under a covering image (the OCR layer of a
     /// scan) as the page's text when it adds at least 40 letters or digits,
-    /// at least four times the visible text, and is not garbage. A page
-    /// whose layer is not kept is listed in `pagesNeedingOcr` with the
-    /// `invisible_text_layer` reason; route on `pagesNeedingOcr`, since a
-    /// book of such pages reports `Mixed`. `false` by default.
+    /// at least four times the visible text, and is neither garbage nor
+    /// case-shifted gibberish. A scan page that shows at most a stamp and
+    /// keeps no layer is listed in `pagesNeedingOcr` (`invisible_text_layer`,
+    /// or `scanned` without a layer). Detection alone lists every page whose
+    /// only text is a hidden layer; pages outside `pages` keep that listing,
+    /// which is none in a stamped book read as text. A book of hidden-layer
+    /// pages reports `Mixed`, so route on `pagesNeedingOcr`. `false` by
+    /// default.
     pub read_invisible_text_layer: Option<bool>,
 }
 

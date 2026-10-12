@@ -3482,7 +3482,9 @@ fn test_read_invisible_text_layer_reads_the_layer_of_a_scan() {
         ..OCR_TOOL_SCAN
     };
     let default = process_pdf_mem(&make_pdf_with_glyph_layer(&[body])).unwrap();
-    assert_eq!(read(body).markdown, default.markdown);
+    let read_body = read(body);
+    assert_eq!(read_body.markdown, default.markdown);
+    assert!(read_body.pages_needing_ocr.is_empty());
 }
 
 /// With `read_invisible_text_layer`, a layer too short for extraction to
@@ -3549,20 +3551,26 @@ fn read_invisible_text_layer(
 }
 
 /// With `read_invisible_text_layer`, a stamped book returns the layers
-/// extraction keeps and sends each page whose layer it does not keep to
-/// OCR, though detection reads the book as text.
+/// extraction keeps and sends each scan page whose layer it does not keep,
+/// or that has none, to OCR, though detection reads the book as text.
 #[test]
 fn test_read_invisible_text_layer_sends_stamped_short_layers_to_ocr() {
     let mut pages = vec![STAMPED_SCAN; 12];
     pages[8].layer_glyphs = 200;
     pages[9].layer_glyphs = 200;
+    // A scan the OCR tool skipped: a stamp over the raster, no layer.
+    pages[10].layer_mode = None;
     let result = read_invisible_text_layer(&pages, None);
-    assert_eq!(result.pages_needing_ocr, vec![9, 10]);
+    assert_eq!(result.pages_needing_ocr, vec![9, 10, 11]);
     assert_eq!(
         result.ocr_reasons_by_page,
         [
             invisible_text_layer_reasons(9),
-            invisible_text_layer_reasons(10)
+            invisible_text_layer_reasons(10),
+            vec![PageOcrReasons {
+                page: 11,
+                reasons: vec![OCR_REASON_SCANNED.to_string()],
+            }],
         ]
         .concat()
     );
@@ -3572,6 +3580,106 @@ fn test_read_invisible_text_layer_sends_stamped_short_layers_to_ocr() {
     let one = read_invisible_text_layer(&[pages[8]], None);
     assert_eq!(one.pages_needing_ocr, vec![1]);
     assert_eq!(one.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+}
+
+/// With `read_invisible_text_layer`, extraction's verdicts join
+/// detection's list in page order, and a page that needs OCR for its layer
+/// names `invisible_text_layer` first.
+#[test]
+fn test_read_invisible_text_layer_merges_verdicts_with_detection() {
+    let pages = [
+        // A stamp and a short layer over a scan-size raster: detection
+        // names it `scanned`.
+        GlyphLayerPage {
+            large_image: true,
+            layer_glyphs: 5,
+            ..STAMPED_SCAN
+        },
+        GlyphLayerPage {
+            layer_glyphs: 200,
+            ..STAMPED_SCAN
+        },
+        GlyphLayerPage {
+            layer_glyphs: 30,
+            ..OCR_TOOL_SCAN
+        },
+        OCR_TOOL_SCAN,
+    ];
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    assert_eq!(result.pages_needing_ocr, vec![1, 2, 3]);
+    assert_eq!(
+        result.ocr_reasons_by_page[0].reasons,
+        [OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED]
+    );
+}
+
+/// With `read_invisible_text_layer`, a kept layer answers only the page's
+/// `invisible_text_layer` reason: vector text on the same page still needs
+/// OCR.
+#[test]
+fn test_read_invisible_text_layer_keeps_other_reasons() {
+    let pages = [
+        OCR_TOOL_SCAN,
+        GlyphLayerPage {
+            vector_paths: 5000,
+            ..OCR_TOOL_SCAN
+        },
+    ];
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pages_needing_ocr, vec![2]);
+    assert_eq!(
+        result.ocr_reasons_by_page,
+        vec![PageOcrReasons {
+            page: 2,
+            reasons: vec![OCR_REASON_VECTOR_TEXT.to_string()],
+        }]
+    );
+}
+
+/// With `read_invisible_text_layer`, a kept layer answers nothing when the
+/// document's markdown is dropped as garbage: its page stays listed.
+#[test]
+fn test_read_invisible_text_layer_keeps_pages_listed_without_markdown() {
+    // Visible letters first, so the first items are text and extraction
+    // reads the layer with its verdict, then pages of symbols that make the
+    // document's markdown garbage.
+    let text = GlyphLayerPage {
+        covering_image: false,
+        layer_mode: Some(0),
+        layer_glyphs: 300,
+        ..OCR_TOOL_SCAN
+    };
+    let mut pages = vec![text, OCR_TOOL_SCAN];
+    for symbols in ["!%@&", "@&!%", "&!%@", "%@&!"] {
+        pages.push(GlyphLayerPage {
+            caption: Some(symbols.repeat(60).leak()),
+            layer_mode: None,
+            ..text
+        });
+    }
+    let result = read_invisible_text_layer(&pages, None);
+    assert_eq!(result.pdf_type, PdfType::Scanned);
+    assert_eq!(result.markdown, None);
+    assert!(result.pages_needing_ocr.contains(&2));
+}
+
+/// With `read_invisible_text_layer`, the layer Tesseract writes for a page
+/// scanned upside down is gibberish of mostly letters; it is not kept, and
+/// the page goes to OCR.
+#[test]
+fn test_read_invisible_text_layer_rejects_an_upside_down_page() {
+    let upside_down = GlyphLayerPage {
+        layer_glyphs: 600,
+        layer_text: "AIIeUI oom YQUN IM ouLIpayda oyrpureeso ystyofop dred ojul os uooYyeEp \
+            jou Yoru wreuued wsidoyn appnos ploullje ou YIM ejoSiad ooys suo Asdaae aroy sty \
+            inoqe stsAydida sty se wOMmep AToUTe Jey AIOUI UNSO se OYISEIS oURGTeDg UBY e104 \
+            JO UO 2OPUIOSI SSUNOOJ YSIs IeMoUTA st ABUT BOUTS azlporjed Aue pue oy Surutol ",
+        ..OCR_TOOL_SCAN
+    };
+    let result = read_invisible_text_layer(&[OCR_TOOL_SCAN, upside_down], None);
+    assert_eq!(result.pages_needing_ocr, vec![2]);
+    assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(2));
 }
 
 /// With `read_invisible_text_layer` and a page filter, only the selected

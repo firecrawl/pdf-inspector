@@ -1847,7 +1847,7 @@ mod tests {
 
     #[test]
     fn invisible_layer_retry_gives_scan_pages_a_verdict() {
-        use super::super::InvisibleLayerVerdict::{Kept, Rejected};
+        use super::super::InvisibleLayerVerdict::{Kept, NeedsOcr};
         let (doc, page_id) = page_with_hidden_layer(true, HIDDEN_LAYER);
         assert_eq!(
             read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
@@ -1857,7 +1857,10 @@ mod tests {
             page_with_hidden_layer(true, b"BT 3 Tr /F1 10 Tf 72 720 Td (nobody sees) Tj ET");
         assert_eq!(
             read_hidden_layer(&doc, page_id, FormWalkBudget::new()),
-            (false, Some(Rejected))
+            (
+                false,
+                Some(NeedsOcr(crate::OCR_REASON_INVISIBLE_TEXT_LAYER))
+            )
         );
         // Hidden text on a page without a covering image is no scan's layer.
         let (doc, page_id) = page_with_hidden_layer(false, HIDDEN_LAYER);

@@ -109,9 +109,10 @@ pub struct DetectionConfig {
     pub text_page_ratio_threshold: f32,
     /// Read a page whose only text is an invisible layer under a covering
     /// image (an OCR layer) as a text page, and let extraction decide each
-    /// page it reads: a page whose layer it keeps returns that layer, and a
-    /// page whose layer it does not keep is listed for OCR with the
-    /// `invisible_text_layer` reason. Off by default.
+    /// scan page it reads: a page whose layer it keeps returns that layer,
+    /// and a page that shows at most a stamp and keeps no layer is listed
+    /// for OCR. Detection itself still lists every page whose only text is
+    /// a hidden layer. Off by default.
     pub read_invisible_text_layer: bool,
 }
 
