@@ -16,10 +16,10 @@ version and date. Earlier releases are described in their
   the exponent in a row of its own above the value or in a loose line of
   `<sup>` tags after the table. Exponents and indices are set smaller than
   the font sizes the heuristic table passes accept, and a rule-anchored
-  table groups rows on raw glyph baselines. The runs now join the cell of
-  the value they sit beside once the table's shape is settled, so which
-  tables are detected does not change. A run with no value beside it in
-  the row stays in the text flow.
+  table groups rows on raw glyph baselines. Once a table has passed all
+  its checks, each run joins the cell of the value it sits beside, so which
+  tables are detected does not change. A run with no value beside it stays
+  where it was before.
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
