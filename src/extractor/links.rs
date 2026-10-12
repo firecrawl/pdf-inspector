@@ -851,9 +851,9 @@ mod tests {
 
     #[test]
     fn unmarked_utf8_field_text_keeps_three_byte_sequences() {
-        // `€` and an en dash are 3-byte UTF-8. Their continuation bytes are
-        // PDFDoc punctuation, and the whole value stays UTF-8, including the
-        // `José` in front of them. `C2 A0` is still the PDFDoc reading.
+        // `€` and an en dash are 3-byte UTF-8. Their 0x80-0x9F continuation
+        // bytes (not the euro's final 0xAC) are PDFDoc punctuation, and the
+        // whole value stays UTF-8, including the `José` in front of them. `C2 A0` is still the PDFDoc reading.
         let mut doc = Document::new();
         let field = doc.add_object(dictionary! {
             "FT" => "Tx",
