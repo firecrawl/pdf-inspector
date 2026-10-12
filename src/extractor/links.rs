@@ -848,4 +848,29 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "name: José");
     }
+
+    #[test]
+    fn unmarked_utf8_field_text_keeps_three_byte_sequences() {
+        // `€` and an en dash are 3-byte UTF-8. Their continuation bytes are
+        // PDFDoc punctuation, and the whole value stays UTF-8, including the
+        // `José` in front of them. `C2 A0` is still the PDFDoc reading.
+        let mut doc = Document::new();
+        let field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("name"),
+            "V" => pdf_text("José – 5€".as_bytes().to_vec()),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let items = extract_form_fields(&doc, &HashMap::new());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "name: José – 5€");
+    }
 }
