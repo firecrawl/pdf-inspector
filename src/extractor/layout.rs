@@ -3046,6 +3046,28 @@ fn roman_folio_beside_entry(entry: &TextItem, entry_text: &str, folio: &TextItem
         && !is_wrapped_fragment(entry, entry_text)
 }
 
+/// A table-header cell: a few words, not a wrapped sentence leftover.
+fn is_short_header_label(text: &str) -> bool {
+    let words = text.split_whitespace().count();
+    (1..=3).contains(&words)
+}
+
+/// Same-style header cells are one row even when the gap exceeds the void
+/// split. A wrapped leftover (`checksum.`) and a different-size tag are not
+/// header cells, so those pairs still split.
+fn same_style_header_row(line: &TextLine, incoming: &TextItem) -> bool {
+    let bold = incoming.is_bold;
+    let font_size = incoming.font_size;
+    let is_header_cell = |item: &TextItem| {
+        let scale = item.font_size.max(font_size).max(1.0);
+        (item.font_size - font_size).abs() <= scale * 0.2
+            && item.is_bold == bold
+            && is_short_header_label(&item.text)
+            && !is_wrapped_fragment(item, item.text.trim())
+    };
+    is_header_cell(incoming) && line.items.iter().all(is_header_cell)
+}
+
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
 /// `page_rtl` is the direction of the page the column belongs to, which
@@ -3172,11 +3194,10 @@ fn group_single_column(
                     }
                     // Wrapped leftovers ("checksum." / "order.") and a
                     // right-aligned tag beside a title sit a column-width
-                    // void apart. Table header cells on this scale are
-                    // closer than 8em and 100pt. Digit page numbers never
-                    // reach this branch. A front-matter folio stays on an
-                    // entry that is not a wrapped sentence. `checksum.`
-                    // beside `iii` still splits.
+                    // void apart. Same-style header cells are one row at
+                    // any gap. Digit page numbers never reach this branch.
+                    // A front-matter folio stays on an entry that is not a
+                    // wrapped sentence. `checksum.` beside `iii` still splits.
                     let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
                         || roman_folio_beside_entry(&item, item.text.trim(), last_item);
                     // Only a run that continues in reading order: an
@@ -3185,6 +3206,7 @@ fn group_single_column(
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
                         && continues_line
                         && !folio_on_entry
+                        && !same_style_header_row(last_line, &item)
                     {
                         return false;
                     }
@@ -3963,19 +3985,37 @@ mod tests {
     }
 
     #[test]
-    fn wide_table_row_splits_at_the_void_rule() {
-        // Documents current behaviour: same-baseline header cells more than
-        // 8em and 100pt apart split into separate lines, even though they
-        // are one table row.
-        let mut cells = Vec::new();
-        for (x, text) in [(47.0, "Status"), (200.0, "Description"), (400.0, "Owner")] {
-            let mut item = make_item(1, x, 459.0, text);
-            item.font_size = 8.5;
-            item.width = text.len() as f32 * 4.5;
-            item.is_bold = true;
-            cells.push(item);
+    fn wide_table_header_stays_one_row() {
+        // Header cells more than 8em and 100pt apart are still one row.
+        // The second cell is where the void rule decides, so a two-cell
+        // header is the same case. Bold is not required.
+        for bold in [true, false] {
+            let mut cells = Vec::new();
+            for (x, text) in [(47.0, "Status"), (200.0, "Description"), (400.0, "Owner")] {
+                let mut item = make_item(1, x, 459.0, text);
+                item.font_size = 8.5;
+                item.width = text.len() as f32 * 4.5;
+                item.is_bold = bold;
+                cells.push(item);
+            }
+            assert_eq!(
+                group_single_column(cells, 0.10, false).len(),
+                1,
+                "bold={bold} wide header stays one row"
+            );
         }
-        assert_eq!(group_single_column(cells, 0.10, false).len(), 3);
+
+        let mut left = make_item(1, 47.0, 459.0, "Status");
+        left.font_size = 8.5;
+        left.width = 27.0;
+        let mut right = make_item(1, 220.0, 459.0, "Description");
+        right.font_size = 8.5;
+        right.width = 50.0;
+        assert_eq!(
+            group_single_column(vec![left, right], 0.10, false).len(),
+            1,
+            "a two-cell header wider than the void floor stays one row"
+        );
     }
 
     #[test]
