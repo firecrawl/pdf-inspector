@@ -6,10 +6,11 @@ mod cell_text;
 
 /// How far a super/subscript run sits from `anchor`, the value it may hang
 /// off: the gap between the run and whichever end of the anchor it is beside.
-/// `None` when the anchor is itself a run or is more than the run's font size
-/// away, too far for the run to annotate it.
+/// `None` when the anchor is itself a run, sits on another line than the
+/// run's anchor line, or is more than the run's font size away, too far for
+/// the run to annotate it.
 pub(crate) fn script_anchor_gap(run: &TextItem, anchor: &TextItem) -> Option<f32> {
-    if anchor.is_script() {
+    if anchor.is_script() || (anchor.line_y() - run.line_y()).abs() > run.font_size {
         return None;
     }
     let gap_after = (run.x - (anchor.x + anchor.width)).abs();

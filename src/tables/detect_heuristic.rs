@@ -1479,57 +1479,7 @@ fn detect_table_in_region(
         (rows, cell_items)
     };
 
-    // Assignment-only items join the grid once its shape is settled, so
-    // they never move a boundary, the alignment score or the header cut.
-    // A script takes its anchor's cell: an exponent hangs off the right end
-    // of its value and often lies past the column boundary. One with no
-    // anchor in the row (a marker on a heading beside the table) stays out.
-    let mut item_indices = item_indices;
-    for (idx, item) in assign_only {
-        let Some(row) = find_row_index(&rows, item.line_y()) else {
-            continue;
-        };
-        if super::crosses_other_rows(item, &rows, Some(row)) {
-            continue;
-        }
-        let anchor_col = cell_items[row]
-            .iter()
-            .enumerate()
-            .flat_map(|(col, col_items)| col_items.iter().map(move |anchor| (col, anchor)))
-            .filter_map(|(col, anchor)| {
-                super::script_anchor_gap(item, anchor).map(|gap| (col, gap))
-            })
-            .min_by(|left, right| left.1.total_cmp(&right.1))
-            .map(|(col, _)| col);
-        if let Some(col) = anchor_col {
-            cell_items[row][col].push(item);
-            item_indices.push(*idx);
-        }
-    }
-
-    // Sort items within each cell by X position and join with subscript-aware spacing
-    let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
-    for row_items in &mut cell_items {
-        let mut row_cells = Vec::with_capacity(columns.len());
-        for col_items in row_items.iter_mut() {
-            // Sort by X position (direction-aware). RTL direction comes from
-            // strong RTL letters only — a digit-only cell split across items
-            // must not have its number reversed. RTL cells sort in baseline
-            // bands so wrapped lines stay contiguous for the embedded-LTR
-            // restoration (matching the rect and structure-tree detectors).
-            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
-            if rtl {
-                crate::text_utils::sort_rtl_cell_items(col_items, |i| *i);
-            } else {
-                col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
-            }
-
-            // Join items with subscript-aware spacing
-            let text = join_cell_items(col_items);
-            row_cells.push(text);
-        }
-        cells.push(row_cells);
-    }
+    let mut cells = join_cells(&mut cell_items);
 
     // Validation 0 (small-font pass only): reject tiny all-numeric
     // fragments. A <=2-row grid whose every cell is a bare 1-2 digit number
@@ -1656,6 +1606,40 @@ fn detect_table_in_region(
         return None;
     }
 
+    // Assignment-only items join the grid once the table has passed every
+    // validation, so they never change a boundary, the header cut or any
+    // verdict above. A script takes its anchor's cell: an exponent hangs off
+    // the right end of its value and often lies past the column boundary.
+    // One with no anchor in the row (a marker on a heading beside the table)
+    // stays out.
+    let mut item_indices = item_indices;
+    let mut assigned = false;
+    for (idx, item) in assign_only {
+        let Some(row) = find_row_index(&rows, item.line_y()) else {
+            continue;
+        };
+        if super::crosses_other_rows(item, &rows, Some(row)) {
+            continue;
+        }
+        let anchor_col = cell_items[row]
+            .iter()
+            .enumerate()
+            .flat_map(|(col, col_items)| col_items.iter().map(move |anchor| (col, anchor)))
+            .filter_map(|(col, anchor)| {
+                super::script_anchor_gap(item, anchor).map(|gap| (col, gap))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(col, _)| col);
+        if let Some(col) = anchor_col {
+            cell_items[row][col].push(item);
+            item_indices.push(*idx);
+            assigned = true;
+        }
+    }
+    if assigned {
+        cells = join_cells(&mut cell_items);
+    }
+
     debug!(
         "table detected: {} rows x {} cols, {} items",
         rows.len(),
@@ -1667,6 +1651,34 @@ fn detect_table_in_region(
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
+/// Sort each cell's items by X position (direction-aware) and join them with
+/// subscript-aware spacing.
+fn join_cells(cell_items: &mut [Vec<Vec<&TextItem>>]) -> Vec<Vec<String>> {
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(cell_items.len());
+    for row_items in cell_items.iter_mut() {
+        let mut row_cells = Vec::with_capacity(row_items.len());
+        for col_items in row_items.iter_mut() {
+            // Sort by X position (direction-aware). RTL direction comes from
+            // strong RTL letters only — a digit-only cell split across items
+            // must not have its number reversed. RTL cells sort in baseline
+            // bands so wrapped lines stay contiguous for the embedded-LTR
+            // restoration (matching the rect and structure-tree detectors).
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
+            if rtl {
+                crate::text_utils::sort_rtl_cell_items(col_items, |i| *i);
+            } else {
+                col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
+            }
+
+            // Join items with subscript-aware spacing
+            let text = join_cell_items(col_items);
+            row_cells.push(text);
+        }
+        cells.push(row_cells);
+    }
+    cells
+}
+
 fn is_key_value_layout(cells: &[Vec<String>]) -> bool {
     if cells.is_empty() {
         return false;
@@ -4211,5 +4223,39 @@ mod tests {
         assert_eq!(tables.len(), 1, "{tables:?}");
         assert!(!tables[0].item_indices.contains(&marker_index));
         assert_eq!(tables[0].cells[0], vec!["Model", "Params", "FLOPs"]);
+    }
+
+    #[test]
+    fn table_whose_values_all_carry_markers_is_detected_as_without_them() {
+        // The markers join their cells only after validation, so the numeric
+        // check still sees bare numbers and the table is kept.
+        let rows = [
+            ("Task", "Score"),
+            ("BoolQ", "91.0"),
+            ("CB", "96.9"),
+            ("COPA", "94.8"),
+            ("RTE", "92.5"),
+            ("WiC", "76.1"),
+        ];
+        let mut items = Vec::new();
+        for (index, (task, score)) in rows.iter().enumerate() {
+            let y = 500.0 - index as f32 * 10.4;
+            items.push(make_item(task, 100.0, y, 6.5, 19.5));
+            items.push(make_item(score, 220.0, y, 6.5, 13.0));
+            if index > 0 {
+                let mut marker = make_item("a", 233.3, y + 2.6, 4.5, 2.5);
+                marker.baseline_shift = 2.6;
+                items.push(marker);
+            }
+        }
+        let bare: Vec<TextItem> = items
+            .iter()
+            .filter(|item| !item.is_script())
+            .cloned()
+            .collect();
+        assert_eq!(detect_tables(&bare, 10.0, false).len(), 1);
+        let tables = detect_tables(&items, 10.0, false);
+        assert_eq!(tables.len(), 1, "{tables:?}");
+        assert_eq!(tables[0].cells[1], vec!["BoolQ", "91.0<sup>a</sup>"]);
     }
 }

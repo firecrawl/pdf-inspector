@@ -268,29 +268,23 @@ fn collect_anchored_rows<'a>(
     rows
 }
 
-/// Move each super/subscript run into the row of the line it annotates.
+/// Move each super/subscript run into the row of the line it annotates, or
+/// `None` when no run moves.
 ///
 /// `collect_anchored_rows` clusters on raw glyph baselines, so an exponent
 /// raised off a value ("2.3 × 10" + "19") forms a row of its own above it.
 /// Assigned as is, that row renders as a phantom table row holding only the
 /// exponent, and the value loses it. Detection keeps the raw-baseline rows;
-/// only cell assignment sees the runs moved to the row at their `line_y()`.
+/// only the final cells see the runs moved to the row at their `line_y()`.
 /// A run with no row at its anchor baseline stays where it was.
-fn reattach_script_runs(rows: Vec<AnchoredRow<'_>>) -> Vec<AnchoredRow<'_>> {
-    if !rows
-        .iter()
-        .flat_map(|(_, row)| row)
-        .any(|(_, item)| item.is_script())
-    {
-        return rows;
-    }
+fn reattach_script_runs<'a>(rows: &[AnchoredRow<'a>]) -> Option<Vec<AnchoredRow<'a>>> {
     let body_rows: Vec<(usize, f32)> = rows
         .iter()
         .enumerate()
         .filter(|(_, (_, row))| row.iter().any(|(_, item)| !item.is_script()))
         .map(|(index, (y, _))| (index, *y))
         .collect();
-    let mut rows = rows;
+    let mut rows = rows.to_vec();
     let mut moved: Vec<(usize, (usize, &TextItem))> = Vec::new();
     for (row_index, (_, row)) in rows.iter_mut().enumerate() {
         row.retain(|&(item_index, item)| {
@@ -316,7 +310,7 @@ fn reattach_script_runs(rows: Vec<AnchoredRow<'_>>) -> Vec<AnchoredRow<'_>> {
         });
     }
     if moved.is_empty() {
-        return rows;
+        return None;
     }
     for (target, entry) in moved {
         rows[target].1.push(entry);
@@ -325,7 +319,7 @@ fn reattach_script_runs(rows: Vec<AnchoredRow<'_>>) -> Vec<AnchoredRow<'_>> {
     for (_, row) in &mut rows {
         row.sort_by(|left, right| left.1.x.total_cmp(&right.1.x));
     }
-    rows
+    Some(rows)
 }
 
 /// The x a run is placed into a column by: a super/subscript run's anchor's
@@ -517,42 +511,12 @@ fn build_text_anchor_table(
     columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
     columns.push(x_max);
 
-    let rows = reattach_script_runs(rows);
-    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
-    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
-    let mut item_indices = Vec::new();
-    let mut wide_items = 0usize;
-    let mut measured_items = 0usize;
-    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
-    for (row_index, (_, row)) in rows.iter().enumerate() {
-        for (item_index, item) in row {
-            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
-                continue;
-            }
-            let x = script_anchor_x(item, row);
-            let column = anchors
-                .iter()
-                .enumerate()
-                .min_by(|left, right| (left.1 - x).abs().total_cmp(&(right.1 - x).abs()))
-                .map(|(index, _)| index)?;
-            let column_width = columns[column + 1] - columns[column];
-            if column_width > 0.0 {
-                measured_items += 1;
-                if item.width.max(0.0) > column_width * 0.72 {
-                    wide_items += 1;
-                }
-            }
-            push_cell_item(
-                &mut cells[row_index][column],
-                &mut last_items[row_index][column],
-                item,
-                item.text.trim(),
-            );
-            item_indices.push(*item_index);
-        }
-    }
-    item_indices.sort_unstable();
-    item_indices.dedup();
+    let AnchorCells {
+        cells,
+        item_indices,
+        measured_items,
+        wide_items,
+    } = fill_anchor_cells(&rows, &anchors, &columns, false)?;
 
     let occupied_rows = cells
         .iter()
@@ -634,12 +598,84 @@ fn build_text_anchor_table(
         return None;
     }
 
+    // Scripts move to their value's row only once the table has passed every
+    // check above, so the checks see the same rows and cells as before.
+    let (rows, cells, item_indices) = match reattach_script_runs(&rows) {
+        Some(reattached) => {
+            let filled = fill_anchor_cells(&reattached, &anchors, &columns, true)?;
+            (reattached, filled.cells, filled.item_indices)
+        }
+        None => (rows, cells, item_indices),
+    };
     Some(Table::new(
         columns,
         rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
     ))
+}
+
+struct AnchorCells {
+    cells: Vec<Vec<String>>,
+    item_indices: Vec<usize>,
+    measured_items: usize,
+    wide_items: usize,
+}
+
+/// Fill a text-anchor table's cells from its rows. With
+/// `scripts_by_anchor`, a super/subscript run takes the column of the value
+/// it hangs off rather than the one nearest its own x.
+fn fill_anchor_cells(
+    rows: &[AnchoredRow<'_>],
+    anchors: &[f32],
+    columns: &[f32],
+    scripts_by_anchor: bool,
+) -> Option<AnchorCells> {
+    let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
+    let mut item_indices = Vec::new();
+    let mut wide_items = 0usize;
+    let mut measured_items = 0usize;
+    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
+    for (row_index, (_, row)) in rows.iter().enumerate() {
+        for (item_index, item) in row {
+            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
+                continue;
+            }
+            let x = if scripts_by_anchor {
+                script_anchor_x(item, row)
+            } else {
+                item.x
+            };
+            let column = anchors
+                .iter()
+                .enumerate()
+                .min_by(|left, right| (left.1 - x).abs().total_cmp(&(right.1 - x).abs()))
+                .map(|(index, _)| index)?;
+            let column_width = columns[column + 1] - columns[column];
+            if column_width > 0.0 {
+                measured_items += 1;
+                if item.width.max(0.0) > column_width * 0.72 {
+                    wide_items += 1;
+                }
+            }
+            push_cell_item(
+                &mut cells[row_index][column],
+                &mut last_items[row_index][column],
+                item,
+                item.text.trim(),
+            );
+            item_indices.push(*item_index);
+        }
+    }
+    item_indices.sort_unstable();
+    item_indices.dedup();
+    Some(AnchorCells {
+        cells,
+        item_indices,
+        measured_items,
+        wide_items,
+    })
 }
 
 fn detect_text_anchor_rule_tables(
