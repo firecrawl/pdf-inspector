@@ -3052,10 +3052,16 @@ fn is_short_header_label(text: &str) -> bool {
     (1..=3).contains(&words)
 }
 
-/// Same-style header cells are one row even when the gap exceeds the void
-/// split. A wrapped leftover (`checksum.`) and a different-size tag are not
-/// header cells, so those pairs still split.
-fn same_style_header_row(line: &TextLine, incoming: &TextItem) -> bool {
+/// Three or more same-style header cells are one row even when the gap
+/// exceeds the void split. Two cells are also how two columns end
+/// (`Summary` / `Results`), so that pair still splits. A wrapped leftover
+/// (`checksum.`) and a different-size tag are not header cells.
+fn same_style_header_row(
+    line: &TextLine,
+    incoming: &TextItem,
+    upcoming: &[Option<TextItem>],
+    y_tolerance: f32,
+) -> bool {
     let bold = incoming.is_bold;
     let font_size = incoming.font_size;
     let is_header_cell = |item: &TextItem| {
@@ -3065,7 +3071,34 @@ fn same_style_header_row(line: &TextLine, incoming: &TextItem) -> bool {
             && is_short_header_label(&item.text)
             && !is_wrapped_fragment(item, item.text.trim())
     };
-    is_header_cell(incoming) && line.items.iter().all(is_header_cell)
+    if !is_header_cell(incoming) || !line.items.iter().all(is_header_cell) {
+        return false;
+    }
+    // Cells of this row, in the order the stream will visit them. A void
+    // between neighbors starts another cell; adjacent words of one cell do not.
+    let mut cells: Vec<&TextItem> = Vec::with_capacity(line.items.len() + 2);
+    cells.extend(line.items.iter());
+    cells.push(incoming);
+    for next in upcoming.iter().flatten() {
+        if next.page != incoming.page || (next.line_y() - incoming.line_y()).abs() >= y_tolerance {
+            continue;
+        }
+        if !is_header_cell(next) {
+            break;
+        }
+        cells.push(next);
+    }
+    let mut clusters = 1u32;
+    for pair in cells.windows(2) {
+        let void = (pair[0].font_size.max(pair[1].font_size) * 8.0).max(100.0);
+        if horizontal_gap(pair[0], pair[1]) > void {
+            clusters += 1;
+            if clusters >= 3 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Group items from a single column into lines
@@ -3103,7 +3136,15 @@ fn group_single_column(
     let mut lines: Vec<TextLine> = Vec::new();
     let y_tolerance = 3.0;
 
-    for item in items {
+    // `Option` so a later cell can be inspected without cloning the run
+    // or shifting the rest of the vec.
+    let mut pending: Vec<Option<TextItem>> = items.into_iter().map(Some).collect();
+    let mut index = 0;
+    while index < pending.len() {
+        let Some(item) = pending[index].take() else {
+            index += 1;
+            continue;
+        };
         // Only check the most recent line for merging
         let should_merge = lines.last().is_some_and(|last_line| {
             if last_line.page != item.page {
@@ -3194,8 +3235,9 @@ fn group_single_column(
                     }
                     // Wrapped leftovers ("checksum." / "order.") and a
                     // right-aligned tag beside a title sit a column-width
-                    // void apart. Same-style header cells are one row at
-                    // any gap. Digit page numbers never reach this branch.
+                    // void apart. Three or more same-style header cells are
+                    // one row at any gap; two short runs still split.
+                    // Digit page numbers never reach this branch.
                     // A front-matter folio stays on an entry that is not a
                     // wrapped sentence. `checksum.` beside `iii` still splits.
                     let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
@@ -3206,7 +3248,12 @@ fn group_single_column(
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
                         && continues_line
                         && !folio_on_entry
-                        && !same_style_header_row(last_line, &item)
+                        && !same_style_header_row(
+                            last_line,
+                            &item,
+                            &pending[index + 1..],
+                            y_tolerance,
+                        )
                     {
                         return false;
                     }
@@ -3229,6 +3276,7 @@ fn group_single_column(
                 adaptive_threshold,
             });
         }
+        index += 1;
     }
 
     // Sort items within each line by X position (direction-aware)
@@ -3986,9 +4034,9 @@ mod tests {
 
     #[test]
     fn wide_table_header_stays_one_row() {
-        // Header cells more than 8em and 100pt apart are still one row.
-        // The second cell is where the void rule decides, so a two-cell
-        // header is the same case. Bold is not required.
+        // Header cells more than 8em and 100pt apart are still one row
+        // once a third cell shows this is a row rather than two columns.
+        // Bold is not required.
         for bold in [true, false] {
             let mut cells = Vec::new();
             for (x, text) in [(47.0, "Status"), (200.0, "Description"), (400.0, "Owner")] {
@@ -4005,16 +4053,18 @@ mod tests {
             );
         }
 
-        let mut left = make_item(1, 47.0, 459.0, "Status");
-        left.font_size = 8.5;
-        left.width = 27.0;
-        let mut right = make_item(1, 220.0, 459.0, "Description");
-        right.font_size = 8.5;
-        right.width = 50.0;
+        // Two short unpunctuated runs a column apart are the leftovers of
+        // two columns, not a header row.
+        let mut summary = make_item(1, 42.0, 569.0, "Summary");
+        summary.font_size = 10.0;
+        summary.width = 50.0;
+        let mut results = make_item(1, 318.0, 569.0, "Results");
+        results.font_size = 10.0;
+        results.width = 45.0;
         assert_eq!(
-            group_single_column(vec![left, right], 0.10, false).len(),
-            1,
-            "a two-cell header wider than the void floor stays one row"
+            group_single_column(vec![summary, results], 0.10, false).len(),
+            2,
+            "two short column leftovers still split"
         );
     }
 
