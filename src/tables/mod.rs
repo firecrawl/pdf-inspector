@@ -4,6 +4,19 @@
 
 mod cell_text;
 
+/// How far a super/subscript run sits from `anchor`, the value it may hang
+/// off: the gap between the run and whichever end of the anchor it is beside.
+/// `None` when the anchor is itself a run or is more than the run's font size
+/// away, too far for the run to annotate it.
+pub(crate) fn script_anchor_gap(run: &TextItem, anchor: &TextItem) -> Option<f32> {
+    if anchor.is_script() {
+        return None;
+    }
+    let gap_after = (run.x - (anchor.x + anchor.width)).abs();
+    let gap_before = (anchor.x - (run.x + run.width)).abs();
+    Some(gap_after.min(gap_before)).filter(|gap| *gap <= run.font_size)
+}
+
 /// Whether a vertical run stands across several rows of a table beyond the
 /// one its foot is in. A rotated column header rises from its header row and
 /// crosses no other row, and a short row-group label spanning two rows stays

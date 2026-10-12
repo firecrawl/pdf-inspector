@@ -643,11 +643,20 @@ pub(crate) fn detect_tables_with_page_width(
                 continue;
             }
 
-            if let Some(mut table) =
-                detect_table_in_region(&region_items, TableDetectionMode::SmallFont, &|i| {
-                    script_flags[i]
-                })
-            {
+            let region_scripts = region_script_runs(
+                items,
+                &expanded_evidence,
+                &claimed_indices,
+                6.0,
+                y_min,
+                y_max,
+            );
+            if let Some(mut table) = detect_table_in_region(
+                &region_items,
+                TableDetectionMode::SmallFont,
+                &|i| script_flags[i],
+                &region_scripts,
+            ) {
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
                 // Try to recover a label column from unclaimed items to the left
@@ -729,11 +738,20 @@ pub(crate) fn detect_tables_with_page_width(
                     continue;
                 }
 
-                if let Some(table) =
-                    detect_table_in_region(&region_items, TableDetectionMode::BodyFont, &|i| {
-                        body_script_flags[i]
-                    })
-                {
+                let region_scripts = region_script_runs(
+                    items,
+                    &expanded_evidence,
+                    &claimed_indices,
+                    body_font_low,
+                    *y_min,
+                    *y_max,
+                );
+                if let Some(table) = detect_table_in_region(
+                    &region_items,
+                    TableDetectionMode::BodyFont,
+                    &|i| body_script_flags[i],
+                    &region_scripts,
+                ) {
                     tables.push(table);
                 }
             }
@@ -761,6 +779,35 @@ pub(crate) fn detect_tables_with_page_width(
     }
 
     tables
+}
+
+/// Super/subscript runs whose anchor line lies in a table region but that
+/// are set below `min_size`, the smallest size the pass takes as a
+/// candidate. Exponents and indices run at 0.5-0.7 of their value's size, so
+/// the size filter drops them and they fell out of their cells as loose
+/// text after the table. They are handed to `detect_table_in_region` for
+/// cell assignment only, so detection still runs on exactly the candidates
+/// it saw before.
+fn region_script_runs<'a>(
+    items: &'a [TextItem],
+    evidence: &[bool],
+    claimed: &std::collections::HashSet<usize>,
+    min_size: f32,
+    y_min: f32,
+    y_max: f32,
+) -> Vec<(usize, &'a TextItem)> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(idx, item)| {
+            !claimed.contains(idx)
+                && evidence[*idx]
+                && item.is_script()
+                && item.font_size < min_size
+                && item.line_y() >= y_min
+                && item.line_y() <= y_max
+        })
+        .collect()
 }
 
 /// Find Y-regions that likely contain tables
@@ -1323,6 +1370,7 @@ fn detect_table_in_region(
     items: &[(usize, &TextItem)],
     mode: TableDetectionMode,
     is_script: &dyn Fn(usize) -> bool,
+    assign_only: &[(usize, &TextItem)],
 ) -> Option<Table> {
     // Column geometry from non-script items only.
     let geometry_items: Vec<(usize, &TextItem)> = items
@@ -1430,6 +1478,34 @@ fn detect_table_in_region(
     } else {
         (rows, cell_items)
     };
+
+    // Assignment-only items join the grid once its shape is settled, so
+    // they never move a boundary, the alignment score or the header cut.
+    // A script takes its anchor's cell: an exponent hangs off the right end
+    // of its value and often lies past the column boundary. One with no
+    // anchor in the row (a marker on a heading beside the table) stays out.
+    let mut item_indices = item_indices;
+    for (idx, item) in assign_only {
+        let Some(row) = find_row_index(&rows, item.line_y()) else {
+            continue;
+        };
+        if super::crosses_other_rows(item, &rows, Some(row)) {
+            continue;
+        }
+        let anchor_col = cell_items[row]
+            .iter()
+            .enumerate()
+            .flat_map(|(col, col_items)| col_items.iter().map(move |anchor| (col, anchor)))
+            .filter_map(|(col, anchor)| {
+                super::script_anchor_gap(item, anchor).map(|gap| (col, gap))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(col, _)| col);
+        if let Some(col) = anchor_col {
+            cell_items[row][col].push(item);
+            item_indices.push(*idx);
+        }
+    }
 
     // Sort items within each cell by X position and join with subscript-aware spacing
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
@@ -2723,9 +2799,12 @@ mod tests {
         // Through the region entry point the marker is a script item; it
         // still lands in its entry's title rather than in the text flow.
         let marker_idx = items.iter().position(|i| i.baseline_shift != 0.0).unwrap();
-        let via_region = detect_table_in_region(&indexed, TableDetectionMode::BodyFont, &|idx| {
-            idx == marker_idx
-        })
+        let via_region = detect_table_in_region(
+            &indexed,
+            TableDetectionMode::BodyFont,
+            &|idx| idx == marker_idx,
+            &[],
+        )
         .expect("contents list through the region entry point");
         assert_eq!(via_region.kind, crate::tables::TableKind::Toc);
         assert_eq!(via_region.cells[13], vec!["5 Digital archives 1", "120"]);
@@ -4045,5 +4124,92 @@ mod tests {
             vec!["Section D".into(), "TBD".into()],
         ];
         assert!(!is_page_number_toc(&cells));
+    }
+
+    /// A three-column table whose last column holds values raised to a
+    /// power, the exponent set as a separate small run at a baseline shift,
+    /// the way TeX sets `$2.3 \cdot 10^{19}$` in a table cell.
+    fn exponent_table(cell_size: f32, exponent_size: f32) -> Vec<TextItem> {
+        let rows = [
+            ("Model", "Params", None),
+            ("Small", "11M", Some(("1.8 × 10", "9"))),
+            ("Base", "65M", Some(("3.3 × 10", "18"))),
+            ("Big", "213M", Some(("2.3 × 10", "19"))),
+            ("Huge", "1.2B", Some(("9.6 × 10", "20"))),
+        ];
+        let mut items = Vec::new();
+        for (index, (name, params, flops)) in rows.iter().enumerate() {
+            let y = 500.0 - index as f32 * cell_size * 1.6;
+            items.push(make_item(name, 100.0, y, cell_size, cell_size * 3.0));
+            items.push(make_item(params, 220.0, y, cell_size, cell_size * 2.0));
+            match flops {
+                None => items.push(make_item("FLOPs", 340.0, y, cell_size, cell_size * 3.0)),
+                Some((value, power)) => {
+                    let width = cell_size * 4.0;
+                    items.push(make_item(value, 340.0, y, cell_size, width));
+                    let shift = cell_size * 0.4;
+                    let mut exponent = make_item(
+                        power,
+                        340.0 + width + 0.3,
+                        y + shift,
+                        exponent_size,
+                        exponent_size,
+                    );
+                    exponent.baseline_shift = shift;
+                    items.push(exponent);
+                }
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn body_font_table_keeps_small_exponents_in_their_value_cells() {
+        let items = exponent_table(10.0, 7.0);
+        let tables = detect_tables(&items, 10.0, false);
+        assert_eq!(tables.len(), 1, "{tables:?}");
+        let last_column: Vec<&str> = tables[0]
+            .cells
+            .iter()
+            .map(|row| row.last().unwrap().as_str())
+            .collect();
+        assert_eq!(
+            last_column,
+            vec![
+                "FLOPs",
+                "1.8 × 10<sup>9</sup>",
+                "3.3 × 10<sup>18</sup>",
+                "2.3 × 10<sup>19</sup>",
+                "9.6 × 10<sup>20</sup>",
+            ]
+        );
+        assert_eq!(tables[0].item_indices.len(), items.len());
+    }
+
+    #[test]
+    fn small_font_table_keeps_exponents_set_below_six_points() {
+        let items = exponent_table(6.5, 4.5);
+        let tables = detect_tables(&items, 10.0, false);
+        assert_eq!(tables.len(), 1, "{tables:?}");
+        assert_eq!(
+            tables[0].cells.last().unwrap().last().unwrap(),
+            "9.6 × 10<sup>20</sup>"
+        );
+        assert_eq!(tables[0].item_indices.len(), items.len());
+    }
+
+    #[test]
+    fn script_with_no_anchor_in_its_row_stays_out_of_the_table() {
+        // A footnote marker on text beside the table shares a row's line but
+        // annotates nothing in it; it must stay in the text flow.
+        let mut items = exponent_table(10.0, 7.0);
+        let mut marker = make_item("20", 385.0, 504.0, 7.0, 7.0);
+        marker.baseline_shift = 4.0;
+        items.push(marker);
+        let marker_index = items.len() - 1;
+        let tables = detect_tables(&items, 10.0, false);
+        assert_eq!(tables.len(), 1, "{tables:?}");
+        assert!(!tables[0].item_indices.contains(&marker_index));
+        assert_eq!(tables[0].cells[0], vec!["Model", "Params", "FLOPs"]);
     }
 }

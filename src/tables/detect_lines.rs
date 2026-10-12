@@ -268,6 +268,79 @@ fn collect_anchored_rows<'a>(
     rows
 }
 
+/// Move each super/subscript run into the row of the line it annotates.
+///
+/// `collect_anchored_rows` clusters on raw glyph baselines, so an exponent
+/// raised off a value ("2.3 × 10" + "19") forms a row of its own above it.
+/// Assigned as is, that row renders as a phantom table row holding only the
+/// exponent, and the value loses it. Detection keeps the raw-baseline rows;
+/// only cell assignment sees the runs moved to the row at their `line_y()`.
+/// A run with no row at its anchor baseline stays where it was.
+fn reattach_script_runs(rows: Vec<AnchoredRow<'_>>) -> Vec<AnchoredRow<'_>> {
+    if !rows
+        .iter()
+        .flat_map(|(_, row)| row)
+        .any(|(_, item)| item.is_script())
+    {
+        return rows;
+    }
+    let body_rows: Vec<(usize, f32)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, row))| row.iter().any(|(_, item)| !item.is_script()))
+        .map(|(index, (y, _))| (index, *y))
+        .collect();
+    let mut rows = rows;
+    let mut moved: Vec<(usize, (usize, &TextItem))> = Vec::new();
+    for (row_index, (_, row)) in rows.iter_mut().enumerate() {
+        row.retain(|&(item_index, item)| {
+            if !item.is_script() {
+                return true;
+            }
+            let target = body_rows
+                .iter()
+                .filter(|(_, y)| (y - item.line_y()).abs() <= TEXT_ROW_TOLERANCE)
+                .min_by(|left, right| {
+                    (left.1 - item.line_y())
+                        .abs()
+                        .total_cmp(&(right.1 - item.line_y()).abs())
+                })
+                .map(|(index, _)| *index);
+            match target {
+                Some(target) if target != row_index => {
+                    moved.push((target, (item_index, item)));
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
+    if moved.is_empty() {
+        return rows;
+    }
+    for (target, entry) in moved {
+        rows[target].1.push(entry);
+    }
+    rows.retain(|(_, row)| !row.is_empty());
+    for (_, row) in &mut rows {
+        row.sort_by(|left, right| left.1.x.total_cmp(&right.1.x));
+    }
+    rows
+}
+
+/// The x a run is placed into a column by: a super/subscript run's anchor's
+/// when the row holds the value it hangs off, so an exponent past the end of
+/// a wide value still lands in the value's column.
+fn script_anchor_x(item: &TextItem, row: &[(usize, &TextItem)]) -> f32 {
+    if !item.is_script() {
+        return item.x;
+    }
+    row.iter()
+        .filter_map(|(_, anchor)| super::script_anchor_gap(item, anchor).map(|gap| (anchor.x, gap)))
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map_or(item.x, |(x, _)| x)
+}
+
 fn rules_are_uniform_grid(rules: &[HorizontalRule]) -> bool {
     if rules.len() < 5 {
         return false;
@@ -444,6 +517,7 @@ fn build_text_anchor_table(
     columns.extend(anchors.windows(2).map(|pair| (pair[0] + pair[1]) / 2.0));
     columns.push(x_max);
 
+    let rows = reattach_script_runs(rows);
     let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
     let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
@@ -455,10 +529,11 @@ fn build_text_anchor_table(
             if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
                 continue;
             }
+            let x = script_anchor_x(item, row);
             let column = anchors
                 .iter()
                 .enumerate()
-                .min_by(|left, right| (left.1 - item.x).abs().total_cmp(&(right.1 - item.x).abs()))
+                .min_by(|left, right| (left.1 - x).abs().total_cmp(&(right.1 - x).abs()))
                 .map(|(index, _)| index)?;
             let column_width = columns[column + 1] - columns[column];
             if column_width > 0.0 {
@@ -3647,5 +3722,49 @@ mod tests {
             tables.is_empty(),
             "Single-column grid should not be a table"
         );
+    }
+
+    #[test]
+    fn test_booktabs_exponent_stays_in_its_value_row() {
+        // Rows cluster on raw glyph baselines, so a raised exponent forms a
+        // row of its own. It belongs after its value, not in a phantom row.
+        let lines = vec![
+            make_hline(500.0, 80.0, 420.0, 1),
+            make_hline(480.0, 80.0, 420.0, 1),
+            make_hline(440.0, 80.0, 420.0, 1),
+        ];
+        // The value is wide enough that its exponent lies nearer the next
+        // column's anchor than its own.
+        let mut value = make_item("2.3 × 10", 220.0, 465.0, 1);
+        value.width = 62.0;
+        let mut exponent = make_item("19", 283.0, 469.0, 1);
+        exponent.width = 6.0;
+        exponent.height = 7.0;
+        exponent.font_size = 7.0;
+        exponent.baseline_shift = 4.0;
+        let items = vec![
+            make_item("Model", 100.0, 490.0, 1),
+            make_item("FLOPs", 220.0, 490.0, 1),
+            make_item("Latency", 340.0, 490.0, 1),
+            make_item("Alpha", 100.0, 465.0, 1),
+            value,
+            exponent,
+            make_item("12", 340.0, 465.0, 1),
+            make_item("Beta", 100.0, 450.0, 1),
+            make_item("89.7", 220.0, 450.0, 1),
+            make_item("9", 340.0, 450.0, 1),
+        ];
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].cells,
+            vec![
+                vec!["Model", "FLOPs", "Latency"],
+                vec!["Alpha", "2.3 × 10<sup>19</sup>", "12"],
+                vec!["Beta", "89.7", "9"],
+            ]
+        );
+        assert!(tables[0].item_indices.contains(&5));
     }
 }

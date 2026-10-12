@@ -11,6 +11,16 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- A super- or subscript in a table cell stays in that cell, after the
+  value it belongs to. `2.3 · 10<sup>19</sup>` came out as `2.3 · 10`, with
+  the exponent in a row of its own above the value or in a loose line of
+  `<sup>` tags after the table. Exponents and indices are set smaller than
+  the font sizes the heuristic table passes accept, and a rule-anchored
+  table groups rows on raw glyph baselines. The runs now join the cell of
+  the value they sit beside once the table's shape is settled, so which
+  tables are detected does not change. A run with no value beside it in
+  the row stays in the text flow.
+
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
   read through the Windows variant of the standard glyph order. That
