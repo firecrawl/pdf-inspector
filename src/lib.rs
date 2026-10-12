@@ -4430,19 +4430,29 @@ fn decrypt_document_bytes(
     // The string loader then hashes the password string's UTF-8 bytes. When
     // the user password's PDFDoc bytes are not that UTF-8 (é is 0xE9, and the
     // 32-byte UTF-8 prefix of 31 `a`s plus é ends in 0xC3), reload from the
-    // ciphertext with those raw bytes instead.
+    // ciphertext with those raw bytes instead. A recovered password whose
+    // bytes are already UTF-8 stays on the string loader: that path decrypts
+    // an object stream before expanding it. The raw reload parses ciphertext
+    // first, and lopdf drops an object stream it cannot expand, so a later
+    // page stored there would be missing while an earlier direct page made
+    // the load look successful.
+    let with_password = |pw: &str| lopdf::LoadOptions {
+        password: Some(pw.to_string()),
+        ..bounded_load_options()
+    };
     if let Some(doc) = loaded {
         if let Some(key) = owner_password::user_password_bytes_for_file_key(doc, pw) {
+            if let Ok(utf8) = std::str::from_utf8(&key) {
+                if let Ok(decrypted) = Document::load_mem_with_options(buf, with_password(utf8)) {
+                    return Ok(decrypted);
+                }
+            }
             if let Some(decrypted) = load_with_raw_file_key(buf, doc, &key) {
                 return Ok(decrypted);
             }
         }
     }
     let resolved = file_key_password(pw, loaded);
-    let with_password = |pw: &str| lopdf::LoadOptions {
-        password: Some(pw.to_string()),
-        ..bounded_load_options()
-    };
     match Document::load_mem_with_options(buf, with_password(&resolved)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
@@ -4458,18 +4468,79 @@ fn decrypt_document_bytes(
 /// A passwordless load keeps the encryption dictionary and drops every other
 /// object. Reloading with the trailer `/Encrypt` name masked parses those
 /// objects with their ciphertext intact; `decrypt_object` then applies `key`.
+///
+/// An object stream would be expanded during that reload, before its bytes
+/// are decrypted, and a failed expansion drops the stream. Its type name is
+/// masked for the reload and restored once the stream decrypts.
 fn load_with_raw_file_key(buf: &[u8], structural: &Document, key: &[u8]) -> Option<Document> {
     let state = lopdf::EncryptionState::decode(structural, key).ok()?;
     let mut patched = buf.to_vec();
     mask_encrypt_keys(&mut patched);
+    mask_object_stream_types(&mut patched);
     let mut doc = Document::load_mem_with_options(&patched, bounded_load_options()).ok()?;
     for (id, object) in doc.objects.iter_mut() {
         lopdf::encryption::decrypt_object(&state, *id, object).ok()?;
+    }
+    if !expand_masked_object_streams(&mut doc) {
+        return None;
     }
     if doc.get_pages().is_empty() {
         return None;
     }
     Some(doc)
+}
+
+/// Rename `/Type /ObjStm` to `/Type /XbjStm` so the loader keeps the stream.
+/// The replacement is the same length, so xref offsets stay valid.
+fn mask_object_stream_types(buf: &mut [u8]) {
+    let needle = b"/ObjStm";
+    let mut search_from = 0;
+    while let Some(at) = buf[search_from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let slash_at = search_from + at;
+        if type_name_introduces_object_stream(buf, slash_at) {
+            buf[slash_at + 1..slash_at + needle.len()].copy_from_slice(b"XbjStm");
+        }
+        search_from = slash_at + needle.len();
+    }
+}
+
+/// `/Type` immediately before `/ObjStm`, with only whitespace between them.
+fn type_name_introduces_object_stream(buf: &[u8], slash_at: usize) -> bool {
+    let mut index = slash_at;
+    while index > 0 && buf[index - 1].is_ascii_whitespace() {
+        index -= 1;
+    }
+    index >= b"/Type".len() && &buf[index - b"/Type".len()..index] == b"/Type"
+}
+
+/// Restore masked object streams and add the objects they contain. `false`
+/// means a masked stream did not decode, so the caller must not keep a
+/// document that is missing those objects.
+fn expand_masked_object_streams(doc: &mut Document) -> bool {
+    let mut recovered = Vec::new();
+    for object in doc.objects.values_mut() {
+        let Ok(stream) = object.as_stream_mut() else {
+            continue;
+        };
+        let Ok(name) = stream.dict.get(b"Type").and_then(lopdf::Object::as_name) else {
+            continue;
+        };
+        if name != b"XbjStm" {
+            continue;
+        }
+        stream.dict.set("Type", "ObjStm");
+        match lopdf::ObjectStream::new_with_limit(stream, Some(MAX_STREAM_DECOMPRESSED_BYTES)) {
+            Ok(parsed) => recovered.extend(parsed.objects),
+            Err(_) => return false,
+        }
+    }
+    for (id, entry) in recovered {
+        doc.objects.entry(id).or_insert(entry);
+    }
+    true
 }
 
 /// Rename each `/Encrypt` key that introduces an object reference so the loader
