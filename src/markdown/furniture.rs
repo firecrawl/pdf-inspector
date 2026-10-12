@@ -370,6 +370,22 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         .map(|(&page, ys)| (page, cluster_rows(ys)))
         .collect();
 
+    /// How many clustered rows at each end count as the margin. One or two
+    /// rows are not a margin: both rows would be "at the edge". On a short
+    /// page the full N-row zones would meet, so the zone starts at one row
+    /// and grows by one row per extra row past 2 * N.
+    fn edge_width(count: usize, n: usize) -> usize {
+        if count <= 2 {
+            0
+        } else {
+            count.saturating_sub(n * 2).clamp(1, n)
+        }
+    }
+
+    fn row_index(y: f32, rows: &[f32]) -> Option<usize> {
+        rows.iter().position(|&py| (py - y).abs() < 0.1)
+    }
+
     /// Returns true if the given Y position is among the first or last N
     /// clustered rows on the specified page. `page_rows` is computed once.
     fn is_y_at_edge(y: f32, page: u32, page_rows: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
@@ -377,21 +393,26 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             Some(rows) => rows,
             None => return false,
         };
-        let count = rows.len();
-        // One or two rows have no interior, so they are not a margin.
-        if count <= 2 {
-            return false;
-        }
-        // On a short page the full N-row zones meet and would mark the body
-        // as furniture. Keep only the outermost row, which is still enough
-        // for a running header or footer, and grow the zone one row per row
-        // past 2 * N so it never jumps to cover nearly the whole page.
-        let edge = count.saturating_sub(n * 2).clamp(1, n);
-        let pos = match rows.iter().position(|&py| (py - y).abs() < 0.1) {
+        let edge = edge_width(rows.len(), n);
+        let pos = match row_index(y, rows) {
             Some(p) => p,
             None => return false,
         };
-        pos < edge || pos + edge >= count
+        edge > 0 && (pos < edge || pos + edge >= rows.len())
+    }
+
+    /// The row just inside a one-row margin. A two-line header lives here
+    /// when the short-page zone was clamped to the outermost row.
+    fn is_shoulder_row(y: f32, page: u32, page_rows: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
+        let rows = match page_rows.get(&page) {
+            Some(rows) => rows,
+            None => return false,
+        };
+        let count = rows.len();
+        if edge_width(count, n) != 1 {
+            return false;
+        }
+        row_index(y, rows).is_some_and(|pos| pos == 1 || pos + 2 == count)
     }
 
     // Average page span for normalizing Y variance
@@ -501,8 +522,41 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         stddev / avg_span < 0.05
     };
 
+    // Every qualifying line, so a short page can tell a repeating header
+    // from a repeating body. The edge map above still decides the margin.
+    let mut repetition: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut repetition_y: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut page_texts: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
+    for line in &lines {
+        let text = line.text();
+        if is_structural_line(text.trim()) {
+            continue;
+        }
+        let normalized = normalize_for_comparison(&text);
+        if normalized.chars().count() < 10 || is_decorative_separator(&normalized) {
+            continue;
+        }
+        repetition
+            .entry(normalized.clone())
+            .or_default()
+            .insert(line.page);
+        repetition_y
+            .entry(normalized.clone())
+            .or_default()
+            .push(line.y);
+        page_texts
+            .entry(line.page)
+            .or_default()
+            .push((line.y, normalized));
+    }
+    let repeats = |text: &str| -> bool {
+        repetition
+            .get(text)
+            .is_some_and(|pages| pages.len() as u32 >= threshold)
+    };
+
     // Identify candidates from individual frequency map
-    let candidates: HashSet<String> = freq
+    let mut candidates: HashSet<String> = freq
         .into_iter()
         .filter(|(text, pages)| {
             pages.len() as u32 >= threshold
@@ -511,6 +565,69 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         })
         .map(|(text, _)| text)
         .collect();
+
+    // A two-row page has no margin zone, but a row that repeats beside a
+    // row that does not is a header. When both rows repeat, neither is:
+    // that is the short page whose body copies the previous page.
+    for (text, pages) in &repetition {
+        let two_row_pages: Vec<u32> = pages
+            .iter()
+            .copied()
+            .filter(|page| page_rows.get(page).is_some_and(|rows| rows.len() == 2))
+            .collect();
+        if two_row_pages.is_empty()
+            || (pages.len() as u32) < threshold
+            || !has_consistent_y(text, &repetition_y)
+        {
+            continue;
+        }
+        let beside_unique_body = two_row_pages.iter().all(|page| {
+            page_texts.get(page).is_some_and(|texts| {
+                texts
+                    .iter()
+                    .any(|(_, other)| other != text && !repeats(other))
+            })
+        });
+        if beside_unique_body {
+            candidates.insert(text.clone());
+        }
+    }
+
+    // On a short page the margin is one row, so a two-line header would
+    // leave its second line behind. Once the outer row is furniture, the
+    // row just inside it is too, when that row repeats and the page still
+    // has a row that does not.
+    let mut shoulder: HashSet<String> = HashSet::new();
+    for (&page, rows) in &page_rows {
+        let count = rows.len();
+        if edge_width(count, EDGE_LINE_COUNT) != 1 {
+            continue;
+        }
+        let Some(texts) = page_texts.get(&page) else {
+            continue;
+        };
+        if !texts.iter().any(|(_, text)| !repeats(text)) {
+            continue;
+        }
+        let on_row = |pos: usize| {
+            let y = rows[pos];
+            texts
+                .iter()
+                .filter(move |(ty, _)| (ty - y).abs() < 0.1)
+                .map(|(_, text)| text.as_str())
+        };
+        for (outer, inner) in [(0, 1), (count - 1, count - 2)] {
+            let outer_is_furniture = on_row(outer).any(|text| candidates.contains(text));
+            if !outer_is_furniture {
+                continue;
+            }
+            for text in on_row(inner) {
+                if repeats(text) && has_consistent_y(text, &repetition_y) {
+                    shoulder.insert(text.to_string());
+                }
+            }
+        }
+    }
 
     // Identify candidates from coalesced band frequency map
     let band_candidates: HashSet<String> = band_freq
@@ -523,7 +640,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         .map(|(text, _)| text)
         .collect();
 
-    if candidates.is_empty() && band_candidates.is_empty() {
+    if candidates.is_empty() && band_candidates.is_empty() && shoulder.is_empty() {
         return lines;
     }
 
@@ -540,13 +657,21 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     // Track which page first shows each candidate (to preserve first occurrence)
     let mut first_page_individual: HashMap<String, u32> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
-        // A one- or two-row page adds no candidates, but a header already
-        // confirmed on full pages is still furniture there.
+        // A one-row page adds no candidates. A two-row page contributes
+        // only a row corroborated above. A header already confirmed on
+        // full pages is still furniture on either. The shoulder set is the
+        // second line of a short-page header.
+        let text = line.text();
+        let normalized = normalize_for_comparison(&text);
         let sparse_page = page_rows.get(&line.page).is_some_and(|r| r.len() <= 2);
-        if !sparse_page && !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT) {
+        let on_shoulder = shoulder.contains(&normalized)
+            && is_shoulder_row(line.y, line.page, &page_rows, EDGE_LINE_COUNT);
+        if !sparse_page
+            && !on_shoulder
+            && !is_y_at_edge(line.y, line.page, &page_rows, EDGE_LINE_COUNT)
+        {
             continue;
         }
-        let text = line.text();
         // Removal must apply the same original-text structural protection
         // as candidate collection: a structural line can share a normalized
         // key with a non-structural candidate once its leading number is
@@ -555,8 +680,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         if protected_bands.contains(&band_key(line)) {
             continue;
         }
-        let normalized = normalize_for_comparison(&text);
-        if candidates.contains(&normalized) {
+        if candidates.contains(&normalized) || on_shoulder {
             let first = first_page_individual.entry(normalized).or_insert(line.page);
             if line.page > *first {
                 removal_set.insert(idx);
@@ -1600,6 +1724,113 @@ mod tests {
                 .iter()
                 .any(|l| l.page == 6 && l.text().contains("page 6 row 0")),
             "the near-empty page body must stay"
+        );
+    }
+
+    #[test]
+    fn two_row_pages_strip_a_header_beside_a_unique_body() {
+        // Every page is two rows, so none of them is a margin zone. The
+        // header still repeats beside a body line that does not.
+        let mut lines = Vec::new();
+        for page in 1..=6u32 {
+            lines.push(make_line(
+                "Quarterly Bulletin running header text",
+                10.0,
+                page,
+                760.0,
+                None,
+            ));
+            lines.push(make_line(
+                &format!("unique body sentence on page {page} of the bulletin"),
+                10.0,
+                page,
+                700.0,
+                None,
+            ));
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Quarterly Bulletin"))
+                .count(),
+            1,
+            "a repeated header on two-row pages must be kept once"
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("unique body"))
+                .count(),
+            6,
+            "the unique body line on each two-row page must stay"
+        );
+    }
+
+    #[test]
+    fn two_row_pages_keep_a_passage_that_repeats_on_both_rows() {
+        // Both rows repeat, so neither row has a body line to compare
+        // against. The passage stays.
+        let mut lines = Vec::new();
+        for page in 1..=6u32 {
+            lines.push(make_line(
+                "first sentence of the repeated two row passage",
+                10.0,
+                page,
+                760.0,
+                None,
+            ));
+            lines.push(make_line(
+                "second sentence of the repeated two row passage",
+                10.0,
+                page,
+                700.0,
+                None,
+            ));
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(result.len(), 12, "a repeated two-row passage must stay");
+    }
+
+    #[test]
+    fn short_page_strips_the_second_line_of_a_running_header() {
+        // Nine rows: the margin zone is one row, and the second header line
+        // sits just inside it. The body lines do not repeat.
+        let mut lines = Vec::new();
+        for page in 1..=6u32 {
+            lines.push(make_line("Journal of Testing", 10.0, page, 760.0, None));
+            lines.push(make_line("Monthly bulletin", 10.0, page, 740.0, None));
+            for row in 0..7u32 {
+                lines.push(make_line(
+                    &format!("unique body words page {page} row {row} lorem ipsum"),
+                    10.0,
+                    page,
+                    700.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+        }
+        let result = strip_repeated_lines(lines, 6);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Journal of Testing"))
+                .count(),
+            1,
+            "the outer header line must be kept once"
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|l| l.text().contains("Monthly bulletin"))
+                .count(),
+            1,
+            "the second header line must be kept once"
+        );
+        assert_eq!(
+            result.iter().filter(|l| l.page == 2).count(),
+            7,
+            "the seven body rows must stay"
         );
     }
 }
