@@ -863,10 +863,11 @@ pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
     decode_marked_text_string(bytes, true)
 }
 
-/// AcroForm `/T` and text or choice `/V`. Unmarked bytes are PDFDocEncoding
-/// even when they are also valid UTF-8: `C2 A0` is Â plus the euro sign, not
-/// U+00A0. Marked UTF-16 and UTF-8 still follow their marks. The
-/// unmarked-UTF-8 habit in [`decode_pdf_text_string`] stays for its other callers.
+/// AcroForm `/T` and text or choice `/V`. Marked UTF-16 and UTF-8 follow
+/// their marks. Unmarked bytes are PDFDocEncoding when a byte is one PDFDoc
+/// reassigns (`C2 A0` is Â plus the euro sign, not U+00A0). A producer that
+/// writes UTF-8 without a mark, and only uses bytes PDFDoc leaves as Latin-1
+/// (`José` is `4A 6F 73 C3 A9`), is read as that UTF-8.
 pub(crate) fn decode_form_field_text(bytes: &[u8]) -> String {
     decode_marked_text_string(bytes, false)
 }
@@ -884,11 +885,29 @@ fn decode_marked_text_string(bytes: &[u8], unmarked_utf8: bool) -> String {
             _ => bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect(),
         }
     } else {
-        bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect()
+        unmarked_form_field_text(bytes)
     };
     let end = text.trim_end_matches('\0').len();
     text.truncate(end);
     text
+}
+
+/// Unmarked AcroForm text. Valid non-ASCII UTF-8 is kept when every byte is
+/// a PDFDoc code that is still Latin-1 (`José` is `4A 6F 73 C3 A9`). A byte
+/// PDFDoc reassigns (`C2 A0` is Â plus the euro sign) keeps the PDFDoc reading.
+fn unmarked_form_field_text(bytes: &[u8]) -> String {
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
+        if !utf8.is_ascii() && bytes.iter().all(|&byte| pdf_doc_byte_is_latin1(byte)) {
+            return utf8.to_owned();
+        }
+    }
+    bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect()
+}
+
+/// PDFDoc leaves this code as its Latin-1 character. The codes it reassigns
+/// are the spacing accents, the high punctuation and letters, and the euro.
+fn pdf_doc_byte_is_latin1(byte: u8) -> bool {
+    !matches!(byte, 0x18..=0x1F | 0x80..=0x9E | 0xA0)
 }
 
 /// Compute effective font size from base size and text matrix
