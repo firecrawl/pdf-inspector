@@ -1,5 +1,6 @@
 //! Hyperlink and AcroForm field extraction.
 
+use crate::text_utils::decode_form_field_text;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -305,7 +306,7 @@ pub(crate) fn walk_form_fields(
         .get(b"T")
         .ok()
         .and_then(|o| o.as_str().ok())
-        .map(|s| String::from_utf8_lossy(s).to_string())
+        .map(decode_form_field_text)
         .unwrap_or_default();
 
     let full_name = if parent_name.is_empty() {
@@ -378,7 +379,7 @@ pub(crate) fn walk_form_fields(
             // Text or Choice field — value is a string or array of strings
             match value {
                 Object::String(s, _) => {
-                    let s = String::from_utf8_lossy(s).to_string();
+                    let s = decode_form_field_text(s);
                     if s.is_empty() {
                         return;
                     }
@@ -389,7 +390,7 @@ pub(crate) fn walk_form_fields(
                         .iter()
                         .filter_map(|o| {
                             if let Object::String(s, _) = o {
-                                Some(String::from_utf8_lossy(s).to_string())
+                                Some(decode_form_field_text(s))
                             } else {
                                 None
                             }
@@ -738,5 +739,138 @@ mod tests {
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
         assert_eq!(items.len(), 1);
+    }
+
+    fn utf16be(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn pdf_text(bytes: Vec<u8>) -> Object {
+        Object::String(bytes, lopdf::StringFormat::Literal)
+    }
+
+    #[test]
+    fn utf16be_and_pdf_doc_field_text_decodes() {
+        // /T and /V are PDF text strings: UTF-16BE after FE FF, otherwise
+        // PDFDocEncoding (0xA0 is the euro sign, not U+00A0).
+        let mut doc = Document::new();
+        let text_field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => pdf_text(utf16be("Prénom")),
+            "V" => pdf_text(utf16be("Zoë")),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let choice_field = doc.add_object(dictionary! {
+            "FT" => "Ch",
+            "T" => Object::string_literal("price"),
+            "V" => vec![pdf_text(vec![0xA0]), Object::string_literal("5")],
+            "Rect" => vec![10.into(), 50.into(), 110.into(), 70.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(text_field), Object::Reference(choice_field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut items = extract_form_fields(&doc, &HashMap::new());
+        items.sort_by(|a, b| a.text.cmp(&b.text));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Prénom: Zoë", "price: €, 5"]
+        );
+    }
+
+    #[test]
+    fn pdf_doc_field_bytes_that_are_also_utf8_stay_pdf_doc() {
+        // C2 A0 is valid UTF-8 (U+00A0) and PDFDoc Â + euro. /T, a text
+        // /V, and a choice /V all take the PDFDoc reading.
+        let mut doc = Document::new();
+        let text_field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => pdf_text(vec![0xC2, 0xA0]),
+            "V" => pdf_text(vec![0xC2, 0xA0]),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let choice_field = doc.add_object(dictionary! {
+            "FT" => "Ch",
+            "T" => Object::string_literal("choice"),
+            "V" => vec![pdf_text(vec![0xC2, 0xA0])],
+            "Rect" => vec![10.into(), 50.into(), 110.into(), 70.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(text_field), Object::Reference(choice_field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut items = extract_form_fields(&doc, &HashMap::new());
+        items.sort_by(|a, b| a.text.cmp(&b.text));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["choice: Â€", "Â€: Â€"]
+        );
+    }
+
+    #[test]
+    fn unmarked_utf8_field_text_keeps_latin1_sequences() {
+        // `José` is UTF-8 without a mark. Every byte is a PDFDoc code that
+        // is still Latin-1, so this is a producer habit rather than `C2 A0`.
+        let mut doc = Document::new();
+        let field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("name"),
+            "V" => pdf_text(b"Jos\xC3\xA9".to_vec()),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let items = extract_form_fields(&doc, &HashMap::new());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "name: José");
+    }
+
+    #[test]
+    fn unmarked_utf8_field_text_keeps_three_byte_sequences() {
+        // `€` and an en dash are 3-byte UTF-8. Their 0x80-0x9F continuation
+        // bytes (not the euro's final 0xAC) are PDFDoc punctuation, and the
+        // whole value stays UTF-8, including the `José` in front of them. `C2 A0` is still the PDFDoc reading.
+        let mut doc = Document::new();
+        let field = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("name"),
+            "V" => pdf_text("José – 5€".as_bytes().to_vec()),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(field)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let items = extract_form_fields(&doc, &HashMap::new());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "name: José – 5€");
     }
 }
