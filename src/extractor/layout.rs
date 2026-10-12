@@ -3079,11 +3079,27 @@ fn same_style_header_row(
     let mut cells: Vec<&TextItem> = Vec::with_capacity(line.items.len() + 2);
     cells.extend(line.items.iter());
     cells.push(incoming);
+    // A lower row can sit between cells of this header in stream order.
+    // Look through a few following baselines for the rest of this one.
+    // Past that, a later short label is not evidence for this row, and the
+    // scan stays bounded. Y-sorting has already gathered a chaotic stream.
+    let mut other_baselines = 0u32;
+    let mut last_other_y: Option<f32> = None;
     for next in upcoming.iter().flatten() {
-        if next.page != incoming.page || (next.line_y() - incoming.line_y()).abs() >= y_tolerance {
-            // Same-baseline cells are adjacent: y-sorting puts them together,
-            // and a row-major stream does not come back up to this line.
+        if next.page != incoming.page {
             break;
+        }
+        let y = next.line_y();
+        if (y - incoming.line_y()).abs() >= y_tolerance {
+            let new_row = last_other_y.is_none_or(|previous| (y - previous).abs() >= y_tolerance);
+            if new_row {
+                other_baselines += 1;
+                if other_baselines > 4 {
+                    break;
+                }
+                last_other_y = Some(y);
+            }
+            continue;
         }
         if !is_header_cell(next) {
             break;
@@ -4085,6 +4101,54 @@ mod tests {
             group_single_column(vec![summary, results], 0.10, false).len(),
             2,
             "two short column leftovers still split"
+        );
+
+        // Stream order emits two header cells, a lower row, then the third.
+        let mut interrupted = Vec::new();
+        for (x, y, text) in [
+            (47.0, 459.0, "Status"),
+            (200.0, 459.0, "Description"),
+            (47.0, 440.0, "Detail"),
+            (400.0, 459.0, "Owner"),
+        ] {
+            let mut item = make_item(1, x, y, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            interrupted.push(item);
+        }
+        let interrupted_lines = group_single_column(interrupted, 0.10, false);
+        assert!(
+            interrupted_lines[0]
+                .items
+                .iter()
+                .any(|item| item.text == "Description"),
+            "a third header cell after a lower row keeps the first two together"
+        );
+
+        // The same third cell past the lookahead is not this row.
+        let mut distant = Vec::new();
+        for (x, y, text) in [
+            (47.0, 459.0, "Status"),
+            (200.0, 459.0, "Description"),
+            (47.0, 440.0, "Detail"),
+            (47.0, 420.0, "Detail"),
+            (47.0, 400.0, "Detail"),
+            (47.0, 380.0, "Detail"),
+            (47.0, 360.0, "Detail"),
+            (400.0, 459.0, "Owner"),
+        ] {
+            let mut item = make_item(1, x, y, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            distant.push(item);
+        }
+        let distant_lines = group_single_column(distant, 0.10, false);
+        assert!(
+            distant_lines[0]
+                .items
+                .iter()
+                .all(|item| item.text == "Status"),
+            "a header cell past the lookahead does not join the row"
         );
     }
 
