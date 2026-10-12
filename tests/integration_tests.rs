@@ -3550,6 +3550,149 @@ fn read_invisible_text_layer(
     process_pdf_mem_with_options(&make_pdf_with_glyph_layer(pages), options).unwrap()
 }
 
+/// A scan with a caller-supplied hidden stream and Courier's measured
+/// six-point glyph advances at 10 points, rather than a wide glyph grid.
+fn make_pdf_with_positioned_layer(layer: &str) -> Vec<u8> {
+    let mut doc = lopdf::Document::load_mem(&make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_glyphs: 0,
+        ..OCR_TOOL_SCAN
+    }]))
+    .unwrap();
+    let page = doc.get_pages()[&1];
+    let (resources, _) = doc.get_page_resources(page).unwrap();
+    let font = resources
+        .unwrap()
+        .get(b"Font")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"F1")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.get_object_mut(font)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("BaseFont", lopdf::Object::Name(b"Courier".to_vec()));
+    let mut content = doc.get_page_content(page);
+    content.extend_from_slice(layer.as_bytes());
+    let stream = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), content));
+    doc.get_object_mut(page)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Contents", stream);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_read_invisible_text_layer_preserves_positioned_word_boundaries() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    for filename in ["title-runs.pdf", "title-runs-spaced.pdf"] {
+        let bytes =
+            std::fs::read(format!("tests/fixtures/invisible-layer-quality/{filename}")).unwrap();
+        let result = process_pdf_mem_with_options(&bytes, options.clone()).unwrap();
+        assert!(
+            result.pages_needing_ocr.is_empty(),
+            "{filename}: {result:?}"
+        );
+        let markdown = result.markdown.unwrap();
+        assert_eq!(markdown.matches("Hello").count(), 20, "{filename}");
+        assert_eq!(markdown.matches("World").count(), 20, "{filename}");
+    }
+}
+
+#[test]
+fn test_read_invisible_text_layer_checks_realistic_glyph_fragments() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    for (words, kept) in [
+        ("Hello World", true),
+        (
+            "文字内容测试文字内容测试文字内容测试 eBay iPhone GitHub",
+            true,
+        ),
+        ("12345678901234567890123456789012345678901234", true),
+        ("ouLIpayda", false),
+    ] {
+        let mut layer = String::new();
+        for line in 0..20 {
+            for (column, glyph) in words.chars().enumerate() {
+                layer.push_str(&format!(
+                    "BT 3 Tr /F1 10 Tf 1 0 0 1 {} {} Tm ({glyph}) Tj ET\n",
+                    72 + column * 6,
+                    720 - line * 14
+                ));
+            }
+        }
+        let bytes = make_pdf_with_positioned_layer(&layer);
+        let result = process_pdf_mem_with_options(&bytes, options.clone()).unwrap();
+        if kept {
+            assert!(result.pages_needing_ocr.is_empty(), "{result:?}");
+            let markdown = result.markdown.unwrap();
+            let text = markdown
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>();
+            for word in words.split_whitespace() {
+                assert_eq!(text.matches(word).count(), 20, "{markdown}");
+            }
+        } else {
+            assert_eq!(result.pages_needing_ocr, vec![1]);
+            assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+            assert!(result.markdown.unwrap_or_default().is_empty());
+        }
+    }
+}
+
+#[test]
+fn test_read_invisible_text_layer_checks_short_tesseract_layers() {
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    for (case, sentence) in [
+        (
+            2,
+            "The physical properties of matter depend on the motion of atoms.",
+        ),
+        (
+            3,
+            "Several physical quantities are used to describe the motion of objects.",
+        ),
+    ] {
+        for rotated in [false, true] {
+            let direction = if rotated { "rotated" } else { "upright" };
+            let bytes = std::fs::read(format!(
+                "tests/fixtures/invisible-layer-quality/{direction}-short-{case}.pdf"
+            ))
+            .unwrap();
+            let off = process_pdf_mem(&bytes).unwrap();
+            assert_eq!(off.pages_needing_ocr, vec![1]);
+            let result = process_pdf_mem_with_options(&bytes, options.clone()).unwrap();
+            if rotated {
+                assert_eq!(result.pages_needing_ocr, vec![1], "case {case}");
+                assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
+                assert!(result.markdown.unwrap_or_default().is_empty());
+            } else {
+                assert!(
+                    result.pages_needing_ocr.is_empty(),
+                    "case {case}: {result:?}"
+                );
+                let text = result
+                    .markdown
+                    .unwrap()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(text.contains(sentence), "case {case}: {text}");
+            }
+        }
+    }
+}
+
 /// With `read_invisible_text_layer`, a stamped book returns the layers
 /// extraction keeps and sends each scan page whose layer it does not keep,
 /// or that has none, to OCR, though detection reads the book as text.
@@ -3677,9 +3820,24 @@ fn test_read_invisible_text_layer_rejects_an_upside_down_page() {
             JO UO 2OPUIOSI SSUNOOJ YSIs IeMoUTA st ABUT BOUTS azlporjed Aue pue oy Surutol ",
         ..OCR_TOOL_SCAN
     };
-    let result = read_invisible_text_layer(&[OCR_TOOL_SCAN, upside_down], None);
-    assert_eq!(result.pages_needing_ocr, vec![2]);
-    assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(2));
+    let mut layer = String::new();
+    let words = upside_down
+        .layer_text
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    for (line, words) in words.chunks(8).enumerate() {
+        layer.push_str(&format!("BT 3 Tr /F1 10 Tf 72 {} Td ", 720 - line * 14));
+        for glyph in words.join(" ").chars() {
+            layer.push_str(&format!("({glyph}) Tj "));
+        }
+        layer.push_str("ET\n");
+    }
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    let result =
+        process_pdf_mem_with_options(&make_pdf_with_positioned_layer(&layer), options).unwrap();
+    assert_eq!(result.pages_needing_ocr, vec![1]);
+    assert_eq!(result.ocr_reasons_by_page, invisible_text_layer_reasons(1));
 }
 
 /// With `read_invisible_text_layer` and a page filter, only the selected

@@ -757,13 +757,17 @@ fn extract_page(
     ) else {
         return needs_ocr(visible, layer_not_kept);
     };
-    let text: String = layer
+    // The content parser has already merged adjacent glyph fragments with
+    // its spacing rules. Keep boundaries between the resulting runs and
+    // lines instead of making word starts look like mid-word case flips.
+    let text = layer
         .0
          .0
         .iter()
         .filter(|it| !matches!(it.item_type, ItemType::Image))
         .map(|it| it.text.as_str())
-        .collect();
+        .collect::<Vec<_>>()
+        .join("\n");
     // The with-invisible pass also holds the visible items, so this is
     // what the hidden layer adds.
     let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);

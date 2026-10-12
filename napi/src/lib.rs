@@ -736,8 +736,10 @@ pub struct ProcessOptions {
     /// keeps no layer is listed in `pagesNeedingOcr` (`invisible_text_layer`,
     /// or `scanned` without a layer). Detection alone lists every page whose
     /// only text is a hidden layer; pages outside `pages` keep that listing,
-    /// which is none in a stamped book read as text. A book of hidden-layer
-    /// pages reports `Mixed`, so route on `pagesNeedingOcr`. `false` by
+    /// which is none in a stamped book read as text. Excluded pages may
+    /// still be read for folio context, without applying layer verdicts.
+    /// A book of hidden-layer pages reports `Mixed`, so route on
+    /// `pagesNeedingOcr`. `false` by
     /// default.
     pub read_invisible_text_layer: Option<bool>,
 }

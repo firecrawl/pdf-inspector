@@ -237,7 +237,12 @@ const CASE_SHIFT_LIMIT: f64 = 0.04;
 pub(crate) fn has_case_shifted_words(text: &str) -> bool {
     let mut stats = CipherGarbleStats::default();
     stats.add_text(text);
-    stats.letter_bigrams >= 100
+    // The layer gate admits 40 alphanumeric characters. A short Latin
+    // layer can still provide strong evidence: at least 20 letter pairs
+    // and three internal flips, rather than one unusual proper name.
+    stats.letter_bigrams >= 20
+        && stats.case_shift_bigrams >= 3
+        && stats.non_latin_letters <= stats.ascii_letters + stats.latin_ext_letters
         && stats.case_shift_bigrams as f64 > stats.letter_bigrams as f64 * CASE_SHIFT_LIMIT
 }
 
