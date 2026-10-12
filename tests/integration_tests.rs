@@ -6671,6 +6671,32 @@ fn owner_password_decrypts_when_it_differs_from_the_user_password() {
     );
 }
 
+/// 31 ASCII `a`s plus `é` is 32 PDFDoc bytes ending in 0xE9. Reading those
+/// bytes as UTF-8 fails, and the owner password then decrypts with the wrong key.
+#[test]
+fn owner_password_decrypts_a_pdfdoc_user_password() {
+    let user_password = format!("{}é", "a".repeat(31));
+    let pdf = pdf_encrypted_with_distinct_passwords("OwnerSecret", &user_password);
+
+    let as_owner = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("OwnerSecret"))
+        .expect("owner password should open the file");
+    let md = as_owner.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Password Protected Content"),
+        "owner password yielded type={:?} ocr={:?} md={md:?}",
+        as_owner.pdf_type,
+        as_owner.pages_needing_ocr
+    );
+    assert_ne!(as_owner.pdf_type, PdfType::Scanned);
+
+    let as_user = process_pdf_mem_with_options(&pdf, PdfOptions::new().password(&user_password))
+        .expect("user password should open the file");
+    assert!(as_user
+        .markdown
+        .unwrap_or_default()
+        .contains("Password Protected Content"));
+}
+
 fn pdf_encrypted_with_distinct_passwords(owner_password: &str, user_password: &str) -> Vec<u8> {
     use lopdf::{
         dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream,

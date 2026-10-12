@@ -4426,6 +4426,18 @@ fn decrypt_document_bytes(
     // fixes this inside lopdf is not on crates.io yet (J-F-Liu/lopdf#573,
     // merged after 0.45.0), so resolve it here before handing the password
     // back to lopdf. A user password is left unchanged.
+    //
+    // The string loader then hashes the password string's UTF-8 bytes. When
+    // the user password's PDFDoc bytes are not that UTF-8 (é is 0xE9, and the
+    // 32-byte UTF-8 prefix of 31 `a`s plus é ends in 0xC3), reload from the
+    // ciphertext with those raw bytes instead.
+    if let Some(doc) = loaded {
+        if let Some(key) = owner_password::user_password_bytes_for_file_key(doc, pw) {
+            if let Some(decrypted) = load_with_raw_file_key(buf, doc, &key) {
+                return Ok(decrypted);
+            }
+        }
+    }
     let resolved = file_key_password(pw, loaded);
     let with_password = |pw: &str| lopdf::LoadOptions {
         password: Some(pw.to_string()),
@@ -4438,6 +4450,58 @@ fn decrypt_document_bytes(
         }
         Err(inner) => Err(inner),
     }
+}
+
+/// Load `buf` so the file key is `key`, which is not the UTF-8 of any string
+/// the stock loader would hash.
+///
+/// A passwordless load keeps the encryption dictionary and drops every other
+/// object. Reloading with the trailer `/Encrypt` name masked parses those
+/// objects with their ciphertext intact; `decrypt_object` then applies `key`.
+fn load_with_raw_file_key(buf: &[u8], structural: &Document, key: &[u8]) -> Option<Document> {
+    let state = lopdf::EncryptionState::decode(structural, key).ok()?;
+    let mut patched = buf.to_vec();
+    mask_encrypt_keys(&mut patched);
+    let mut doc = Document::load_mem_with_options(&patched, bounded_load_options()).ok()?;
+    for (id, object) in doc.objects.iter_mut() {
+        lopdf::encryption::decrypt_object(&state, *id, object).ok()?;
+    }
+    if doc.get_pages().is_empty() {
+        return None;
+    }
+    Some(doc)
+}
+
+/// Rename each `/Encrypt` key that introduces an object reference so the loader
+/// does not treat the file as encrypted. The replacement is the same length,
+/// so xref offsets stay valid. Cross-reference streams store this key in the
+/// stream dictionary rather than a classic `trailer` keyword.
+fn mask_encrypt_keys(buf: &mut [u8]) {
+    let needle = b"/Encrypt";
+    let mut search_from = 0;
+    while let Some(at) = buf[search_from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let key_at = search_from + at;
+        let after = key_at + needle.len();
+        if encrypt_key_introduces_a_reference(buf, after) {
+            buf[key_at + 1] = b'X';
+        }
+        search_from = after;
+    }
+}
+
+/// `/Encrypt 7 0 R` in a trailer or cross-reference stream dictionary.
+fn encrypt_key_introduces_a_reference(buf: &[u8], after_key: usize) -> bool {
+    let mut index = after_key;
+    if index >= buf.len() || !buf[index].is_ascii_whitespace() {
+        return false;
+    }
+    while index < buf.len() && buf[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index < buf.len() && buf[index].is_ascii_digit()
 }
 
 fn file_key_password(password: &str, loaded: Option<&Document>) -> String {
