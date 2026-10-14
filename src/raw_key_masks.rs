@@ -176,7 +176,7 @@ impl<'a> Lexer<'a> {
 
     /// Skip a stream payload. `length` is the dictionary's direct `/Length`;
     /// without one, or when it does not land on `endstream`, scan for the
-    /// keyword instead.
+    /// keyword followed by `endobj` instead.
     fn skip_stream_payload(&mut self, length: Option<usize>) {
         if self.buf.get(self.pos..self.pos + 2) == Some(b"\r\n") {
             self.pos += 2;
@@ -199,7 +199,21 @@ impl<'a> Lexer<'a> {
         }
         self.pos = self.buf[self.pos.min(self.buf.len())..]
             .windows(b"endstream".len())
-            .position(|window| window == b"endstream")
+            .enumerate()
+            .position(|(at, window)| {
+                if window != b"endstream" {
+                    return false;
+                }
+                let mut following = Lexer {
+                    buf: self.buf,
+                    pos: self.pos + at + b"endstream".len(),
+                };
+                following
+                    .buf
+                    .get(following.pos)
+                    .is_some_and(|&byte| is_whitespace(byte))
+                    && matches!(following.next(), Some(Token::Keyword(ref k)) if k == b"endobj")
+            })
             .map_or(self.buf.len(), |at| self.pos + at + b"endstream".len());
     }
 
@@ -348,5 +362,31 @@ trailer\n<< /Root 1 0 R /Encrypt 7 0 R >>";
         let input: &[u8] =
             b"<< /Kids [ << /Type /ObjStm >> ] /Sub << /Encrypt 7 0 R >> /Encrypt 3 >>";
         assert_eq!(masked(input), input);
+    }
+
+    #[test]
+    fn masks_trailer_encrypt_after_an_indirect_length_stream_with_false_endstream() {
+        let input = b"2 0 obj\n<< /Length 20 0 R >>\nstream\nendstream <<\nendstream\nendobjSuffix\n/Encrypt 9 0 R\nendstream\nendobj\n20 0 obj\n50\nendobj\ntrailer\n<< /Encrypt 7 0 R >>";
+        let expected = b"2 0 obj\n<< /Length 20 0 R >>\nstream\nendstream <<\nendstream\nendobjSuffix\n/Encrypt 9 0 R\nendstream\nendobj\n20 0 obj\n50\nendobj\ntrailer\n<< /Xncrypt 7 0 R >>";
+        assert_eq!(masked(input), expected);
+    }
+
+    #[test]
+    fn masks_trailer_encrypt_after_an_incorrect_direct_length_stream() {
+        let input = b"2 0 obj\n<< /Length 1 >>\nstream\nendstream <<\n/Encrypt 9 0 R\nendstream\r\n \tendobj\ntrailer\n<< /Encrypt 7 0 R >>";
+        let expected = b"2 0 obj\n<< /Length 1 >>\nstream\nendstream <<\n/Encrypt 9 0 R\nendstream\r\n \tendobj\ntrailer\n<< /Xncrypt 7 0 R >>";
+        assert_eq!(masked(input), expected);
+    }
+
+    #[test]
+    fn uses_direct_stream_length_past_false_endstream_and_endobj() {
+        let payload = b"endstream\nendobj\n<< /Encrypt 9 0 R";
+        let input = format!(
+            "2 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\ntrailer\n<< /Encrypt 7 0 R >>",
+            payload.len(),
+            String::from_utf8_lossy(payload)
+        );
+        let expected = input.replace("trailer\n<< /Encrypt", "trailer\n<< /Xncrypt");
+        assert_eq!(masked(input.as_bytes()), expected.as_bytes());
     }
 }
