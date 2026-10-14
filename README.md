@@ -291,6 +291,8 @@ PDF arrives
 
 This saves cost and latency for the majority of PDFs that are already text-based (reports, papers, invoices, legal docs).
 
+For practical routing policies, confidence guidance, page-number conventions, binding examples, and fallback handling, see the [OCR routing guide](docs/ocr-routing.md).
+
 ## Debugging
 
 See [docs/debugging.md](docs/debugging.md) for `RUST_LOG` environment variable usage.
