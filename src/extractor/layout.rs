@@ -3091,6 +3091,15 @@ fn same_style_header_row(
         if !is_header_cell(next) {
             break;
         }
+        // Grouping starts a new line for a shifted-baseline run at the
+        // line's first X or well left of its last run, so such a run is
+        // not a cell of this row either.
+        let shifted = (next.line_y() - line.y).abs() > 0.5;
+        let first_x = cells.first().map_or(next.x, |first| first.x);
+        let last_x = cells.last().map_or(next.x, |last| last.x);
+        if shifted && ((next.x - first_x).abs() < 5.0 || next.x < last_x - 10.0) {
+            break;
+        }
         cells.push(next);
     }
     let mut clusters = 1u32;
@@ -4133,6 +4142,38 @@ mod tests {
                 .iter()
                 .all(|item| item.text == "Status"),
             "a header cell after a lower row does not keep the earlier cells together"
+        );
+    }
+
+    #[test]
+    fn unmergeable_third_cell_does_not_join_two_header_cells() {
+        // `Detail` is within 3pt of the anchor but sits at the first cell's
+        // X on a shifted baseline, so grouping puts it on its own line. It
+        // must not count as the third cell that keeps `Status` and
+        // `Description` together.
+        let mut cells = Vec::new();
+        for (x, y, text) in [
+            (47.0, 459.0, "Status"),
+            (200.0, 461.5, "Description"),
+            (47.0, 456.8, "Detail"),
+        ] {
+            let mut item = make_item(1, x, y, text);
+            item.font_size = 8.5;
+            item.width = text.len() as f32 * 4.5;
+            cells.push(item);
+        }
+        let lines = group_single_column(cells, 0.10, false);
+        assert!(
+            lines.iter().all(|line| line.items.len() == 1),
+            "no two cells share a line: {:?}",
+            lines
+                .iter()
+                .map(|line| line
+                    .items
+                    .iter()
+                    .map(|i| i.text.as_str())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
         );
     }
 
