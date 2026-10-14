@@ -3052,6 +3052,24 @@ fn is_short_header_label(text: &str) -> bool {
     (1..=3).contains(&words)
 }
 
+/// Whether `next_x` continues the order runs are visited in.
+///
+/// Y-sorting walks a baseline from left to right, including on an RTL page.
+/// Stream order follows reading order, so an RTL page continues toward `-x`.
+fn continues_in_traversal_order(
+    next_x: f32,
+    prev_x: f32,
+    page_rtl: bool,
+    use_y_sorting: bool,
+) -> bool {
+    let moves_right = next_x > prev_x;
+    if use_y_sorting {
+        moves_right
+    } else {
+        moves_right != page_rtl
+    }
+}
+
 /// Three or more same-style header cells are one row even when the gap
 /// exceeds the void split. Two cells are also how two columns end
 /// (`Summary` / `Results`), so that pair still splits. A wrapped leftover
@@ -3061,6 +3079,8 @@ fn same_style_header_row(
     incoming: &TextItem,
     upcoming: &[Option<TextItem>],
     y_tolerance: f32,
+    page_rtl: bool,
+    use_y_sorting: bool,
 ) -> bool {
     let bold = incoming.is_bold;
     let font_size = incoming.font_size;
@@ -3091,14 +3111,28 @@ fn same_style_header_row(
         if !is_header_cell(next) {
             break;
         }
-        // Grouping re-bases the font reference on this cell. A row cell
-        // outside that reference is rejected then, so this cell must not
-        // be what keeps the earlier cells together.
-        let accepts_row = cells.iter().all(|cell| {
+        // Grouping has no font test of its own. A size mismatch drops a cell
+        // only when the void split would, which also requires a word-initial
+        // run continuing in traversal order and a gap past that limit. A
+        // closer cell still joins the preceding one, so it still counts.
+        let Some(preceding) = cells.last().copied() else {
+            break;
+        };
+        let gap = horizontal_gap(preceding, next);
+        let void_limit = (next.font_size.max(preceding.font_size) * 8.0).max(100.0);
+        let continues_line =
+            continues_in_traversal_order(next.x, preceding.x, page_rtl, use_y_sorting);
+        let starts_word = next
+            .text
+            .trim()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic());
+        let font_differs = cells.iter().any(|cell| {
             let scale = cell.font_size.max(next.font_size).max(1.0);
-            (cell.font_size - next.font_size).abs() <= scale * 0.2
+            (cell.font_size - next.font_size).abs() > scale * 0.2
         });
-        if !accepts_row {
+        if font_differs && continues_line && starts_word && gap > void_limit {
             break;
         }
         // Grouping starts a new line for a shifted-baseline run at the
@@ -3124,6 +3158,46 @@ fn same_style_header_row(
             if clusters >= 3 {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// True when a same-baseline run already occupies the open gap between
+/// `last` and `item`, or one will arrive before the next baseline.
+///
+/// Grouping only joins onto the current line, so a run after a baseline
+/// break cannot fill this gap.
+fn same_baseline_run_fills_gap(
+    line: &TextLine,
+    last: &TextItem,
+    item: &TextItem,
+    upcoming: &[Option<TextItem>],
+    y_tolerance: f32,
+) -> bool {
+    let last_right = last.x + effective_width(last);
+    let item_right = item.x + effective_width(item);
+    let (gap_left, gap_right) = if last.x <= item.x {
+        (last_right, item.x)
+    } else {
+        (item_right, last.x)
+    };
+    if gap_right <= gap_left {
+        return false;
+    }
+    let overlaps_gap = |run: &TextItem| {
+        let right = run.x + effective_width(run);
+        run.x < gap_right && right > gap_left
+    };
+    if line.items.iter().any(overlaps_gap) {
+        return true;
+    }
+    for next in upcoming.iter().flatten() {
+        if next.page != line.page || (next.line_y() - line.y).abs() >= y_tolerance {
+            break;
+        }
+        if overlaps_gap(next) {
+            return true;
         }
     }
     false
@@ -3255,13 +3329,28 @@ fn group_single_column(
                     // one justified line stays together.
                     let clause_gutter =
                         gap > (item.font_size.max(last_item.font_size) * 5.0).max(50.0);
-                    // Only a run that continues in reading order. The gap is
-                    // symmetric, so an out-of-order body run looks like a
-                    // gutter until a later run fills it.
-                    let continues_line = (item.x > last_item.x) != page_rtl;
+                    // Y-sorting visits a baseline left to right, so the step
+                    // has to be read in that order. Stream order follows
+                    // reading order instead.
+                    let continues_line =
+                        continues_in_traversal_order(item.x, last_item.x, page_rtl, use_y_sorting);
+                    // A backwards step is still a column boundary when nothing
+                    // on this baseline fills the gap. Suppress the split only
+                    // for a hole a same-baseline run already occupies or will
+                    // occupy before the next baseline: two complete clauses
+                    // emitted right-column-first stay split, and a body line
+                    // whose middle run arrives later stays one line.
+                    let column_boundary = continues_line
+                        || !same_baseline_run_fills_gap(
+                            last_line,
+                            last_item,
+                            &item,
+                            &pending[index + 1..],
+                            y_tolerance,
+                        );
                     if line_wordy
                         && incoming_wordy
-                        && continues_line
+                        && column_boundary
                         && (starts_lower || style_mismatch || (both_clauses && clause_gutter))
                     {
                         return false;
@@ -3283,6 +3372,8 @@ fn group_single_column(
                             &item,
                             &pending[index + 1..],
                             y_tolerance,
+                            page_rtl,
+                            use_y_sorting,
                         )
                     {
                         return false;
@@ -4111,6 +4202,182 @@ mod tests {
     }
 
     #[test]
+    fn full_clauses_split_in_either_stream_order() {
+        // 10pt clauses: the left run ends at 259 and the right run starts at
+        // 318, a 59pt gutter under the 100pt void split. Reading order and
+        // the reversed stream both keep the columns apart. A same-baseline
+        // run that shows up only after a lower line cannot fill that gutter.
+        let mut left = make_item(
+            1,
+            42.0,
+            584.0,
+            "Left column: record source type, page count, and",
+        );
+        left.font_size = 10.0;
+        left.width = 217.0;
+        let mut right = make_item(
+            1,
+            318.0,
+            584.0,
+            "Right column: inspect tables, images, links, and reading",
+        );
+        right.font_size = 10.0;
+        right.width = 250.0;
+        for page_rtl in [false, true] {
+            for reverse in [false, true] {
+                let left_first = !page_rtl ^ reverse;
+                let items = if left_first {
+                    vec![left.clone(), right.clone()]
+                } else {
+                    vec![right.clone(), left.clone()]
+                };
+                assert_eq!(
+                    group_single_column(items, 0.10, page_rtl).len(),
+                    2,
+                    "page_rtl={page_rtl} reverse={reverse} full clauses stay split"
+                );
+            }
+        }
+
+        let mut lower = make_item(1, 42.0, 560.0, "Detail from the next row of the page");
+        lower.font_size = 10.0;
+        lower.width = 180.0;
+        let mut late = make_item(1, 260.0, 584.0, "notes");
+        late.font_size = 10.0;
+        late.width = 40.0;
+        let interrupted =
+            group_single_column(vec![right.clone(), left.clone(), lower, late], 0.10, false);
+        assert!(
+            interrupted.iter().all(|line| {
+                let has_left = line
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains("Left column"));
+                let has_right = line
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains("Right column"));
+                !(has_left && has_right)
+            }),
+            "a filler after the next baseline does not join the reversed clauses: {interrupted:?}"
+        );
+    }
+
+    #[test]
+    fn later_filler_keeps_one_line_in_either_stream_order() {
+        // Spatially one line with 4pt gaps. Each order either emits the
+        // backwards jump before the middle run, or lands that jump once the
+        // middle run is already on the line. Both stay one line on an LTR
+        // page and on an RTL page.
+        let mut left = make_item(1, 40.0, 600.0, "revenue this quarter");
+        left.width = 90.0;
+        let mut middle = make_item(1, 134.0, 600.0, "rose steadily all year");
+        middle.width = 116.0;
+        let mut right = make_item(1, 254.0, 600.0, "across every region");
+        right.width = 110.0;
+        let orders: [[usize; 3]; 4] = [
+            [2, 0, 1], // right, left, middle — filler arrives later
+            [1, 2, 0], // middle, right, left — filler is already on the line
+            [0, 2, 1], // left, right, middle — RTL backwards jump, filler later
+            [1, 0, 2], // middle, left, right — RTL jump with the filler present
+        ];
+        let page_rtl_for = [false, false, true, true];
+        let runs = [left, middle, right];
+        for (order, page_rtl) in orders.iter().zip(page_rtl_for) {
+            let items = order.map(|index| runs[index].clone());
+            let lines = group_single_column(items.to_vec(), 0.10, page_rtl);
+            let grouped: Vec<Vec<&str>> = lines
+                .iter()
+                .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
+                .collect();
+            assert_eq!(
+                grouped,
+                vec![vec![
+                    "revenue this quarter",
+                    "rose steadily all year",
+                    "across every region",
+                ]],
+                "order {order:?} page_rtl={page_rtl} stays one line"
+            );
+        }
+    }
+
+    #[test]
+    fn y_sorted_rtl_page_splits_same_baseline_gutters() {
+        // Chaotic stream order forces Y-sorting, which then visits the shared
+        // baseline from left to right. On an RTL page that step still crosses
+        // a same-style clause gutter and a column-width void.
+        let prefix: Vec<TextItem> = [700.0, 600.0, 680.0, 500.0, 640.0, 720.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, y)| make_item(1, 40.0, y, &format!("note {i}")))
+            .collect();
+        for page_rtl in [false, true] {
+            let mut clauses = prefix.clone();
+            let mut left = make_item(
+                1,
+                42.0,
+                400.0,
+                "Left column: record source type, page count, and",
+            );
+            left.font_size = 10.0;
+            left.width = 217.0;
+            let mut right = make_item(
+                1,
+                318.0,
+                400.0,
+                "Right column: inspect tables, images, links, and reading",
+            );
+            right.font_size = 10.0;
+            right.width = 250.0;
+            clauses.push(left);
+            clauses.push(right);
+            assert!(
+                should_use_y_sorting(&clauses),
+                "clause fixture must take the y-sorted path"
+            );
+            let lines = group_single_column(clauses, 0.10, page_rtl);
+            assert!(
+                lines.iter().all(|line| {
+                    let has_left = line
+                        .items
+                        .iter()
+                        .any(|item| item.text.contains("Left column"));
+                    let has_right = line
+                        .items
+                        .iter()
+                        .any(|item| item.text.contains("Right column"));
+                    !(has_left && has_right)
+                }),
+                "page_rtl={page_rtl} y-sorted clauses across a 59pt gutter stay apart"
+            );
+
+            let mut void_runs = prefix.clone();
+            let mut checksum = make_item(1, 42.0, 400.0, "checksum.");
+            checksum.font_size = 10.0;
+            checksum.width = 50.0;
+            let mut order = make_item(1, 318.0, 400.0, "order.");
+            order.font_size = 10.0;
+            order.width = 40.0;
+            void_runs.push(checksum);
+            void_runs.push(order);
+            assert!(
+                should_use_y_sorting(&void_runs),
+                "void fixture must take the y-sorted path"
+            );
+            let lines = group_single_column(void_runs, 0.10, page_rtl);
+            assert!(
+                lines.iter().all(|line| {
+                    let has_left = line.items.iter().any(|item| item.text == "checksum.");
+                    let has_right = line.items.iter().any(|item| item.text == "order.");
+                    !(has_left && has_right)
+                }),
+                "page_rtl={page_rtl} y-sorted column void stays split"
+            );
+        }
+    }
+
+    #[test]
     fn wide_table_header_stays_one_row() {
         // Header cells more than 8em and 100pt apart are still one row
         // once a third cell shows this is a row rather than two columns.
@@ -4242,6 +4509,34 @@ mod tests {
             grouped,
             vec![vec!["Status"], vec!["Description"], vec!["Owner"]],
             "a cell grouping rejects must not keep the earlier cells together"
+        );
+    }
+
+    #[test]
+    fn mixed_size_header_within_the_void_stays_one_row() {
+        // 8pt, 10pt, and 12.5pt. Owner is outside 20% of Status, but the 80pt
+        // gap is inside Owner's 100pt void limit, so grouping still appends
+        // it. That third cell keeps Status on the same row.
+        let mut cells = Vec::new();
+        for (text, x, width, font_size) in [
+            ("Status", 47.0, 30.0, 8.0),
+            ("Description", 200.0, 50.0, 10.0),
+            ("Owner", 330.0, 30.0, 12.5),
+        ] {
+            let mut item = make_item(1, x, 459.0, text);
+            item.width = width;
+            item.font_size = font_size;
+            cells.push(item);
+        }
+        let lines = group_single_column(cells, 0.10, false);
+        let grouped: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![vec!["Status", "Description", "Owner"]],
+            "a third cell grouping will append keeps the header row together"
         );
     }
 
