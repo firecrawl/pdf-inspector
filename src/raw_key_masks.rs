@@ -211,7 +211,7 @@ impl<'a> Lexer<'a> {
                 following
                     .buf
                     .get(following.pos)
-                    .is_some_and(|&byte| is_whitespace(byte))
+                    .is_some_and(|&byte| is_whitespace(byte) || byte == b'%')
                     && matches!(following.next(), Some(Token::Keyword(ref k)) if k == b"endobj")
             })
             .map_or(self.buf.len(), |at| self.pos + at + b"endstream".len());
@@ -368,6 +368,13 @@ trailer\n<< /Root 1 0 R /Encrypt 7 0 R >>";
     fn masks_trailer_encrypt_after_an_indirect_length_stream_with_false_endstream() {
         let input = b"2 0 obj\n<< /Length 20 0 R >>\nstream\nendstream <<\nendstream\nendobjSuffix\n/Encrypt 9 0 R\nendstream\nendobj\n20 0 obj\n50\nendobj\ntrailer\n<< /Encrypt 7 0 R >>";
         let expected = b"2 0 obj\n<< /Length 20 0 R >>\nstream\nendstream <<\nendstream\nendobjSuffix\n/Encrypt 9 0 R\nendstream\nendobj\n20 0 obj\n50\nendobj\ntrailer\n<< /Xncrypt 7 0 R >>";
+        assert_eq!(masked(input), expected);
+    }
+
+    #[test]
+    fn masks_trailer_encrypt_after_an_indirect_length_stream_with_endstream_comment() {
+        let input = b"2 0 obj\n<< /Length 20 0 R >>\nstream\n/Encrypt 9 0 R\nendstream%comment\nendobj\n20 0 obj\n15\nendobj\ntrailer\n<< /Encrypt 7 0 R >>";
+        let expected = b"2 0 obj\n<< /Length 20 0 R >>\nstream\n/Encrypt 9 0 R\nendstream%comment\nendobj\n20 0 obj\n15\nendobj\ntrailer\n<< /Xncrypt 7 0 R >>";
         assert_eq!(masked(input), expected);
     }
 
