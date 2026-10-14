@@ -3091,6 +3091,16 @@ fn same_style_header_row(
         if !is_header_cell(next) {
             break;
         }
+        // Grouping re-bases the font reference on this cell. A row cell
+        // outside that reference is rejected then, so this cell must not
+        // be what keeps the earlier cells together.
+        let accepts_row = cells.iter().all(|cell| {
+            let scale = cell.font_size.max(next.font_size).max(1.0);
+            (cell.font_size - next.font_size).abs() <= scale * 0.2
+        });
+        if !accepts_row {
+            break;
+        }
         // Grouping starts a new line for a shifted-baseline run at the
         // line's first X or well left of its last run, so such a run is
         // not a cell of this row either.
@@ -3245,8 +3255,13 @@ fn group_single_column(
                     // one justified line stays together.
                     let clause_gutter =
                         gap > (item.font_size.max(last_item.font_size) * 5.0).max(50.0);
+                    // Only a run that continues in reading order. The gap is
+                    // symmetric, so an out-of-order body run looks like a
+                    // gutter until a later run fills it.
+                    let continues_line = (item.x > last_item.x) != page_rtl;
                     if line_wordy
                         && incoming_wordy
+                        && continues_line
                         && (starts_lower || style_mismatch || (both_clauses && clause_gutter))
                     {
                         return false;
@@ -3260,9 +3275,6 @@ fn group_single_column(
                     // wrapped sentence. `checksum.` beside `iii` still splits.
                     let folio_on_entry = roman_folio_beside_entry(last_item, &line_text, &item)
                         || roman_folio_beside_entry(&item, item.text.trim(), last_item);
-                    // Only a run that continues in reading order: an
-                    // out-of-order stream fills the void in later.
-                    let continues_line = (item.x > last_item.x) != page_rtl;
                     if gap > (item.font_size.max(last_item.font_size) * 8.0).max(100.0)
                         && continues_line
                         && !folio_on_entry
@@ -4072,6 +4084,33 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_body_runs_with_word_gaps_stay_one_line() {
+        // Stream order is right, left, middle. Spatially one line with two
+        // 4pt gaps. A symmetric gap against the right-hand run must not split
+        // the line before the middle run arrives to fill it.
+        let mut right = make_item(1, 254.0, 600.0, "across every region");
+        right.width = 110.0;
+        let mut left = make_item(1, 40.0, 600.0, "revenue this quarter");
+        left.width = 90.0;
+        let mut middle = make_item(1, 134.0, 600.0, "rose steadily all year");
+        middle.width = 116.0;
+        let lines = group_single_column(vec![right, left, middle], 0.10, false);
+        let grouped: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![vec![
+                "revenue this quarter",
+                "rose steadily all year",
+                "across every region",
+            ]],
+            "out-of-order body runs with word spaces stay one line"
+        );
+    }
+
+    #[test]
     fn wide_table_header_stays_one_row() {
         // Header cells more than 8em and 100pt apart are still one row
         // once a third cell shows this is a row rather than two columns.
@@ -4174,6 +4213,35 @@ mod tests {
                     .map(|i| i.text.as_str())
                     .collect::<Vec<_>>())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn drifting_header_sizes_do_not_share_a_row() {
+        // 8pt, 10pt, and 12.5pt. Neighbors sit on the 20% boundary, but
+        // Owner is not the same face as Status. Grouping will not add Owner
+        // to that row, so it must not count as the third cell that keeps
+        // Status and Description together.
+        let mut cells = Vec::new();
+        for (text, x, width, font_size) in [
+            ("Status", 47.0, 30.0, 8.0),
+            ("Description", 200.0, 50.0, 10.0),
+            ("Owner", 400.0, 30.0, 12.5),
+        ] {
+            let mut item = make_item(1, x, 459.0, text);
+            item.width = width;
+            item.font_size = font_size;
+            cells.push(item);
+        }
+        let lines = group_single_column(cells, 0.10, false);
+        let grouped: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![vec!["Status"], vec!["Description"], vec!["Owner"]],
+            "a cell grouping rejects must not keep the earlier cells together"
         );
     }
 
