@@ -43,6 +43,7 @@ pub mod markdown;
 mod overlong_numerals;
 mod owner_password;
 pub mod process_mode;
+mod raw_key_masks;
 pub mod structure_tree;
 pub mod tables;
 mod text_quality;
@@ -4475,8 +4476,7 @@ fn decrypt_document_bytes(
 fn load_with_raw_file_key(buf: &[u8], structural: &Document, key: &[u8]) -> Option<Document> {
     let state = lopdf::EncryptionState::decode(structural, key).ok()?;
     let mut patched = buf.to_vec();
-    mask_encrypt_keys(&mut patched);
-    mask_object_stream_types(&mut patched);
+    raw_key_masks::mask_encrypt_and_object_streams(&mut patched);
     let mut doc = Document::load_mem_with_options(&patched, bounded_load_options()).ok()?;
     for (id, object) in doc.objects.iter_mut() {
         lopdf::encryption::decrypt_object(&state, *id, object).ok()?;
@@ -4488,32 +4488,6 @@ fn load_with_raw_file_key(buf: &[u8], structural: &Document, key: &[u8]) -> Opti
         return None;
     }
     Some(doc)
-}
-
-/// Rename `/Type /ObjStm` to `/Type /XbjStm` so the loader keeps the stream.
-/// The replacement is the same length, so xref offsets stay valid.
-fn mask_object_stream_types(buf: &mut [u8]) {
-    let needle = b"/ObjStm";
-    let mut search_from = 0;
-    while let Some(at) = buf[search_from..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        let slash_at = search_from + at;
-        if type_name_introduces_object_stream(buf, slash_at) {
-            buf[slash_at + 1..slash_at + needle.len()].copy_from_slice(b"XbjStm");
-        }
-        search_from = slash_at + needle.len();
-    }
-}
-
-/// `/Type` immediately before `/ObjStm`, with only whitespace between them.
-fn type_name_introduces_object_stream(buf: &[u8], slash_at: usize) -> bool {
-    let mut index = slash_at;
-    while index > 0 && buf[index - 1].is_ascii_whitespace() {
-        index -= 1;
-    }
-    index >= b"/Type".len() && &buf[index - b"/Type".len()..index] == b"/Type"
 }
 
 /// Restore masked object streams and add the objects they contain. `false`
@@ -4541,38 +4515,6 @@ fn expand_masked_object_streams(doc: &mut Document) -> bool {
         doc.objects.entry(id).or_insert(entry);
     }
     true
-}
-
-/// Rename each `/Encrypt` key that introduces an object reference so the loader
-/// does not treat the file as encrypted. The replacement is the same length,
-/// so xref offsets stay valid. Cross-reference streams store this key in the
-/// stream dictionary rather than a classic `trailer` keyword.
-fn mask_encrypt_keys(buf: &mut [u8]) {
-    let needle = b"/Encrypt";
-    let mut search_from = 0;
-    while let Some(at) = buf[search_from..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        let key_at = search_from + at;
-        let after = key_at + needle.len();
-        if encrypt_key_introduces_a_reference(buf, after) {
-            buf[key_at + 1] = b'X';
-        }
-        search_from = after;
-    }
-}
-
-/// `/Encrypt 7 0 R` in a trailer or cross-reference stream dictionary.
-fn encrypt_key_introduces_a_reference(buf: &[u8], after_key: usize) -> bool {
-    let mut index = after_key;
-    if index >= buf.len() || !buf[index].is_ascii_whitespace() {
-        return false;
-    }
-    while index < buf.len() && buf[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    index < buf.len() && buf[index].is_ascii_digit()
 }
 
 fn file_key_password(password: &str, loaded: Option<&Document>) -> String {

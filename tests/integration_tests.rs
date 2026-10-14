@@ -6802,6 +6802,84 @@ fn owner_password_keeps_a_page_stored_in_an_object_stream() {
     assert_object_stream_page(&pdfdoc, &user_password);
 }
 
+/// The same fixture with the object stream's `/Type` entry spelled through a
+/// comment or a `#` escape, which the raw-key reload has to mask as well.
+/// The PDFDoc user password forces that reload; it used to leave these
+/// spellings alone, so lopdf dropped the encrypted stream and page 2 with it.
+#[test]
+fn owner_password_keeps_an_object_stream_page_under_other_type_spellings() {
+    let user_password = format!("{}é", "a".repeat(31));
+    let pdfdoc = pdf_with_page_in_encrypted_object_stream("OwnerSecret", &user_password);
+    for spelling in ["/Type%note\n/ObjStm", "/Type /Obj#53tm", "/Typ#65 /ObjStm"] {
+        let respelled = respell_object_stream_type(&pdfdoc, spelling);
+        assert_object_stream_page(&respelled, "OwnerSecret");
+        assert_object_stream_page(&respelled, &user_password);
+    }
+}
+
+/// Append an incremental update that rewrites the object stream with its
+/// `/Type/ObjStm` entry replaced by `spelling`. The payload bytes are copied
+/// unchanged, so they stay encrypted under the same object number.
+fn respell_object_stream_type(pdf: &[u8], spelling: &str) -> Vec<u8> {
+    let type_at = pdf
+        .windows(12)
+        .position(|window| window == b"/Type/ObjStm")
+        .expect("fixture object stream");
+    let header_at = pdf[..type_at]
+        .windows(4)
+        .rposition(|window| window == b"obj\n")
+        .expect("object header");
+    let line_start = pdf[..header_at]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |at| at + 1);
+    let end = type_at
+        + pdf[type_at..]
+            .windows(7)
+            .position(|window| window == b"endobj\n")
+            .expect("endobj")
+        + 7;
+    let header = String::from_utf8(pdf[line_start..header_at].to_vec()).expect("header");
+    let object_number: u32 = header
+        .split_whitespace()
+        .next()
+        .and_then(|number| number.parse().ok())
+        .expect("object number");
+
+    let trailer_at = pdf
+        .windows(8)
+        .rposition(|window| window == b"trailer\n")
+        .expect("trailer");
+    let trailer_end = trailer_at
+        + pdf[trailer_at..]
+            .windows(9)
+            .position(|window| window == b"startxref")
+            .expect("startxref");
+    let trailer = String::from_utf8_lossy(&pdf[trailer_at..trailer_end]).into_owned();
+    let prev = last_startxref(pdf).expect("startxref");
+    let prev_at = trailer.find("/Prev ").expect("/Prev") + "/Prev ".len();
+    let prev_end = prev_at
+        + trailer[prev_at..]
+            .find(|c: char| !c.is_ascii_digit())
+            .expect("prev end");
+    let trailer = format!("{}{prev}{}", &trailer[..prev_at], &trailer[prev_end..]);
+
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let object_at = out.len();
+    out.extend_from_slice(&pdf[line_start..type_at]);
+    out.extend_from_slice(spelling.as_bytes());
+    out.extend_from_slice(&pdf[type_at + 12..end]);
+    let xref_at = out.len();
+    out.extend_from_slice(
+        format!("xref\n{object_number} 1\n{object_at:010} 00000 n \n{trailer}startxref\n{xref_at}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 fn assert_object_stream_page(pdf: &[u8], password: &str) {
     let opened = process_pdf_mem_with_options(pdf, PdfOptions::new().password(password))
         .unwrap_or_else(|err| panic!("password {password:?} should open the file: {err:?}"));
