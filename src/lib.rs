@@ -41,7 +41,9 @@ pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
 mod overlong_numerals;
+mod owner_password;
 pub mod process_mode;
+mod raw_key_masks;
 pub mod structure_tree;
 pub mod tables;
 mod text_quality;
@@ -4396,9 +4398,9 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
         // an encryption error. Handle both by re-loading with the password.
-        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password),
+        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(buf, password, Some(&doc)),
         Ok(doc) => Ok(doc),
-        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password),
+        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(buf, password, None),
         Err(e) => Err(e),
     }
 }
@@ -4406,18 +4408,128 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// Re-load an encrypted PDF, decrypting with `password`. Falls back to the
 /// empty password (owner-only encryption, the common "protected" case) when a
 /// non-empty password was supplied but rejected.
-fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
+///
+/// `loaded` is the structural parse, when that parse succeeded with
+/// `is_encrypted()` still true. Owner-password recovery reads `/O` from it.
+/// When the passwordless parse fails with an encryption error there is no
+/// structural document to recover from, and loading with `password` here would
+/// authenticate and strip `/Encrypt` before Algorithm 7 can run — so recovery
+/// is skipped and the supplied password is used as-is.
+fn decrypt_document_bytes(
+    buf: &[u8],
+    password: Option<&str>,
+    loaded: Option<&Document>,
+) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
+    // lopdf 0.45.0 accepts an owner password, then derives the file key from
+    // that literal password. Algorithm 2 needs the user password, which
+    // Algorithm 7 recovers from `/O` when the two differ. The release that
+    // fixes this inside lopdf is not on crates.io yet (J-F-Liu/lopdf#573,
+    // merged after 0.45.0), so resolve it here before handing the password
+    // back to lopdf. A user password is left unchanged.
+    //
+    // The string loader then hashes the password string's UTF-8 bytes. When
+    // the user password's PDFDoc bytes are not that UTF-8 (é is 0xE9, and the
+    // 32-byte UTF-8 prefix of 31 `a`s plus é ends in 0xC3), reload from the
+    // ciphertext with those raw bytes instead. A recovered password whose
+    // bytes are already UTF-8 stays on the string loader: that path decrypts
+    // an object stream before expanding it. The raw reload parses ciphertext
+    // first, and lopdf drops an object stream it cannot expand, so a later
+    // page stored there would be missing while an earlier direct page made
+    // the load look successful.
     let with_password = |pw: &str| lopdf::LoadOptions {
         password: Some(pw.to_string()),
         ..bounded_load_options()
     };
-    match Document::load_mem_with_options(buf, with_password(pw)) {
+    if let Some(doc) = loaded {
+        if let Some(key) = owner_password::user_password_bytes_for_file_key(doc, pw) {
+            if let Ok(utf8) = std::str::from_utf8(&key) {
+                if let Ok(decrypted) = Document::load_mem_with_options(buf, with_password(utf8)) {
+                    return Ok(decrypted);
+                }
+            }
+            if let Some(decrypted) = load_with_raw_file_key(buf, doc, &key) {
+                return Ok(decrypted);
+            }
+        }
+    }
+    let resolved = file_key_password(pw, loaded);
+    match Document::load_mem_with_options(buf, with_password(&resolved)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
             Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
         }
         Err(inner) => Err(inner),
+    }
+}
+
+/// Load `buf` so the file key is `key`, which is not the UTF-8 of any string
+/// the stock loader would hash.
+///
+/// A passwordless load keeps the encryption dictionary and drops every other
+/// object. Reloading with the trailer `/Encrypt` name masked parses those
+/// objects with their ciphertext intact; `decrypt_object` then applies `key`.
+///
+/// An object stream would be expanded during that reload, before its bytes
+/// are decrypted, and a failed expansion drops the stream. Its type name is
+/// masked for the reload and restored once the stream decrypts.
+fn load_with_raw_file_key(buf: &[u8], structural: &Document, key: &[u8]) -> Option<Document> {
+    let state = lopdf::EncryptionState::decode(structural, key).ok()?;
+    let mut patched = buf.to_vec();
+    raw_key_masks::mask_encrypt_and_object_streams(&mut patched);
+    let mut doc = Document::load_mem_with_options(&patched, bounded_load_options()).ok()?;
+    for (id, object) in doc.objects.iter_mut() {
+        lopdf::encryption::decrypt_object(&state, *id, object).ok()?;
+    }
+    if !expand_masked_object_streams(&mut doc) {
+        return None;
+    }
+    if doc.get_pages().is_empty() {
+        return None;
+    }
+    Some(doc)
+}
+
+/// Restore masked object streams and add the objects they contain. `false`
+/// means a masked stream did not decode, so the caller must not keep a
+/// document that is missing those objects.
+fn expand_masked_object_streams(doc: &mut Document) -> bool {
+    let mut recovered = Vec::new();
+    for object in doc.objects.values_mut() {
+        let Ok(stream) = object.as_stream_mut() else {
+            continue;
+        };
+        let Ok(name) = stream.dict.get(b"Type").and_then(lopdf::Object::as_name) else {
+            continue;
+        };
+        if name != b"XbjStm" {
+            continue;
+        }
+        stream.dict.set("Type", "ObjStm");
+        match lopdf::ObjectStream::new_with_limit(stream, Some(MAX_STREAM_DECOMPRESSED_BYTES)) {
+            Ok(parsed) => recovered.extend(parsed.objects),
+            Err(_) => return false,
+        }
+    }
+    for (id, entry) in recovered {
+        doc.objects.entry(id).or_insert(entry);
+    }
+    true
+}
+
+fn file_key_password(password: &str, loaded: Option<&Document>) -> String {
+    if password.is_empty() {
+        return String::new();
+    }
+    // Only the structural passwordless document still has `/Encrypt`. For the
+    // R2–R4 Standard files this recovery targets, that load succeeds with
+    // `is_encrypted()` true (see `load_document_bytes`). A second passwordless
+    // parse cannot succeed after the first already failed, and a passworded
+    // parse strips `/Encrypt`, so leave the supplied password unchanged.
+    match loaded {
+        Some(doc) => owner_password::user_password_for_file_key(doc, password)
+            .unwrap_or_else(|| password.to_string()),
+        None => password.to_string(),
     }
 }
 

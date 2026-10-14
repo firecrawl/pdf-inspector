@@ -6638,6 +6638,715 @@ fn encrypted_pdf_decrypts_with_correct_password() {
     );
 }
 
+/// Regression for #524. lopdf 0.45.0 authenticates a distinct owner password
+/// and then derives the file key from that password, so the text comes out
+/// empty and the file is classified as scanned. The user password Algorithm 7
+/// recovers from `/O` is what has to be decrypted with.
+#[test]
+fn owner_password_decrypts_when_it_differs_from_the_user_password() {
+    let pdf = pdf_encrypted_with_distinct_passwords("OwnerSecret", "usersecret");
+
+    let as_owner = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("OwnerSecret"))
+        .expect("owner password should open the file");
+    let md = as_owner.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Password Protected Content"),
+        "owner password yielded type={:?} ocr={:?} md={md:?}",
+        as_owner.pdf_type,
+        as_owner.pages_needing_ocr
+    );
+    assert_ne!(as_owner.pdf_type, PdfType::Scanned);
+
+    let as_user = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("usersecret"))
+        .expect("user password should open the file");
+    assert!(as_user
+        .markdown
+        .unwrap_or_default()
+        .contains("Password Protected Content"));
+
+    let wrong = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("nope"));
+    assert!(
+        matches!(wrong, Err(PdfError::Encrypted)),
+        "wrong password should stay encrypted, got {wrong:?}"
+    );
+}
+
+/// Revision 6 hashes the UTF-8 password. Rewriting it as PDFDocEncoding
+/// would change `José` before the file key is derived.
+#[test]
+fn revision_6_user_password_keeps_its_utf8_bytes() {
+    let pdf = pdf_encrypted_revision_6("OwnerKey", "José");
+
+    let as_user = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("José"))
+        .expect("user password should open the revision 6 file");
+    let md = as_user.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Password Protected Content"),
+        "user password yielded type={:?} md={md:?}",
+        as_user.pdf_type
+    );
+
+    let as_owner = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("OwnerKey"))
+        .expect("owner password should open the revision 6 file");
+    assert!(as_owner
+        .markdown
+        .unwrap_or_default()
+        .contains("Password Protected Content"));
+}
+
+fn pdf_encrypted_revision_6(owner_password: &str, user_password: &str) -> Vec<u8> {
+    use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
+    use lopdf::{
+        dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let mut doc = Document::with_version("2.0");
+    let id = Object::String(b"0123456789abcdef".to_vec(), lopdf::StringFormat::Literal);
+    doc.trailer.set("ID", vec![id.clone(), id]);
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content = b"BT /F1 24 Tf 72 720 Td (Password Protected Content) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let page_id = doc.new_object_id();
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![Object::Reference(page_id)],
+        "Count" => 1,
+    });
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Reference(resources_id),
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+    let file_encryption_key = *b"0123456789abcdef0123456789abcdef";
+    let state = EncryptionState::try_from(EncryptionVersion::V5 {
+        encrypt_metadata: true,
+        crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
+        file_encryption_key: &file_encryption_key,
+        stream_filter: b"StdCF".to_vec(),
+        string_filter: b"StdCF".to_vec(),
+        owner_password,
+        user_password,
+        permissions: Permissions::all(),
+    })
+    .expect("revision 6 encryption state");
+    doc.encrypt(&state).expect("encrypt");
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save");
+    out
+}
+
+/// 31 ASCII `a`s plus `é` is 32 PDFDoc bytes ending in 0xE9. Reading those
+/// bytes as UTF-8 fails, and the owner password then decrypts with the wrong key.
+#[test]
+fn owner_password_decrypts_a_pdfdoc_user_password() {
+    let user_password = format!("{}é", "a".repeat(31));
+    let pdf = pdf_encrypted_with_distinct_passwords("OwnerSecret", &user_password);
+
+    let as_owner = process_pdf_mem_with_options(&pdf, PdfOptions::new().password("OwnerSecret"))
+        .expect("owner password should open the file");
+    let md = as_owner.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Password Protected Content"),
+        "owner password yielded type={:?} ocr={:?} md={md:?}",
+        as_owner.pdf_type,
+        as_owner.pages_needing_ocr
+    );
+    assert_ne!(as_owner.pdf_type, PdfType::Scanned);
+
+    let as_user = process_pdf_mem_with_options(&pdf, PdfOptions::new().password(&user_password))
+        .expect("user password should open the file");
+    assert!(as_user
+        .markdown
+        .unwrap_or_default()
+        .contains("Password Protected Content"));
+}
+
+/// Page 1 is a direct object and page 2 lives in an encrypted object stream.
+/// The raw-key reload used to drop that stream, keep page 1, and return a
+/// document that never contained page 2.
+#[test]
+fn owner_password_keeps_a_page_stored_in_an_object_stream() {
+    let ascii = pdf_with_page_in_encrypted_object_stream("OwnerSecret", "usersecret");
+    assert!(
+        ascii.windows(7).any(|window| window == b"/ObjStm"),
+        "fixture should store a page in an object stream"
+    );
+    assert_object_stream_page(&ascii, "OwnerSecret");
+    assert_object_stream_page(&ascii, "usersecret");
+
+    let user_password = format!("{}é", "a".repeat(31));
+    let pdfdoc = pdf_with_page_in_encrypted_object_stream("OwnerSecret", &user_password);
+    assert_object_stream_page(&pdfdoc, "OwnerSecret");
+    assert_object_stream_page(&pdfdoc, &user_password);
+}
+
+/// The same fixture with the object stream's `/Type` entry spelled through a
+/// comment or a `#` escape, which the raw-key reload has to mask as well.
+/// The PDFDoc user password forces that reload; it used to leave these
+/// spellings alone, so lopdf dropped the encrypted stream and page 2 with it.
+#[test]
+fn owner_password_keeps_an_object_stream_page_under_other_type_spellings() {
+    let user_password = format!("{}é", "a".repeat(31));
+    let pdfdoc = pdf_with_page_in_encrypted_object_stream("OwnerSecret", &user_password);
+    for spelling in ["/Type%note\n/ObjStm", "/Type /Obj#53tm", "/Typ#65 /ObjStm"] {
+        let respelled = respell_object_stream_type(&pdfdoc, spelling);
+        assert_object_stream_page(&respelled, "OwnerSecret");
+        assert_object_stream_page(&respelled, &user_password);
+    }
+}
+
+/// Append an incremental update that rewrites the object stream with its
+/// `/Type/ObjStm` entry replaced by `spelling`. The payload bytes are copied
+/// unchanged, so they stay encrypted under the same object number.
+fn respell_object_stream_type(pdf: &[u8], spelling: &str) -> Vec<u8> {
+    let type_at = pdf
+        .windows(12)
+        .position(|window| window == b"/Type/ObjStm")
+        .expect("fixture object stream");
+    let header_at = pdf[..type_at]
+        .windows(4)
+        .rposition(|window| window == b"obj\n")
+        .expect("object header");
+    let line_start = pdf[..header_at]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |at| at + 1);
+    let end = type_at
+        + pdf[type_at..]
+            .windows(7)
+            .position(|window| window == b"endobj\n")
+            .expect("endobj")
+        + 7;
+    let header = String::from_utf8(pdf[line_start..header_at].to_vec()).expect("header");
+    let object_number: u32 = header
+        .split_whitespace()
+        .next()
+        .and_then(|number| number.parse().ok())
+        .expect("object number");
+
+    let trailer_at = pdf
+        .windows(8)
+        .rposition(|window| window == b"trailer\n")
+        .expect("trailer");
+    let trailer_end = trailer_at
+        + pdf[trailer_at..]
+            .windows(9)
+            .position(|window| window == b"startxref")
+            .expect("startxref");
+    let trailer = String::from_utf8_lossy(&pdf[trailer_at..trailer_end]).into_owned();
+    let prev = last_startxref(pdf).expect("startxref");
+    let prev_at = trailer.find("/Prev ").expect("/Prev") + "/Prev ".len();
+    let prev_end = prev_at
+        + trailer[prev_at..]
+            .find(|c: char| !c.is_ascii_digit())
+            .expect("prev end");
+    let trailer = format!("{}{prev}{}", &trailer[..prev_at], &trailer[prev_end..]);
+
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let object_at = out.len();
+    out.extend_from_slice(&pdf[line_start..type_at]);
+    out.extend_from_slice(spelling.as_bytes());
+    out.extend_from_slice(&pdf[type_at + 12..end]);
+    let xref_at = out.len();
+    out.extend_from_slice(
+        format!("xref\n{object_number} 1\n{object_at:010} 00000 n \n{trailer}startxref\n{xref_at}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+fn assert_object_stream_page(pdf: &[u8], password: &str) {
+    let opened = process_pdf_mem_with_options(pdf, PdfOptions::new().password(password))
+        .unwrap_or_else(|err| panic!("password {password:?} should open the file: {err:?}"));
+    let md = opened.markdown.unwrap_or_default();
+    assert!(
+        md.contains("Direct Page") && md.contains("Compressed Page"),
+        "password {password:?} yielded type={:?} pages_needing_ocr={:?} md={md:?}",
+        opened.pdf_type,
+        opened.pages_needing_ocr
+    );
+}
+
+fn pdf_encrypted_with_distinct_passwords(owner_password: &str, user_password: &str) -> Vec<u8> {
+    use lopdf::{
+        dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream,
+    };
+
+    let mut doc = Document::with_version("1.4");
+    let id = Object::String(b"0123456789abcdef".to_vec(), lopdf::StringFormat::Literal);
+    doc.trailer.set("ID", vec![id.clone(), id]);
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content = b"BT /F1 24 Tf 72 720 Td (Password Protected Content) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let page_id = doc.new_object_id();
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![Object::Reference(page_id)],
+        "Count" => 1,
+    });
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Reference(resources_id),
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    let state = EncryptionState::try_from(EncryptionVersion::V2 {
+        document: &doc,
+        owner_password,
+        user_password,
+        key_length: 128,
+        permissions: Permissions::all(),
+    })
+    .expect("encryption state");
+    doc.encrypt(&state).expect("encrypt");
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save");
+    out
+}
+
+/// Two-page PDF whose second page dictionary is inside an object stream.
+///
+/// lopdf will not write object streams into a file that is already encrypted,
+/// so this saves the modern file first, RC4-encrypts each non-xref stream in
+/// place (the ciphertext is the same length), and appends the encryption
+/// dictionary as an incremental update. Page 1's dictionary uses a non-zero
+/// generation so the writer leaves it outside the object stream.
+fn pdf_with_page_in_encrypted_object_stream(owner_password: &str, user_password: &str) -> Vec<u8> {
+    use lopdf::{
+        dictionary, Dictionary, Document, EncryptionState, EncryptionVersion, Object, Permissions,
+        Stream,
+    };
+
+    let mut doc = Document::with_version("1.5");
+    let file_id = Object::String(b"0123456789abcdef".to_vec(), lopdf::StringFormat::Literal);
+    doc.trailer
+        .set("ID", vec![file_id.clone(), file_id.clone()]);
+
+    fn add_direct(doc: &mut Document, object: Object) -> Object {
+        doc.max_id += 1;
+        let id = (doc.max_id, 1);
+        doc.objects.insert(id, object);
+        Object::Reference(id)
+    }
+
+    let font = add_direct(
+        &mut doc,
+        Object::Dictionary(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }),
+    );
+    let resources = add_direct(
+        &mut doc,
+        Object::Dictionary(dictionary! {
+            "Font" => dictionary! { "F1" => font },
+        }),
+    );
+    let direct_content = b"BT /F1 24 Tf 72 720 Td (Direct Page) Tj ET";
+    let direct_contents = add_direct(
+        &mut doc,
+        Object::Stream(Stream::new(Dictionary::new(), direct_content.to_vec())),
+    );
+    let compressed_content = b"BT /F1 24 Tf 72 640 Td (Compressed Page) Tj ET";
+    let compressed_contents = add_direct(
+        &mut doc,
+        Object::Stream(Stream::new(Dictionary::new(), compressed_content.to_vec())),
+    );
+    let page1 = add_direct(
+        &mut doc,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => direct_contents,
+            "Resources" => resources.clone(),
+        }),
+    );
+    doc.max_id += 1;
+    let page2_id = (doc.max_id, 0);
+    let page2 = Object::Reference(page2_id);
+    doc.objects.insert(
+        page2_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => compressed_contents,
+            "Resources" => resources,
+        }),
+    );
+    let pages = add_direct(
+        &mut doc,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page1.clone(), page2],
+            "Count" => 2,
+        }),
+    );
+    // Parent is filled after `pages` exists. Both page dictionaries need it,
+    // and page 2's copy is the one the object stream will store.
+    if let Ok(page) = doc
+        .get_object_mut((page2_id.0, page2_id.1))
+        .and_then(Object::as_dict_mut)
+    {
+        page.set("Parent", pages.clone());
+    }
+    if let Object::Reference(page1_id) = page1 {
+        if let Ok(page) = doc.get_object_mut(page1_id).and_then(Object::as_dict_mut) {
+            page.set("Parent", pages.clone());
+        }
+    }
+    let catalog = add_direct(
+        &mut doc,
+        Object::Dictionary(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages,
+        }),
+    );
+    doc.trailer.set("Root", catalog);
+
+    let mut plain = Vec::new();
+    doc.save_modern(&mut plain).expect("save object streams");
+    let loaded = Document::load_mem(&plain).expect("reload modern pdf");
+    let state = EncryptionState::try_from(EncryptionVersion::V2 {
+        document: &loaded,
+        owner_password,
+        user_password,
+        key_length: 128,
+        permissions: Permissions::all(),
+    })
+    .expect("encryption state");
+    encrypt_streams_in_place(&mut plain, &state);
+    append_encrypt_dictionary(&mut plain, &loaded, &state);
+    plain
+}
+
+fn encrypt_streams_in_place(buf: &mut [u8], state: &lopdf::EncryptionState) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some(header) = find_object_header(&buf[pos..]) else {
+            break;
+        };
+        let after_header = pos + header.header_end;
+        let Some(stream_at) = find_stream_keyword(&buf[after_header..]) else {
+            pos = after_header;
+            continue;
+        };
+        let dict = &buf[after_header..after_header + stream_at];
+        if dict.windows(6).any(|window| window == b"endobj") {
+            pos = after_header;
+            continue;
+        }
+        let keyword = after_header + stream_at;
+        let after_keyword = keyword + b"stream".len();
+        let content_at = if buf.get(after_keyword..after_keyword + 2) == Some(b"\r\n") {
+            after_keyword + 2
+        } else if buf.get(after_keyword) == Some(&b'\n') {
+            after_keyword + 1
+        } else {
+            pos = after_keyword;
+            continue;
+        };
+        let Some(length) = direct_length(dict) else {
+            pos = content_at;
+            continue;
+        };
+        let content_end = content_at + length;
+        if content_end > buf.len() {
+            break;
+        }
+        if !dict.windows(5).any(|window| window == b"/XRef") {
+            let mut object = lopdf::Object::Stream(lopdf::Stream::new(
+                lopdf::Dictionary::new(),
+                buf[content_at..content_end].to_vec(),
+            ));
+            lopdf::encryption::encrypt_object(
+                state,
+                (header.number, header.generation),
+                &mut object,
+            )
+            .expect("encrypt stream");
+            let encrypted = object.as_stream().expect("stream").content.clone();
+            assert_eq!(
+                encrypted.len(),
+                length,
+                "RC4 stream ciphertext keeps its length"
+            );
+            buf[content_at..content_end].copy_from_slice(&encrypted);
+        }
+        pos = content_end;
+    }
+}
+
+struct ObjectHeader {
+    number: u32,
+    generation: u16,
+    header_end: usize,
+}
+
+fn find_object_header(buf: &[u8]) -> Option<ObjectHeader> {
+    let mut index = 0;
+    while index < buf.len() {
+        if !buf[index].is_ascii_digit() || (index > 0 && !buf[index - 1].is_ascii_whitespace()) {
+            index += 1;
+            continue;
+        }
+        let Some(number_end) = read_digits(buf, index) else {
+            index += 1;
+            continue;
+        };
+        if buf.get(number_end) != Some(&b' ') {
+            index = number_end;
+            continue;
+        }
+        let generation_at = number_end + 1;
+        let Some(generation_end) = read_digits(buf, generation_at) else {
+            index = generation_at;
+            continue;
+        };
+        if buf.get(generation_end..generation_end + 4) != Some(b" obj") {
+            index = generation_end;
+            continue;
+        }
+        let Some(number) = std::str::from_utf8(&buf[index..number_end])
+            .ok()
+            .and_then(|text| text.parse().ok())
+        else {
+            index = generation_end + 4;
+            continue;
+        };
+        let Some(generation) = std::str::from_utf8(&buf[generation_at..generation_end])
+            .ok()
+            .and_then(|text| text.parse().ok())
+        else {
+            index = generation_end + 4;
+            continue;
+        };
+        return Some(ObjectHeader {
+            number,
+            generation,
+            header_end: generation_end + 4,
+        });
+    }
+    None
+}
+
+fn read_digits(buf: &[u8], start: usize) -> Option<usize> {
+    let mut end = start;
+    while end < buf.len() && buf[end].is_ascii_digit() {
+        end += 1;
+    }
+    (end > start).then_some(end)
+}
+
+fn find_stream_keyword(buf: &[u8]) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(at) = buf[search_from..]
+        .windows(6)
+        .position(|window| window == b"stream")
+    {
+        let keyword = search_from + at;
+        let boundary_before =
+            keyword == 0 || buf[keyword - 1].is_ascii_whitespace() || buf[keyword - 1] == b'>';
+        let after = keyword + 6;
+        let boundary_after = matches!(buf.get(after), Some(b'\n' | b'\r'));
+        if boundary_before && boundary_after {
+            return Some(keyword);
+        }
+        search_from = keyword + 1;
+    }
+    None
+}
+
+fn direct_length(dict: &[u8]) -> Option<usize> {
+    let key = b"/Length";
+    let mut search_from = 0;
+    while let Some(at) = dict[search_from..]
+        .windows(key.len())
+        .position(|window| window == key)
+    {
+        let mut index = search_from + at + key.len();
+        if index < dict.len() && is_pdf_name_byte(dict[index]) {
+            search_from = index;
+            continue;
+        }
+        while index < dict.len() && dict[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let digits = index;
+        while index < dict.len() && dict[index].is_ascii_digit() {
+            index += 1;
+        }
+        if digits == index {
+            search_from = search_from + at + key.len();
+            continue;
+        }
+        let mut after = index;
+        while after < dict.len() && dict[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        if after < dict.len() && dict[after].is_ascii_digit() {
+            search_from = index;
+            continue;
+        }
+        return std::str::from_utf8(&dict[digits..index]).ok()?.parse().ok();
+    }
+    None
+}
+
+fn is_pdf_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_' | b'.')
+}
+
+fn append_encrypt_dictionary(
+    buf: &mut Vec<u8>,
+    loaded: &lopdf::Document,
+    state: &lopdf::EncryptionState,
+) {
+    let encrypt = state.encode().expect("encryption dictionary");
+    let owner = encrypt
+        .get(b"O")
+        .and_then(lopdf::Object::as_str)
+        .expect("/O");
+    let user = encrypt
+        .get(b"U")
+        .and_then(lopdf::Object::as_str)
+        .expect("/U");
+    let version = encrypt
+        .get(b"V")
+        .and_then(lopdf::Object::as_i64)
+        .expect("/V");
+    let revision = encrypt
+        .get(b"R")
+        .and_then(lopdf::Object::as_i64)
+        .expect("/R");
+    let length = encrypt
+        .get(b"Length")
+        .and_then(lopdf::Object::as_i64)
+        .expect("/Length");
+    let permissions = encrypt
+        .get(b"P")
+        .and_then(lopdf::Object::as_i64)
+        .expect("/P");
+    let root = loaded
+        .trailer
+        .get(b"Root")
+        .and_then(lopdf::Object::as_reference)
+        .expect("/Root");
+    let ids = loaded
+        .trailer
+        .get(b"ID")
+        .and_then(lopdf::Object::as_array)
+        .expect("/ID");
+    let id_hex = |object: &lopdf::Object| -> String {
+        let bytes = object.as_str().expect("id string");
+        let mut hex = String::from("<");
+        for byte in bytes {
+            hex.push_str(&format!("{byte:02X}"));
+        }
+        hex.push('>');
+        hex
+    };
+    let prev = last_startxref(buf).expect("startxref");
+    if !buf.ends_with(b"\n") {
+        buf.push(b'\n');
+    }
+    let object_number = loaded.max_id + 1;
+    let object_at = buf.len();
+    let object = format!(
+        "{object_number} 0 obj\n<< /Filter /Standard /V {version} /R {revision} /Length {length} /O {} /U {} /P {permissions} >>\nendobj\n",
+        pdf_hex(owner),
+        pdf_hex(user),
+    );
+    buf.extend_from_slice(object.as_bytes());
+    let xref_at = buf.len();
+    let trailer = format!(
+        "xref\n{object_number} 1\n{object_at:010} 00000 n \ntrailer\n<< /Size {} /Prev {prev} /Root {} {} R /Encrypt {object_number} 0 R /ID [{} {}] >>\nstartxref\n{xref_at}\n%%EOF\n",
+        object_number + 1,
+        root.0,
+        root.1,
+        id_hex(&ids[0]),
+        id_hex(&ids[1]),
+    );
+    buf.extend_from_slice(trailer.as_bytes());
+}
+
+fn pdf_hex(bytes: &[u8]) -> String {
+    let mut hex = String::from("<");
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02X}"));
+    }
+    hex.push('>');
+    hex
+}
+
+fn last_startxref(buf: &[u8]) -> Option<u64> {
+    let marker = b"startxref";
+    let mut found = None;
+    let mut search_from = 0;
+    while let Some(at) = buf[search_from..]
+        .windows(marker.len())
+        .position(|window| window == marker)
+    {
+        let digits_at = search_from + at + marker.len();
+        let mut index = digits_at;
+        while index < buf.len() && buf[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let start = index;
+        while index < buf.len() && buf[index].is_ascii_digit() {
+            index += 1;
+        }
+        if start < index {
+            found = std::str::from_utf8(&buf[start..index]).ok()?.parse().ok();
+        }
+        search_from = digits_at;
+    }
+    found
+}
+
 /// Regression for the #231 review finding: `extract_pages_markdown`'s
 /// `has_template_image` check must be gated the same way
 /// `classify_pdf`/`detect_pdf_type` gates it (image_count <= 1, few text
