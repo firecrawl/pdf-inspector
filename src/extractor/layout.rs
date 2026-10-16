@@ -3070,10 +3070,43 @@ fn continues_in_traversal_order(
     }
 }
 
+/// Prose signals shared by grouping and header lookahead. Backwards stream
+/// steps need a column-sized gutter even for lowercase fragments: a smaller
+/// unfilled hole can be ordinary justification in a single line.
+fn prose_gap_splits(
+    line_text: &str,
+    line_is_bold: bool,
+    last: &TextItem,
+    item: &TextItem,
+    continues_line: bool,
+) -> bool {
+    let gap = horizontal_gap(last, item);
+    let font_size = item.font_size.max(last.font_size);
+    let text = item.text.trim();
+    let first = text.chars().next();
+    if gap <= (font_size * 3.0).max(30.0) || !first.is_some_and(|c| c.is_alphabetic()) {
+        return false;
+    }
+    let line_words = line_text.split_whitespace().count();
+    let incoming_words = text.split_whitespace().count();
+    let line_wordy =
+        line_words >= 2 && line_text.chars().filter(|c| c.is_alphabetic()).count() >= 8;
+    let incoming_wordy =
+        incoming_words >= 3 && text.chars().filter(|c| c.is_alphabetic()).count() >= 10;
+    let starts_lower = first.is_some_and(|c| c.is_lowercase());
+    let style_mismatch = line_is_bold && !item.is_bold;
+    let both_clauses = line_words >= 6 && incoming_words >= 6;
+    let clause_gutter = gap > (font_size * 5.0).max(50.0);
+    line_wordy
+        && incoming_wordy
+        && (continues_line || clause_gutter)
+        && (starts_lower || style_mismatch || (both_clauses && clause_gutter))
+}
+
 /// Three or more same-style header cells are one row even when the gap
 /// exceeds the void split. Two cells are also how two columns end
 /// (`Summary` / `Results`), so that pair still splits. A wrapped leftover
-/// (`checksum.`) and a different-size tag are not header cells.
+/// (`checksum.`) and a different-size tag across a void are not header cells.
 fn same_style_header_row(
     line: &TextLine,
     incoming: &TextItem,
@@ -3084,12 +3117,14 @@ fn same_style_header_row(
 ) -> bool {
     let bold = incoming.is_bold;
     let font_size = incoming.font_size;
-    let is_header_cell = |item: &TextItem| {
-        let scale = item.font_size.max(font_size).max(1.0);
-        (item.font_size - font_size).abs() <= scale * 0.2
-            && item.is_bold == bold
+    let is_header_label = |item: &TextItem| {
+        item.is_bold == bold
             && is_short_header_label(&item.text)
             && !is_wrapped_fragment(item, item.text.trim())
+    };
+    let is_header_cell = |item: &TextItem| {
+        let scale = item.font_size.max(font_size).max(1.0);
+        (item.font_size - font_size).abs() <= scale * 0.2 && is_header_label(item)
     };
     if !is_header_cell(incoming) || !line.items.iter().all(is_header_cell) {
         return false;
@@ -3099,7 +3134,10 @@ fn same_style_header_row(
     let mut cells: Vec<&TextItem> = Vec::with_capacity(line.items.len() + 2);
     cells.extend(line.items.iter());
     cells.push(incoming);
-    for next in upcoming.iter().flatten() {
+    for (next_index, next) in upcoming.iter().enumerate() {
+        let Some(next) = next else {
+            continue;
+        };
         // Grouping measures each run against the line anchor, so the
         // lookahead does too.
         if next.page != incoming.page || (next.line_y() - line.y).abs() >= y_tolerance {
@@ -3108,7 +3146,7 @@ fn same_style_header_row(
             // evidence for keeping the cells already seen together.
             break;
         }
-        if !is_header_cell(next) {
+        if !is_header_label(next) {
             break;
         }
         // Grouping has no font test of its own. A size mismatch drops a cell
@@ -3133,6 +3171,29 @@ fn same_style_header_row(
             (cell.font_size - next.font_size).abs() > scale * 0.2
         });
         if font_differs && continues_line && starts_word && gap > void_limit {
+            break;
+        }
+        let line_text = cells
+            .iter()
+            .map(|cell| cell.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if prose_gap_splits(
+            &line_text,
+            cells.iter().all(|cell| cell.is_bold),
+            preceding,
+            next,
+            continues_line,
+        ) && (continues_line
+            || !same_baseline_run_fills_gap(
+                cells.iter().copied(),
+                line.y,
+                preceding,
+                next,
+                &upcoming[next_index + 1..],
+                y_tolerance,
+            ))
+        {
             break;
         }
         // Grouping starts a new line for a shifted-baseline run at the
@@ -3168,8 +3229,9 @@ fn same_style_header_row(
 ///
 /// Grouping only joins onto the current line, so a run after a baseline
 /// break cannot fill this gap.
-fn same_baseline_run_fills_gap(
-    line: &TextLine,
+fn same_baseline_run_fills_gap<'a>(
+    mut line_items: impl Iterator<Item = &'a TextItem>,
+    line_y: f32,
     last: &TextItem,
     item: &TextItem,
     upcoming: &[Option<TextItem>],
@@ -3189,11 +3251,11 @@ fn same_baseline_run_fills_gap(
         let right = run.x + effective_width(run);
         run.x < gap_right && right > gap_left
     };
-    if line.items.iter().any(overlaps_gap) {
+    if line_items.any(overlaps_gap) {
         return true;
     }
     for next in upcoming.iter().flatten() {
-        if next.page != line.page || (next.line_y() - line.y).abs() >= y_tolerance {
+        if next.page != item.page || (next.line_y() - line_y).abs() >= y_tolerance {
             break;
         }
         if overlaps_gap(next) {
@@ -3292,66 +3354,29 @@ fn group_single_column(
                         .next()
                         .is_some_and(|c| c.is_alphabetic())
                 {
-                    // The incoming run must be substantial prose; the line
-                    // side may be short (a wrapped heading's last words).
-                    let incoming_wordy = {
-                        let t = item.text.trim();
-                        t.split_whitespace().count() >= 3
-                            && t.chars().filter(|c| c.is_alphabetic()).count() >= 10
-                    };
                     let line_text = last_line
                         .items
                         .iter()
                         .map(|i| i.text.trim())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let line_words = line_text.split_whitespace().count();
-                    let line_wordy = line_words >= 2
-                        && line_text.chars().filter(|c| c.is_alphabetic()).count() >= 8;
-                    // Lowercase starts are mid-sentence continuations and
-                    // split on prose signals alone. A bold heading beside
-                    // regular body text splits too. Same-style uppercase
-                    // splits only when both runs are full clauses (six or
-                    // more words): a feature-tile row is a few words and
-                    // stays on one line.
-                    let starts_lower = item
-                        .text
-                        .trim()
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_lowercase());
-                    // The whole line must be bold (a heading), not merely
-                    // its last run — mixed bold-label/value rows stay joined.
-                    let style_mismatch = last_line.items.iter().all(|i| i.is_bold) && !item.is_bold;
-                    let both_clauses = line_words >= 6 && item.text.split_whitespace().count() >= 6;
-                    // A same-style clause split needs a real gutter. The
-                    // sample column gap is ~59pt at 10pt; a ~30pt hole in
-                    // one justified line stays together.
-                    let clause_gutter =
-                        gap > (item.font_size.max(last_item.font_size) * 5.0).max(50.0);
-                    // Y-sorting visits a baseline left to right, so the step
-                    // has to be read in that order. Stream order follows
-                    // reading order instead.
                     let continues_line =
                         continues_in_traversal_order(item.x, last_item.x, page_rtl, use_y_sorting);
-                    // A backwards step is still a column boundary when nothing
-                    // on this baseline fills the gap. Suppress the split only
-                    // for a hole a same-baseline run already occupies or will
-                    // occupy before the next baseline: two complete clauses
-                    // emitted right-column-first stay split, and a body line
-                    // whose middle run arrives later stays one line.
-                    let column_boundary = continues_line
+                    if prose_gap_splits(
+                        &line_text,
+                        last_line.items.iter().all(|i| i.is_bold),
+                        last_item,
+                        &item,
+                        continues_line,
+                    ) && (continues_line
                         || !same_baseline_run_fills_gap(
-                            last_line,
+                            last_line.items.iter(),
+                            last_line.y,
                             last_item,
                             &item,
                             &pending[index + 1..],
                             y_tolerance,
-                        );
-                    if line_wordy
-                        && incoming_wordy
-                        && column_boundary
-                        && (starts_lower || style_mismatch || (both_clauses && clause_gutter))
+                        ))
                     {
                         return false;
                     }
@@ -4202,6 +4227,29 @@ mod tests {
     }
 
     #[test]
+    fn reversed_justified_prose_stays_one_line() {
+        for gap in [31.0, 35.0, 50.0] {
+            let mut left = make_item(1, 40.0, 600.0, "the report continues with these figures");
+            left.width = 200.0;
+            left.font_size = 10.0;
+            let mut right = make_item(1, 240.0 + gap, 600.0, "before the close of the year");
+            right.width = 150.0;
+            right.font_size = 10.0;
+            let lines = group_single_column(vec![right, left], 0.10, false);
+            assert_eq!(
+                lines.len(),
+                1,
+                "a reversed justified {gap}pt gap stays joined"
+            );
+            assert_eq!(
+                lines[0].items[0].text,
+                "the report continues with these figures"
+            );
+            assert_eq!(lines[0].items[1].text, "before the close of the year");
+        }
+    }
+
+    #[test]
     fn full_clauses_split_in_either_stream_order() {
         // 10pt clauses: the left run ends at 259 and the right run starts at
         // 318, a 59pt gutter under the 100pt void split. Reading order and
@@ -4513,15 +4561,12 @@ mod tests {
     }
 
     #[test]
-    fn mixed_size_header_within_the_void_stays_one_row() {
-        // 8pt, 10pt, and 12.5pt. Owner is outside 20% of Status, but the 80pt
-        // gap is inside Owner's 100pt void limit, so grouping still appends
-        // it. That third cell keeps Status on the same row.
+    fn lowercase_prose_does_not_keep_distant_headers_joined() {
         let mut cells = Vec::new();
         for (text, x, width, font_size) in [
             ("Status", 47.0, 30.0, 8.0),
             ("Description", 200.0, 50.0, 10.0),
-            ("Owner", 330.0, 30.0, 12.5),
+            ("the current owner", 330.0, 100.0, 12.5),
         ] {
             let mut item = make_item(1, x, 459.0, text);
             item.width = width;
@@ -4529,15 +4574,41 @@ mod tests {
             cells.push(item);
         }
         let lines = group_single_column(cells, 0.10, false);
-        let grouped: Vec<Vec<&str>> = lines
-            .iter()
-            .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
-            .collect();
         assert_eq!(
-            grouped,
-            vec![vec!["Status", "Description", "Owner"]],
-            "a third cell grouping will append keeps the header row together"
+            lines[0].items.len(),
+            1,
+            "rejected prose cannot keep Status and Description joined"
         );
+        assert_eq!(lines[0].items[0].text, "Status");
+    }
+
+    #[test]
+    fn mixed_size_header_within_the_void_stays_one_row() {
+        // Owner can differ from both earlier cells. The 80pt gap is inside
+        // its void limit, so grouping appends it and keeps the row together.
+        for owner_size in [12.5, 15.0] {
+            let mut cells = Vec::new();
+            for (text, x, width, font_size) in [
+                ("Status", 47.0, 30.0, 8.0),
+                ("Description", 200.0, 50.0, 10.0),
+                ("Owner", 330.0, 30.0, owner_size),
+            ] {
+                let mut item = make_item(1, x, 459.0, text);
+                item.width = width;
+                item.font_size = font_size;
+                cells.push(item);
+            }
+            let lines = group_single_column(cells, 0.10, false);
+            let grouped: Vec<Vec<&str>> = lines
+                .iter()
+                .map(|line| line.items.iter().map(|item| item.text.as_str()).collect())
+                .collect();
+            assert_eq!(
+                grouped,
+                vec![vec!["Status", "Description", "Owner"]],
+                "a third cell grouping will append keeps the header row together"
+            );
+        }
     }
 
     #[test]
