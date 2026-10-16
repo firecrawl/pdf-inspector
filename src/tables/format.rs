@@ -296,6 +296,27 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut cleaned: Vec<Vec<String>> = Vec::new();
     let mut footnotes: Vec<String> = Vec::new();
 
+    // A first column left empty by nearly every row is a row-group label
+    // column: one spanning cell drawn once for a block of rows ("Grupo WBC",
+    // "Q1"). There an empty first cell is the norm, so it cannot be read as
+    // "this row continues the previous one" the way it can in a table whose
+    // first column normally carries an entry label. Only rows that reach the
+    // continuation decision below count: blank and footnote rows are skipped.
+    let data_rows: Vec<&Vec<String>> = cells
+        .iter()
+        .skip(1)
+        .filter(|row| {
+            row.iter().any(|c| !c.trim().is_empty())
+                && !is_footnote_row(row.first().map(|s| s.trim()).unwrap_or(""))
+        })
+        .collect();
+    let empty_first_cells = data_rows
+        .iter()
+        .filter(|row| row.first().is_some_and(|cell| cell.trim().is_empty()))
+        .count();
+    let data_rows = data_rows.len();
+    let first_column_is_row_group_label = data_rows >= 4 && empty_first_cells * 4 >= data_rows * 3;
+
     for row in cells {
         // Check if this row is empty
         if row.iter().all(|c| c.trim().is_empty()) {
@@ -421,6 +442,20 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && filled_cells == 1
             && header_filled >= 3
             && looks_like_plain_section_label(first_cell);
+        // A row of a row-group table that fills exactly the columns the row
+        // above fills is the next entry of the group rather than text spilling
+        // out of the row above: wrapped text rarely lands in precisely the same
+        // columns as the row it came from, and its entry label carries on
+        // mid-sentence in lowercase. Later cells may be lowercase values.
+        let filled_pattern = |r: &[String]| -> Vec<bool> {
+            r.iter().skip(1).map(|c| !c.trim().is_empty()).collect()
+        };
+        let looks_like_row_group_data_row = first_column_is_row_group_label
+            && non_first_cells.len() >= 2
+            && !starts_with_lowercase_alpha(first_non_empty_cell)
+            && cleaned
+                .last()
+                .is_some_and(|prev| filled_pattern(prev) == filled_pattern(row));
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
@@ -428,6 +463,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
+            && !looks_like_row_group_data_row
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
@@ -459,6 +495,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_hierarchical_subrow
             && !looks_like_new_first_column_entry
             && !looks_like_section_label_row
+            && !looks_like_row_group_data_row
             && !is_short_subheader;
 
         let is_continuation = is_classic_continuation || is_wrapped_continuation;
@@ -619,6 +656,62 @@ mod tests {
         assert_eq!(cleaned.len(), 2);
         assert!(cleaned[1][1].contains("Short"));
         assert!(cleaned[1][1].contains("continued text here"));
+    }
+
+    fn row(cells: &[&str]) -> Vec<String> {
+        cells.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn test_clean_table_cells_row_group_entries_not_merged() {
+        // Column 0 holds one label per block of rows; every entry after the
+        // first leaves it blank and fills the same columns as the entry above.
+        let cells = vec![
+            row(&["Group", "Name", "Code", "Flag"]),
+            row(&["Group A", "Contagem total de células brancas", "WBC", "yes"]),
+            row(&[
+                "",
+                "Concentração de hemoglobina corpuscular média",
+                "MCHC",
+                "yes",
+            ]),
+            row(&[
+                "",
+                "Largura da distribuição de células vermelhas",
+                "RDW",
+                "no",
+            ]),
+            row(&["", "Volume corpuscular médio por célula", "MCV", "yes"]),
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 5);
+        assert_eq!(cleaned[2][2], "MCHC");
+        assert_eq!(cleaned[3][3], "no");
+    }
+
+    #[test]
+    fn test_clean_table_cells_row_group_wrapped_tail_still_merged() {
+        // In the same kind of table, text wrapped out of an entry's name
+        // fills only that column and still joins the entry it came from.
+        let cells = vec![
+            row(&["Group", "Name", "Code", "Flag"]),
+            row(&["Group A", "Contagem total de células brancas", "WBC", "yes"]),
+            row(&["", "Concentração de hemoglobina corpuscular", "MCHC", "yes"]),
+            row(&["", "média", "", ""]),
+            row(&["", "Volume corpuscular médio por célula", "MCV", "yes"]),
+            row(&[
+                "",
+                "Largura da distribuição de células vermelhas",
+                "RDW",
+                "no",
+            ]),
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 5);
+        assert_eq!(
+            cleaned[2][1],
+            "Concentração de hemoglobina corpuscular média"
+        );
     }
 
     #[test]
