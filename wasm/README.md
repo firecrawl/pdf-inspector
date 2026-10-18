@@ -36,9 +36,12 @@ const result = processPdf(pdf, {
 The package also exports:
 
 - `detectPdf(pdf, options?)` for detection without extraction.
-- `classifyPdf(pdf)` for the lightweight result shape shared with the native Node.js API.
-- `extractText(pdf)` for plain text.
+- `classifyPdf(pdf, options?)` for the lightweight result shape shared with the native Node.js API.
+- `extractText(pdf, options?)` for plain text.
 - `version()` for the WASM package version.
+
+`detectPdf`, `classifyPdf` and `extractText` accept `{ password }` for
+encrypted documents, the same way `processPdf` does.
 
 ## Browser behavior
 
