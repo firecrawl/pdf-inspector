@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector"
-version = "1.17.0"
+version = "1.25.2"
 edition = "2021"
 # Oldest compiler the crate builds on (slice::as_chunks). Independent of the
 # 1.98 pin in rust-toolchain.toml, which is what we develop and release with.
@@ -12,8 +12,9 @@ license = "MIT"
 repository = "https://github.com/firecrawl/pdf-inspector"
 readme = "docs/rust-api.md"
 # Explicit allowlist: crates.io caps uploads at 10 MiB and tests/fixtures
-# alone exceeds that. external/bcmaps ships in the crate — tounicode.rs
-# loads it at runtime relative to CARGO_MANIFEST_DIR.
+# alone exceeds that. external/bcmaps ships in the crate and is embedded
+# by tounicode.rs, so a `cargo install` binary does not need the crate
+# source on disk at runtime.
 include = [
     "/src/**",
     "/external/bcmaps/**",
@@ -41,7 +42,14 @@ log = "0.4"
 # Text processing
 regex = "1.10"
 once_cell = "1.19"
+# Built-in CMaps. Embedded on every target: a cargo-installed binary's
+# CARGO_MANIFEST_DIR is the registry checkout, which is not a stable
+# runtime location (and does not exist at all for a published wheel).
+include_dir = "0.7"
 unicode-normalization = "0.1"
+# Unicode Bidirectional Algorithm: resolved levels for reading right-to-left
+# lines back out of their display order.
+unicode-bidi = "0.3"
 
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"
@@ -49,7 +57,7 @@ ttf-parser = "0.25"
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-lopdf = { version = "0.42.0", features = ["rayon"] }
+lopdf = { version = "0.45.0", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
 # Optional native page rendering for OCR pipelines. PDFium is loaded at
@@ -72,11 +80,11 @@ ureq = { version = "3.4", default-features = false, features = ["rustls", "platf
 [target.'cfg(all(windows, not(target_arch = "wasm32")))'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
 
-# Browser builds use JavaScript randomness for encrypted PDFs and embed the
-# bundled CMaps because there is no filesystem at runtime.
+# Browser builds use JavaScript randomness for encrypted PDFs. CMaps are
+# embedded for every target (see include_dir above); wasm has no filesystem
+# fallback.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
-include_dir = "0.7"
+lopdf = { version = "0.45.0", default-features = false, features = ["wasm_js"] }
 
 [dev-dependencies]
 tempfile = "3.3"

@@ -30,6 +30,7 @@ src/
   extractor/
     mod.rs                      – top-level extraction orchestrator
     content_stream.rs           – PDF operator state machine (Tj/TJ/Td/Tm/q/Q)
+    geometry.rs                 – run boxes and baseline rotation shared by both content parsers
     fonts.rs                    – font width/encoding, CMapDecisionCache, TrueType cmap fallback
     layout.rs                   – column detection (histogram), newspaper/tabular classification,
                                   spanning-line pre-masking, sidebar detection

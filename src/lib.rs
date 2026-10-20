@@ -32,10 +32,15 @@
 pub mod python;
 
 pub mod adobe_korea1;
+mod bidi;
+mod bidi_mirroring;
 pub mod detector;
 pub mod extractor;
+mod form_bbox_repair;
 pub mod glyph_names;
+mod mac_glyph_order;
 pub mod markdown;
+mod overlong_numerals;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
@@ -44,21 +49,27 @@ pub mod text_utils;
 pub mod tounicode;
 pub mod types;
 pub mod vision;
+mod xref_repair;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
+pub use extractor::geometry::PageRotation;
 pub use extractor::{
-    extract_text, extract_text_with_positions, extract_text_with_positions_mem,
+    extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
+    extract_text_with_positions_and_rotations_mem_in_frame,
+    extract_text_with_positions_and_rotations_mem_with_options, extract_text_with_positions_mem,
+    extract_text_with_positions_mem_in_frame, extract_text_with_positions_mem_with_options,
     extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    PositionFrame, PositionOptions,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -111,13 +122,20 @@ pub const OCR_REASON_SUSPECTED_GARBLED_TEXT: &str = "suspected_garbled_text";
 /// page) with no usable text layer.
 pub const OCR_REASON_SCANNED: &str = "scanned";
 
-/// OCR reason: the page has no extractable text and no image to OCR, blank,
+/// OCR reason: the page has no extractable text and no image to OCR — blank,
 /// or content the parser cannot reach.
 pub const OCR_REASON_NO_TEXT: &str = "no_text";
 
 /// OCR reason: the page's text is drawn as vector outlines (path operators)
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
+
+/// OCR reason: every text-showing operator on the page leaves nothing to
+/// see — text render mode 3 (invisible), or mode 7 (clip only) with
+/// nothing painted through the clip — while an image covers at least half
+/// of the page: a scan carrying a text layer nobody sees. What that layer
+/// says is not what the page shows, so the page is read from its raster.
+pub const OCR_REASON_INVISIBLE_TEXT_LAYER: &str = "invisible_text_layer";
 
 // =========================================================================
 // Result type
@@ -130,6 +148,34 @@ pub struct PageOcrReasons {
     pub page: u32,
     /// Machine-readable OCR reason identifiers.
     pub reasons: Vec<String>,
+}
+
+/// A font whose ToUnicode CMap (or, for a font without one, the embedded
+/// program's own cmap table) had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
+///
+/// A CMap written for some of a font's glyphs but not all of them loses the
+/// others' letters from the text. A code without an entry is read from the
+/// mapped codes around it when they spell it out — a CMap mapping code 36
+/// to `A` and code 38 to `C` says code 37 is `B`, for a run of digits or of
+/// letters of one case whose glyph order follows the alphabet — and is a
+/// U+FFFD in the text otherwise, so the loss stays visible. The counts let
+/// a caller weigh text read from such a font: `codes - interpolated -
+/// unmapped` of its codes had an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontCMapGaps {
+    /// The font's `/BaseFont` name, or its resource name when it has none
+    /// or an empty one.
+    pub font: String,
+    /// Codes shown through the font's CMap, repeats included: two-byte
+    /// codes, or the bytes of a single-byte CMap.
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around
+    /// them.
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in
+    /// the text.
+    pub unmapped: u32,
 }
 
 /// High-level PDF processing result.
@@ -147,15 +193,45 @@ pub struct PdfProcessResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
-    /// Title from PDF metadata (if available).
+    /// The `/Title` of the document information dictionary, decoded as a
+    /// PDF text string (UTF-16 or UTF-8 after a byte order mark,
+    /// PDFDocEncoding otherwise; see [`PdfTypeResult::title`]). `None` when
+    /// the entry is missing or not a string. The entries below follow the
+    /// same decoding and missing-value rule.
     pub title: Option<String>,
-    /// Detection confidence score (0.0-1.0).
+    /// The document information dictionary's `/Author`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator`: the application
+    /// the document was authored in.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer`: the application
+    /// that wrote the PDF.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate` as written, a
+    /// PDF date string such as `D:20240115103000+01'00'`, neither validated
+    /// nor converted.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate` as written, like
+    /// `creation_date`.
+    pub mod_date: Option<String>,
+    /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
     /// Layout complexity analysis (tables, multi-column detection).
     pub layout: LayoutComplexity,
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// The fonts whose ToUnicode CMap — or, for a font without one, the
+    /// embedded program's cmap table — lacked an entry for a code the
+    /// document shows through it, with the counts of codes shown, read from
+    /// their neighbours and left as U+FFFD (see [`FontCMapGaps`]). Always
+    /// empty in [`ProcessMode::DetectOnly`], which decodes no text;
+    /// otherwise empty when every such code had an entry.
+    pub cmap_gaps: Vec<FontCMapGaps>,
 }
 
 // =========================================================================
@@ -271,7 +347,7 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
     process_pdf_with_options(path, PdfOptions::new())
 }
 
-/// Fast metadata-only detection, no text extraction or markdown generation.
+/// Fast metadata-only detection — no text extraction or markdown generation.
 ///
 /// Equivalent to `process_pdf_with_options(path, PdfOptions::detect_only())`.
 pub fn detect_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError> {
@@ -288,7 +364,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     let start = ProcessingTimer::start();
     validate_pdf_file(&path)?;
 
-    // Load the document once, shared by detection AND extraction.
+    // Load the document once — shared by detection AND extraction.
     let (doc, page_count) =
         load_document_from_path_with_password(&path, options.password.as_deref())?;
 
@@ -383,7 +459,7 @@ pub struct PdfClassification {
     pub page_count: u32,
     /// 0-indexed page numbers that need OCR (scanned/image pages).
     pub pages_needing_ocr: Vec<u32>,
-    /// Detection confidence score (0.0-1.0).
+    /// Detection confidence score (0.0–1.0).
     pub confidence: f32,
 }
 
@@ -400,6 +476,42 @@ pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
         pages_needing_ocr: detection.pages_needing_ocr.iter().map(|&p| p - 1).collect(),
         confidence: detection.confidence,
     })
+}
+
+/// The PDF written back out with the `/BBox` of its Form XObjects repaired
+/// — a zero-area box widened, numerals too large for any parser saturated
+/// — for callers that render the document with their own renderer. Rust
+/// only: the Python, Node.js and WebAssembly bindings do not expose it.
+///
+/// Some producers write `/BBox [0 0 0 0]` on a form XObject that holds a
+/// page's content; taken as the clip it declares, the box hides the form
+/// entirely, and a page drawn through it renders blank. Others write the
+/// box as ±(DBL_MAX / 2) in full, 308-digit numerals no integer parser
+/// holds: the form drops out of the document for one reader and clips to
+/// nothing for another. pdf-inspector repairs both whenever it loads a
+/// document, so its own extraction and the renderer of its OCR pipeline
+/// see the content; a renderer given the original bytes does not, and can
+/// be given these instead.
+///
+/// Returns `Ok(None)` when no form needs the repair, and for an encrypted
+/// document — whether or not it opens without a password — since a plain
+/// serialization would drop its protection; the OCR pipeline renders a
+/// decrypted copy of such a document in memory instead. Otherwise
+/// `Ok(Some(bytes))` holds a plain serialization of the loaded document:
+/// object streams and incremental updates are flattened, and the file's
+/// own repairs — a recovered cross-reference table, a missing end-of-file
+/// marker — are folded in.
+pub fn widen_degenerate_form_bboxes_mem(buffer: &[u8]) -> Result<Option<Vec<u8>>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (mut doc, _page_count, repairs) = match load_document_from_mem_with_repairs(buffer, None) {
+        Ok(loaded) => loaded,
+        Err(PdfError::Encrypted) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !repairs.repaired_forms() || doc.is_encrypted() || doc.encryption_state.is_some() {
+        return Ok(None);
+    }
+    Ok(form_bbox_repair::serialize_for_rendering(&mut doc))
 }
 
 // =========================================================================
@@ -443,6 +555,11 @@ pub(crate) struct InternalPagesExtraction {
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+    /// The document written back out for the renderer when form XObjects
+    /// were repaired at load (see `form_bbox_repair`); `None` when the
+    /// original bytes render as loaded.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) render_bytes: Option<Vec<u8>>,
 }
 
 /// Extract formatted markdown for pages of a PDF, with layout
@@ -474,16 +591,21 @@ pub fn extract_pages_markdown_mem(
         &MarkdownOptions::default(),
         false,
         false,
+        false,
     )
     .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+/// `render_repairs` asks for the repaired document to be written back out
+/// for the renderer when the loader changed it (see `form_bbox_repair`);
+/// a caller that will not render leaves it off.
 pub(crate) fn extract_pages_markdown_mem_for_ocr(
     buffer: &[u8],
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
+    render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
@@ -492,6 +614,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         markdown_options,
         markdown_options.strip_headers_footers,
         true,
+        render_repairs,
     )
 }
 
@@ -502,9 +625,14 @@ fn extract_pages_markdown_mem_impl(
     markdown_options: &MarkdownOptions,
     strip_repeated_headers_footers: bool,
     preserve_ocr_candidates: bool,
+    render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
+    let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut doc = doc;
+    #[cfg(not(all(feature = "ocr", not(target_arch = "wasm32"))))]
+    let _ = (repairs, render_repairs);
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -516,7 +644,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _, _) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -626,7 +754,7 @@ fn extract_pages_markdown_mem_impl(
         // while still being fundamentally a scan: a full-page raster with
         // a little genuine native text drawn over it (a header, a stamp, a
         // cover-sheet annotation). Text-quality signals alone can't see
-        // that, consult the same "large background image" signal
+        // that — consult the same "large background image" signal
         // classify_pdf/detect_pdf_type already uses, so the two APIs can't
         // silently disagree on whether a page needs OCR. See #227.
         // Also covers vector-outlined text (glyphs drawn as paths, not
@@ -634,12 +762,18 @@ fn extract_pages_markdown_mem_impl(
         // embedded-font body text elsewhere would otherwise still extract
         // non-empty, non-garbled markdown and miss OCR routing entirely.
         // detect_from_document's Mixed-type per-page routing always sends
-        // these pages to OCR; mirror that here too. Both signals share one
-        // analyze_page_content pass, see page_ocr_signals's doc comment.
-        let (has_template_image, has_vector_text) = lopdf_pages
+        // these pages to OCR; mirror that here too. And a page whose every
+        // text-showing operator is invisible under a covering image: the
+        // text layer it extracts describes the raster rather than being
+        // the page's content. All three signals share one
+        // analyze_page_content pass — see page_ocr_signals's doc comment.
+        let signals = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or((false, false));
+            .unwrap_or_default();
+        let has_template_image = signals.template_image_needs_ocr;
+        let has_vector_text = signals.has_vector_text;
+        let has_invisible_text_layer = signals.has_invisible_text_layer;
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -671,6 +805,18 @@ fn extract_pages_markdown_mem_impl(
 
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+        // First among a page's reasons, as classification's
+        // `page_ocr_reasons` lists it too, so a page whose whole text layer
+        // is hidden under a scan — a scan whatever its fonts are — gets the
+        // same first reason from both surfaces; the reasons after it keep
+        // this surface's own order.
+        if has_invisible_text_layer {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_INVISIBLE_TEXT_LAYER,
+            );
+        }
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -691,7 +837,8 @@ fn extract_pages_markdown_mem_impl(
             || has_gid
             || is_garbage_text(&md)
             || has_template_image
-            || has_vector_text;
+            || has_vector_text
+            || has_invisible_text_layer;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
@@ -726,6 +873,23 @@ fn extract_pages_markdown_mem_impl(
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         supplemental_ocr_regions,
+        // A renderer reading the original bytes would clip a repaired form
+        // to nothing, so the OCR pipeline renders the repaired document.
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        render_bytes: if render_repairs && repairs.repaired_forms() {
+            // A renderer given the original bytes would clip the repaired
+            // forms to nothing again, so a copy that cannot be written is
+            // an error, not a fallback.
+            Some(
+                form_bbox_repair::serialize_for_rendering(&mut doc).ok_or_else(|| {
+                    PdfError::Parse(
+                        "the repaired document could not be written for rendering".to_string(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -828,14 +992,24 @@ mod ocr_header_footer_tests {
             height: 10.0,
             font: "Test".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -885,7 +1059,7 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
     validate_pdf_file(&path)?;
-    let buffer = std::fs::read(path.as_ref())?;
+    let buffer = read_file(path.as_ref())?;
     extract_pages_markdown_mem(&buffer, pages)
 }
 
@@ -959,7 +1133,7 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     pages: Option<&[u32]>,
 ) -> Result<Vec<StructureElement>, PdfError> {
     validate_pdf_file(&path)?;
-    let buffer = std::fs::read(path.as_ref())?;
+    let buffer = read_file(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
 }
 
@@ -996,7 +1170,7 @@ const OCR_LAYER_MIN_ALNUM: usize = 40;
 
 /// Alphanumeric mass of extracted items, ignoring raster placeholders.
 /// `[Image: ...]` items (ItemType::Image) are synthesized for image
-/// XObjects, they mark that pixels exist, not that text was read, so they
+/// XObjects — they mark that pixels exist, not that text was read, so they
 /// must not count as coverage.
 fn non_placeholder_alnum(items: &[TextItem]) -> usize {
     items
@@ -1010,17 +1184,24 @@ fn non_placeholder_alnum(items: &[TextItem]) -> usize {
 ///
 /// This is designed for hybrid OCR pipelines: a layout model detects regions
 /// in a rendered page image, and this function extracts the PDF text that
-/// falls within each region, avoiding GPU OCR for text-based pages.
+/// falls within each region — avoiding GPU OCR for text-based pages.
 ///
 /// Each region result includes a `needs_ocr` flag that is set when extraction
 /// quality is suspect (empty text, GID-encoded fonts, garbage/encoding issues).
 ///
 /// # Arguments
 ///
-/// * `buffer`, PDF file bytes
-/// * `page_regions`, list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
-///   Coordinates are in **PDF points** with **top-left origin** (matching typical
-///   layout model output after coordinate conversion).
+/// * `buffer` — PDF file bytes
+/// * `page_regions` — list of `(page_number_0indexed, Vec<[x1, y1, x2, y2]>)`.
+///   Coordinates are in **PDF points** with **top-left origin**, relative to
+///   the page's **visible page box** (`CropBox ∩ MediaBox`, else the
+///   MediaBox) as laid out in the content stream — the frame
+///   [`extract_text_with_positions_mem`] reports items in (with `y` flipped
+///   by the box height). `/Rotate` is not applied and a page whose text is
+///   predominantly rotated is turned (see [`PageRotation`]), so this matches
+///   a rendered page image only for pages with `/Rotate 0` whose text is not
+///   predominantly rotated; rects taken from a rendered page go through
+///   [`extract_text_in_regions_mem_in_frame`] with [`PositionFrame::Display`].
 ///
 /// # Returns
 ///
@@ -1029,6 +1210,41 @@ pub fn extract_text_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_text_in_regions_mem_in_frame(buffer, page_regions, PositionFrame::Sheet)
+}
+
+/// [`extract_text_in_regions_mem`] with the frame of the region rects given
+/// explicitly. [`PositionFrame::Sheet`] reads them as that function does;
+/// [`PositionFrame::Display`] reads them on the rendered page — the visible
+/// page box turned clockwise by the page's inheritable `/Rotate`, top-left
+/// origin, `y` down — the frame a layout model working on a page image
+/// reports boxes in. Pages whose text is predominantly rotated are handled
+/// the same way in both frames.
+pub fn extract_text_in_regions_mem_in_frame(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    frame: PositionFrame,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_text_in_regions_mem_with_options(
+        buffer,
+        page_regions,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_in_regions_mem_in_frame`] with every option given as a
+/// [`PositionOptions`]: the frame the region rects are read in, and whether
+/// bold is also read from the font's weight class (`bold_from_weight`: a
+/// weight class of `bold_weight_threshold` or more, 600 by default, is bold,
+/// and a run the weight makes bold is then its own item while the region's
+/// lines are assembled). The default options are
+/// [`extract_text_in_regions_mem`].
+pub fn extract_text_in_regions_mem_with_options(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    options: PositionOptions,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let frame = options.frame;
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
@@ -1046,7 +1262,8 @@ pub fn extract_text_in_regions_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
+    let mut display_pages: HashMap<u32, extractor::DisplayPage> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
@@ -1054,56 +1271,65 @@ pub fn extract_text_in_regions_mem(
             continue;
         }
 
-        // Get page height from MediaBox for coordinate flip
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        // Extract text items for this page. The Form XObject budget is shared
-        // with the invisible-layer retry below so one page cannot consume two
-        // full expansion budgets.
+        // Extract text items for this page in the visible-page-box frame;
+        // region bounds flip y with that box's height. The Form XObject
+        // budget is shared with the invisible-layer retry below so one page
+        // cannot consume two full expansion budgets.
         let mut form_budget = extractor::FormWalkBudget::new();
-        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
+        let extractor::PageBoxExtraction {
+            mut items,
+            has_gid_fonts: mut has_gid,
+            mut coords_rotated,
+            skipped_invisible,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box_with_options(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            options.text_extraction(false),
+            &mut style_cache,
+            &mut form_budget,
+        )?;
+        page_heights.insert(*page_num, page_box.height());
+        if frame == PositionFrame::Display {
+            display_pages.insert(
                 *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut form_budget,
-            )?;
+                extractor::DisplayPage::new(&doc, page_id, page_box),
+            );
+        }
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
         // pass sees nothing there but `[Image: ...]` placeholders, so every
         // region on the page reports needs_ocr even though the exact text is
-        // embedded in the PDF, and this extractor then disagrees with the
+        // embedded in the PDF — and this extractor then disagrees with the
         // markdown path, which already retries Mixed PDFs with the invisible
         // layer included. Retry page-scoped, and only when (a) the first
-        // pass actually SKIPPED invisible text, blank pages and image-only
+        // pass actually SKIPPED invisible text — blank pages and image-only
         // scans without an OCR layer must not pay a second content-stream
-        // parse (review catch), and (b) the page has NO visible text item
+        // parse (review catch) — and (b) the page has NO visible text item
         // at all (punctuation counts, whitespace-only artifacts don't): an
         // invisible OCR layer transcribes the raster, so any visible glyph
         // has an invisible twin there and adoption would duplicate it
-        // (review catches, strict gate, no fuzzy dedupe). Adopt the retry
+        // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
         // only when it contributes real, non-garbage text.
         let has_visible_text = items.iter().any(|it| {
             !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
         });
         if skipped_invisible && !has_visible_text {
-            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
-                extractor::content_stream::extract_page_text_items(
-                    &doc,
-                    page_id,
-                    *page_num,
-                    &font_cmaps,
-                    true,
-                    &mut style_cache,
-                    &mut form_budget,
-                )
-            {
+            if let Ok(invisible) = extractor::extract_page_text_items_in_page_box_with_options(
+                &doc,
+                page_id,
+                *page_num,
+                &font_cmaps,
+                options.text_extraction(true),
+                &mut style_cache,
+                &mut form_budget,
+            ) {
+                let inv_items = invisible.items;
                 let inv_alnum = non_placeholder_alnum(&inv_items);
-                // Judge the WHOLE recovered layer, not a prefix, a broken
+                // Judge the WHOLE recovered layer, not a prefix — a broken
                 // OCR layer can hide its garbage past any fixed sample size
                 // (review catch).
                 let sample: String = inv_items
@@ -1113,8 +1339,8 @@ pub fn extract_text_in_regions_mem(
                     .collect();
                 if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
                     items = inv_items;
-                    has_gid = inv_gid;
-                    coords_rotated = inv_rotated;
+                    has_gid = invisible.has_gid_fonts;
+                    coords_rotated = invisible.coords_rotated;
                 }
             }
         }
@@ -1125,8 +1351,8 @@ pub fn extract_text_in_regions_mem(
         if has_gid {
             gid_pages.insert(*page_num);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
     }
@@ -1140,18 +1366,18 @@ pub fn extract_text_in_regions_mem(
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let _page_has_gid = gid_pages.contains(&page_1idx);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
+        let display = display_pages.get(&page_1idx).copied();
 
         let mut page_results = Vec::with_capacity(regions.len());
 
         // Exclusive item->region assignment: overlapping layout regions used
         // to extract shared items into EVERY region they touched (the
         // 1.5pt inclusion margin makes borders generous), duplicating whole
-        // lines in the final markdown on 21% of bench docs, and downstream
+        // lines in the final markdown on 21% of bench docs — and downstream
         // duplicate-handling sometimes dropped the variant holding a
         // sentence tail, turning duplication into content LOSS. Each item
         // now belongs to the single region with the largest overlap area;
@@ -1159,7 +1385,7 @@ pub fn extract_text_in_regions_mem(
         let all_bounds: Vec<RegionBounds> = regions
             .iter()
             .map(|rect| {
-                let [rx1, ry1, rx2, ry2] = *rect;
+                let [rx1, ry1, rx2, ry2] = sheet_region_rect(*rect, display);
                 region_bounds(rx1, ry1, rx2, ry2, page_h, coords)
             })
             .collect();
@@ -1242,6 +1468,7 @@ pub fn extract_text_in_regions_mem(
 ///
 /// Similar to [`extract_text_in_regions_mem`] but runs table detection on items
 /// within each region and returns markdown pipe-tables instead of flat text.
+/// Regions use the same visible-page-box coordinate frame.
 ///
 /// When table structure is detected, `text` contains a markdown pipe-table and
 /// `needs_ocr` is `false`. When no table is found (too few items, poor alignment,
@@ -1251,6 +1478,31 @@ pub fn extract_tables_in_regions_mem(
     buffer: &[u8],
     page_regions: &[(u32, Vec<[f32; 4]>)],
 ) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_tables_in_regions_mem_in_frame(buffer, page_regions, PositionFrame::Sheet)
+}
+
+/// [`extract_tables_in_regions_mem`] with the frame of the region rects given
+/// explicitly — see [`extract_text_in_regions_mem_in_frame`].
+pub fn extract_tables_in_regions_mem_in_frame(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    frame: PositionFrame,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    extract_tables_in_regions_mem_with_options(
+        buffer,
+        page_regions,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_tables_in_regions_mem_in_frame`] with every option given as a
+/// [`PositionOptions`] — see [`extract_text_in_regions_mem_with_options`].
+pub fn extract_tables_in_regions_mem_with_options(
+    buffer: &[u8],
+    page_regions: &[(u32, Vec<[f32; 4]>)],
+    options: PositionOptions,
+) -> Result<Vec<PageRegionResult>, PdfError> {
+    let frame = options.frame;
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
     let pages = doc.get_pages();
@@ -1264,26 +1516,38 @@ pub fn extract_tables_in_regions_mem(
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut gid_pages: HashSet<u32> = HashSet::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
+    let mut display_pages: HashMap<u32, extractor::DisplayPage> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
             continue;
         }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
+        let extractor::PageBoxExtraction {
+            mut items,
+            rects,
+            lines,
+            has_gid_fonts: has_gid,
+            coords_rotated,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box_with_options(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            options.text_extraction(false),
+            &mut style_cache,
+            &mut extractor::FormWalkBudget::new(),
+        )?;
+        page_heights.insert(*page_num, page_box.height());
+        if frame == PositionFrame::Display {
+            display_pages.insert(
                 *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
-            )?;
+                extractor::DisplayPage::new(&doc, page_id, page_box),
+            );
+        }
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -1291,8 +1555,8 @@ pub fn extract_tables_in_regions_mem(
         if has_gid {
             gid_pages.insert(*page_num);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
         rects_by_page.insert(*page_num, rects);
@@ -1306,21 +1570,21 @@ pub fn extract_tables_in_regions_mem(
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let _page_has_gid = gid_pages.contains(&page_1idx);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
+        let display = display_pages.get(&page_1idx).copied();
 
         let mut page_results = Vec::with_capacity(regions.len());
 
         for rect in regions {
-            let [rx1, ry1, rx2, ry2] = *rect;
+            let [rx1, ry1, rx2, ry2] = sheet_region_rect(*rect, display);
 
             // Note: we intentionally DO NOT bail on page_has_gid here.
             // The GID flag means some font on the page uses unresolvable
             // glyph IDs, but that font may only appear in a logo or
-            // header, not in the table region. Instead we let the
+            // header — not in the table region. Instead we let the
             // per-region text quality checks (is_garbage_text, is_cid_garbage,
             // detect_encoding_issues) reject based on the actual extracted
             // content. This avoids rejecting clean tables just because an
@@ -1445,7 +1709,7 @@ pub fn extract_tables_in_regions_mem(
                     // the visible text, so the region should fall back to
                     // OCR. `captured_only_a_fragment` compares captured
                     // chars against text the extractor saw, which is
-                    // symmetrically low under font-decode failure, this
+                    // symmetrically low under font-decode failure — this
                     // guard breaks that symmetry by comparing against
                     // bbox area, which is independent of extraction.
                     if source != TableCandidateSource::KeyValue
@@ -1568,6 +1832,10 @@ enum VectorGridSource {
 /// The returned shape intentionally matches [`TsrTableInput`]'s structure
 /// fields so callers can hand it to `extract_tables_with_structure_*` and let
 /// the existing PDF-text cell fill path populate contents.
+///
+/// `region_pdf_pt_bbox` is `[x1, y1, x2, y2]` in PDF points, top-left origin,
+/// relative to the visible page box (see [`extract_text_in_regions_mem`]).
+/// The returned cell bboxes are crop-image pixels.
 pub fn detect_vector_grid_in_region_mem(
     buffer: &[u8],
     page_idx: u32,
@@ -1585,25 +1853,27 @@ pub fn detect_vector_grid_in_region_mem(
 
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
-    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
-        extractor::content_stream::extract_page_text_items(
-            &doc,
-            page_id,
-            page_1idx,
-            &font_cmaps,
-            false,
-            &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
-        )?;
+    let extractor::PageBoxExtraction {
+        mut items,
+        rects,
+        lines,
+        coords_rotated,
+        page_box,
+        ..
+    } = extractor::extract_page_text_items_in_page_box(
+        &doc,
+        page_id,
+        page_1idx,
+        &font_cmaps,
+        false,
+        &mut extractor::FontStyleCache::new(),
+        &mut extractor::FormWalkBudget::new(),
+    )?;
+    let page_h = page_box.height();
     text_utils::fix_letterspaced_items(&mut items);
 
-    let coords = if coords_rotated {
-        RegionCoordSpace::Rotated90Ccw
-    } else {
-        RegionCoordSpace::Standard
-    };
-    if matches!(coords, RegionCoordSpace::Rotated90Ccw) {
+    let coords = RegionCoordSpace::from(coords_rotated);
+    if coords != RegionCoordSpace::Standard {
         // TODO: add a rotated-page vector-grid fixture before enabling this.
         // The TSR crop contract is top-left page coordinates, while rotated
         // extraction normalizes vector geometry into a synthetic coordinate
@@ -1852,7 +2122,7 @@ mod vector_grid_tests {
     /// for it, and the rect detector then admits a 10×2 fake table where
     /// every cell holds a sentence fragment ("I agree to comply...", "I",
     /// "It is the property owner's responsibility..."). This test asserts
-    /// the detector REJECTS that fake table, only the real 5×3 form data
+    /// the detector REJECTS that fake table — only the real 5×3 form data
     /// table (TYPE / SIZE / SETBACKS) should survive. See pdf-evals PR #30
     /// for the original score regression that surfaced this.
     #[test]
@@ -2005,7 +2275,7 @@ mod vector_grid_tests {
         assert!(!detected.cell_bboxes.is_empty());
     }
 
-    /// Regression for `greencomp_competence.pdf`, a 2-column "Area / Competence"
+    /// Regression for `greencomp_competence.pdf` — a 2-column "Area / Competence"
     /// glossary with a green-shaded header row and plain (line-drawn) body cells.
     /// Mirrors the production failure cohort #1 (Contractions glossary) and #6
     /// (BIO 350 course header): a few colored header rects sit in a horizontal
@@ -2040,7 +2310,7 @@ mod vector_grid_tests {
         );
     }
 
-    /// Regression for `upstage_key_functions.pdf`, a 4-column "Service Stage /
+    /// Regression for `upstage_key_functions.pdf` — a 4-column "Service Stage /
     /// Function Name / Explanation / Expected Benefit" table with a blue-shaded
     /// header band plus alternating row backgrounds. Mirrors production crops
     /// #2 (Parameter / Value with alternating blue rows) and #7 (Spanish XML
@@ -2071,7 +2341,7 @@ mod vector_grid_tests {
         );
     }
 
-    /// Regression for `wired_header_data_misalign.pdf`, a single page from a
+    /// Regression for `wired_header_data_misalign.pdf` — a single page from a
     /// parts catalog with a 4-column wire-bordered table (`Item | EAN | Nombre
     /// | Cant`). Column headers are centered/right-aligned inside their cells
     /// while data is left-aligned, so cluster_x_positions merges or drops
@@ -2482,6 +2752,7 @@ fn extracted_bbox_to_page_top_left(
         RegionCoordSpace::Rotated90Ccw => {
             [-y_max, page_height - x_max, -y_min, page_height - x_min]
         }
+        RegionCoordSpace::Rotated90Cw => [y_min, page_height + x_min, y_max, page_height + x_max],
     }
 }
 
@@ -2495,13 +2766,14 @@ fn extracted_bbox_to_page_top_left(
 /// The structure tokens and bboxes are typically produced by an external
 /// table-structure recognition model (e.g. SLANet on PaddleOCR) running on
 /// a rendered crop of the page. pdf-inspector uses the structure to lay out
-/// the cells and pulls the cell text from the native PDF, no OCR involved.
+/// the cells and pulls the cell text from the native PDF — no OCR involved.
 #[derive(Debug, Clone)]
 pub struct TsrTableInput {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// **top-left origin** (matches the layout model's coordinate space).
+    /// **top-left origin**, relative to the visible page box — the frame of
+    /// a rendered page image (see [`extract_text_in_regions_mem`]).
     pub crop_pdf_pt_bbox: [f32; 4],
     /// DPI the crop image was rendered at (e.g. `200.0`). Used to convert
     /// cell bboxes from image-pixels back to PDF points.
@@ -2523,7 +2795,7 @@ pub struct TsrTableInput {
 ///    awareness.
 /// 2. Converts each cell bbox from crop image-pixels into page PDF-points.
 /// 3. Pulls the cell's text by overlap-testing PDF text items inside that
-///    bbox, same primitives used by [`extract_text_in_regions_mem`].
+///    bbox — same primitives used by [`extract_text_in_regions_mem`].
 ///
 /// Returns one `Vec<StructuredCell>` per input, in input order. Each cell
 /// carries its (row, col, rowspan, colspan, is_header) metadata, the
@@ -2553,32 +2825,34 @@ pub fn extract_tables_with_structure_cells_mem(
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut page_heights: HashMap<u32, f32> = HashMap::new();
     let mut page_thresholds: HashMap<u32, f32> = HashMap::new();
-    let mut rotated_pages: HashSet<u32> = HashSet::new();
+    let mut rotated_pages: HashMap<u32, RegionCoordSpace> = HashMap::new();
     let mut style_cache = extractor::FontStyleCache::new();
 
     for (page_num, &page_id) in pages.iter() {
         if !needed_pages.contains(page_num) {
             continue;
         }
-        let height = get_page_height(&doc, page_id).unwrap_or(792.0);
-        page_heights.insert(*page_num, height);
-
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
-            extractor::content_stream::extract_page_text_items(
-                &doc,
-                page_id,
-                *page_num,
-                &font_cmaps,
-                false,
-                &mut style_cache,
-                &mut extractor::FormWalkBudget::new(),
-            )?;
+        let extractor::PageBoxExtraction {
+            mut items,
+            coords_rotated,
+            page_box,
+            ..
+        } = extractor::extract_page_text_items_in_page_box(
+            &doc,
+            page_id,
+            *page_num,
+            &font_cmaps,
+            false,
+            &mut style_cache,
+            &mut extractor::FormWalkBudget::new(),
+        )?;
+        page_heights.insert(*page_num, page_box.height());
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
         }
-        if coords_rotated {
-            rotated_pages.insert(*page_num);
+        if coords_rotated != extractor::geometry::PageRotation::Upright {
+            rotated_pages.insert(*page_num, coords_rotated.into());
         }
         items_by_page.insert(*page_num, items);
     }
@@ -2588,17 +2862,16 @@ pub fn extract_tables_with_structure_cells_mem(
     for input in inputs {
         let page_1idx = input.page + 1;
         let Some(items) = items_by_page.get(&page_1idx) else {
-            // Out-of-range page or page with no extractable text, emit empty.
+            // Out-of-range page or page with no extractable text — emit empty.
             results.push(Vec::new());
             continue;
         };
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
-        let coords = if rotated_pages.contains(&page_1idx) {
-            RegionCoordSpace::Rotated90Ccw
-        } else {
-            RegionCoordSpace::Standard
-        };
+        let coords = rotated_pages
+            .get(&page_1idx)
+            .copied()
+            .unwrap_or(RegionCoordSpace::Standard);
 
         let crop_origin = [input.crop_pdf_pt_bbox[0], input.crop_pdf_pt_bbox[1]];
 
@@ -2689,7 +2962,7 @@ pub fn extract_tables_with_structure_cells_mem(
             for token_item in token_subitems {
                 let token_w = text_utils::effective_width(&token_item);
                 let token_cx = token_item.x + token_w * 0.5;
-                let token_cy = token_item.y + token_item.height * 0.5;
+                let token_cy = token_item.y + text_utils::effective_height(&token_item) * 0.5;
                 let mut best: Option<(usize, f32)> = None;
                 for (cell_idx, meta) in cell_meta.iter().enumerate() {
                     let Some((bounds, ccx, ccy)) = meta else {
@@ -2714,13 +2987,13 @@ pub fn extract_tables_with_structure_cells_mem(
         }
 
         // Build per-cell text from the assigned tokens. Markdown cells must
-        // be one line, collapse line breaks from the line-grouping pass.
+        // be one line — collapse line breaks from the line-grouping pass.
         for (cell_idx, matched) in per_cell_items.into_iter().enumerate() {
             cells[cell_idx].text = collect_text_from_matched_items(matched, adaptive_threshold)
                 .replace(['\n', '\r'], " ");
         }
 
-        // Stage 2: orphan assignment, tokens that didn't land in any cell
+        // Stage 2: orphan assignment — tokens that didn't land in any cell
         // during stage 1 get assigned to their nearest *empty* cell,
         // clamped by a plausibility cap derived from cell geometry.
         //
@@ -2751,27 +3024,40 @@ pub fn extract_tables_with_structure_cells_mem(
 /// token, with each token's `x` / `width` estimated from the original item's
 /// effective width and the token's character offset.
 ///
-/// PDFs often render an entire row's content as a single Tj, e.g.
-/// "Marshall Islands 0.9 0.9 0.9", producing one wide TextItem whose
+/// PDFs often render an entire row's content as a single Tj — e.g.
+/// "Marshall Islands 0.9 0.9 0.9" — producing one wide TextItem whose
 /// center sits in only one of the model-emitted cells. Per-item routing
 /// then parks the whole row in that one cell. Splitting on whitespace
 /// gives each word its own approximate position so per-cell routing can
 /// distribute the words to whichever cells their estimated centers fall
 /// into.
 ///
-/// The character-width estimate is `effective_width / char_count`.
-/// `effective_width` returns the explicit `item.width` when known and
-/// otherwise falls back to `char_count * font_size * 0.5`. Either way the
-/// estimate is uniform across the item, fine for routing, since we only
-/// need to know which cell each token's center lands in, not its exact
-/// position. Single-token items collapse to a one-element vector
-/// equivalent to the input item, making this a no-op for the common case.
+/// The character-width estimate is `item.width / char_count`. A run with a
+/// known zero advance keeps all its tokens at its origin — that is where
+/// they were drawn; only a run whose advance is unknown (and somehow has no
+/// box) is spread over half an em per character for the interpolation. The
+/// estimate is uniform across the item —
+/// fine for routing, since we only need to know which cell each token's
+/// center lands in, not its exact position. Single-token items collapse to
+/// a one-element vector equivalent to the input item, making this a no-op
+/// for the common case.
 fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
     let total_chars = item.text.chars().count();
     if total_chars == 0 {
         return Vec::new();
     }
-    let item_w = text_utils::effective_width(item);
+    // Token positions are interpolated along +x, the reading direction of
+    // an upright run only. A rotated run (vertical table header) or an
+    // upside-down one, whose tokens advance towards -x, stays one item: its
+    // box already routes it to the right cell.
+    if !item.is_upright() {
+        return vec![item.clone()];
+    }
+    let item_w = if item.width > 0.0 || item.advance_known {
+        item.width
+    } else {
+        total_chars as f32 * item.font_size * 0.5
+    };
     let char_w = item_w / total_chars as f32;
 
     let mut tokens: Vec<TextItem> = Vec::new();
@@ -2812,7 +3098,7 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
 }
 
 /// Compute plausibility caps for the orphan-assignment pass. Returns
-/// `(cap_x, cap_y)`, the maximum x/y distance from a text item's center
+/// `(cap_x, cap_y)` — the maximum x/y distance from a text item's center
 /// to a candidate empty cell's bbox before the candidate is rejected.
 ///
 /// Caps are derived from cell geometry so they scale with the table:
@@ -2849,7 +3135,7 @@ fn tsr_assignment_caps(cells: &[tables::StructuredCell]) -> (f32, f32) {
 /// For each text item that wasn't claimed by any cell during stage 1,
 /// find the nearest *empty* cell within `(cap_x, cap_y)` of the item's
 /// center and append the item's text to that cell. Cells that already
-/// have content are skipped, stage 2 only fills, never augments.
+/// have content are skipped — stage 2 only fills, never augments.
 ///
 /// Distance is point-to-rect: 0 if the item center is inside the cell's
 /// bbox, else the axis-aligned gap to the nearest edge. Both x-gap and
@@ -2870,11 +3156,18 @@ fn tsr_assign_orphan_items(
     if cap_x <= 0.0 || cap_y <= 0.0 {
         return;
     }
-    // Y-tolerance for "same line as a previous orphan", multi-token branch
+    // The caps come from the cells' page-coordinate boxes; in a turned frame
+    // the page's horizontal extent runs along the frame's y axis and vice
+    // versa, so swap them (and the same-line tolerance derived from cap_y).
+    let (cap_x, cap_y) = match coord_space {
+        RegionCoordSpace::Standard => (cap_x, cap_y),
+        RegionCoordSpace::Rotated90Ccw | RegionCoordSpace::Rotated90Cw => (cap_y, cap_x),
+    };
+    // Y-tolerance for "same line as a previous orphan" — multi-token branch
     // names like "Blue Valley Parkway" are 3 separate text items and should
     // all stack into the same cell. But two orphans on different rows of
     // the PDF (different y values) targeting the same empty cell should
-    // NOT merge, that produces the "Mitchell Woonsocket" / "Shawnee Blue
+    // NOT merge — that produces the "Mitchell Woonsocket" / "Shawnee Blue
     // Valley Parkway" run-on cells. Half a row of slack is conservative.
     let y_tolerance = (cap_y * 0.5).max(3.0);
 
@@ -2908,7 +3201,7 @@ fn tsr_assign_orphan_items(
             continue;
         }
         let cx = item.x + item_w * 0.5;
-        let cy = item.y + item.height * 0.5;
+        let cy = item.y + text_utils::effective_height(item) * 0.5;
 
         let mut best: Option<(usize, f32)> = None;
         for (ci, bounds_opt) in cell_bounds.iter().enumerate() {
@@ -3014,8 +3307,8 @@ struct TsrCellTextLine {
 
 impl TsrCellTextLine {
     fn new(item: TextItem) -> Self {
-        let center_y = item.y + item.height * 0.5;
-        let half_height = (item.height * 0.5).max(2.5);
+        let center_y = item.y + text_utils::effective_height(&item) * 0.5;
+        let half_height = (text_utils::effective_height(&item) * 0.5).max(2.5);
         Self {
             center_y,
             half_height,
@@ -3024,10 +3317,12 @@ impl TsrCellTextLine {
     }
 
     fn add(&mut self, item: TextItem) {
-        let center_y = item.y + item.height * 0.5;
+        let center_y = item.y + text_utils::effective_height(&item) * 0.5;
         let existing = self.items.len() as f32;
         self.center_y = (self.center_y * existing + center_y) / (existing + 1.0);
-        self.half_height = self.half_height.max((item.height * 0.5).max(2.5));
+        self.half_height = self
+            .half_height
+            .max((text_utils::effective_height(&item) * 0.5).max(2.5));
         self.items.push(item);
     }
 
@@ -3076,8 +3371,8 @@ fn cluster_tsr_cell_text_lines(mut items: Vec<TextItem>) -> Vec<TsrCellTextLine>
 
     let mut lines: Vec<TsrCellTextLine> = Vec::new();
     for item in items {
-        let item_top = item.y + item.height;
-        let item_half_height = (item.height * 0.5).max(2.5);
+        let item_top = item.y + text_utils::effective_height(&item);
+        let item_half_height = (text_utils::effective_height(&item) * 0.5).max(2.5);
         if let Some(last) = lines.last_mut() {
             let gap = last.bottom_y() - item_top;
             if gap <= last.half_height.max(item_half_height) {
@@ -3313,10 +3608,10 @@ fn try_expand_multi_row_cells(
 /// Returns `Some(issue)` if the cells look like they reflect a known
 /// SLANet detection pathology. Reasons (also used as metric labels):
 ///
-/// * `phantom_empty_row`, a row whose every cell is empty, surrounded
+/// * `phantom_empty_row` — a row whose every cell is empty, surrounded
 ///   above and below by rows with content. SLANet sometimes emits an
 ///   extra row that doesn't correspond to any visible PDF row.
-/// * `multi_row_in_cell`, at least one non-label `rowspan==1` cell
+/// * `multi_row_in_cell` — at least one non-label `rowspan==1` cell
 ///   encloses PDF text items that cluster into two distinct visual lines
 ///   separated by a whitespace gap larger than the line height. Cells
 ///   declared as `rowspan>1` are excluded since they are *expected*
@@ -3362,33 +3657,33 @@ fn detect_tsr_quality_issue(
     let Some(&page_id) = pages.get(&page_1idx) else {
         return Ok(None);
     };
-    let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
-        extractor::content_stream::extract_page_text_items(
-            &doc,
-            page_id,
-            page_1idx,
-            &font_cmaps,
-            false,
-            &mut extractor::FontStyleCache::new(),
-            &mut extractor::FormWalkBudget::new(),
-        )?;
+    let extractor::PageBoxExtraction {
+        mut items,
+        coords_rotated,
+        page_box,
+        ..
+    } = extractor::extract_page_text_items_in_page_box(
+        &doc,
+        page_id,
+        page_1idx,
+        &font_cmaps,
+        false,
+        &mut extractor::FontStyleCache::new(),
+        &mut extractor::FormWalkBudget::new(),
+    )?;
+    let page_h = page_box.height();
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
-    let coords = if coords_rotated {
-        RegionCoordSpace::Rotated90Ccw
-    } else {
-        RegionCoordSpace::Standard
-    };
+    let coords = RegionCoordSpace::from(coords_rotated);
     let expanded_cells =
         try_expand_multi_row_cells(cells, &items, page_h, coords, adaptive_threshold);
     let first_row = cells.iter().map(|cell| cell.row).min().unwrap_or(0);
     let first_col = cells.iter().map(|cell| cell.col).min().unwrap_or(0);
 
     for cell in cells {
-        // rowspan>1 cells are intentionally multi-line, skip them.
+        // rowspan>1 cells are intentionally multi-line — skip them.
         if cell.rowspan > 1 {
             continue;
         }
@@ -3447,7 +3742,7 @@ fn is_wrapped_tsr_label_cell(
 ///   result is labeled `multi_row_in_cell_expanded` and the heuristic is
 ///   not consulted.
 /// * **Per-input errors**: any failure in detection or heuristic
-///   extraction for a single input is contained, that input
+///   extraction for a single input is contained — that input
 ///   returns the raw TSR markdown with `fallback_reason` set to
 ///   an `_error` label so callers can metric on it. Other inputs
 ///   in the same batch are unaffected.
@@ -3474,7 +3769,7 @@ pub fn extract_tables_with_structure_auto_mem(
         let issue = match detect_tsr_quality_issue(buffer, input, cells) {
             Ok(opt) => opt,
             Err(_) => {
-                // Detection failed for this input, fall through with
+                // Detection failed for this input — fall through with
                 // the raw TSR markdown so the rest of the batch is
                 // unaffected. Tag the reason for caller metrics.
                 results.push(TableExtractionResult {
@@ -3517,7 +3812,7 @@ pub fn extract_tables_with_structure_auto_mem(
                         .and_then(|p| p.regions.into_iter().next().map(|r| r.text))
                         .unwrap_or_default(),
                     Err(_) => {
-                        // Heuristic threw, keep raw TSR markdown.
+                        // Heuristic threw — keep raw TSR markdown.
                         results.push(TableExtractionResult {
                             markdown: tsr_md,
                             fallback_reason: Some(format!("{reason}_heuristic_error")),
@@ -3526,7 +3821,7 @@ pub fn extract_tables_with_structure_auto_mem(
                     }
                 };
                 if heuristic_md.trim().is_empty() {
-                    // Heuristic produced nothing useful, keep TSR
+                    // Heuristic produced nothing useful — keep TSR
                     // markdown rather than ship empty. The reason
                     // suffix lets callers count this case.
                     TableExtractionResult {
@@ -3547,43 +3842,38 @@ pub fn extract_tables_with_structure_auto_mem(
     Ok(results)
 }
 
-/// Get page height in points from MediaBox.
-fn get_page_height(doc: &Document, page_id: lopdf::ObjectId) -> Option<f32> {
-    let page_dict = doc.get_dictionary(page_id).ok()?;
-    // Try MediaBox directly, then follow reference
-    let media_box = page_dict.get(b"MediaBox").ok()?;
-    let arr = match media_box {
-        lopdf::Object::Array(a) => a,
-        lopdf::Object::Reference(r) => {
-            if let Ok(lopdf::Object::Array(a)) = doc.get_object(*r) {
-                a
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
-    if arr.len() >= 4 {
-        let y1 = obj_to_f32(&arr[1])?;
-        let y2 = obj_to_f32(&arr[3])?;
-        Some((y2 - y1).abs())
-    } else {
-        None
-    }
-}
-
-fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
-    match obj {
-        lopdf::Object::Integer(i) => Some(*i as f32),
-        lopdf::Object::Real(f) => Some(*f),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy)]
+/// Coordinate frame the extracted items of a page live in: plain page
+/// coordinates, or the frame turned by the rotated-page correction (see
+/// `extractor::geometry::PageRotation`). Region boxes arrive in page
+/// coordinates and are turned the same way before matching items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegionCoordSpace {
     Standard,
+    /// Frame turned for a counter-clockwise page: `(x, y) → (y, -x)`.
     Rotated90Ccw,
+    /// Frame turned for a clockwise page: `(x, y) → (-y, x)`.
+    Rotated90Cw,
+}
+
+impl From<extractor::geometry::PageRotation> for RegionCoordSpace {
+    fn from(rotation: extractor::geometry::PageRotation) -> Self {
+        use extractor::geometry::PageRotation;
+        match rotation {
+            PageRotation::Upright => RegionCoordSpace::Standard,
+            PageRotation::Ccw => RegionCoordSpace::Rotated90Ccw,
+            PageRotation::Cw => RegionCoordSpace::Rotated90Cw,
+        }
+    }
+}
+
+/// A region rect in the sheet frame's top-left space: unchanged when the
+/// caller gave it there, turned back from the rendered page when it came in
+/// the display frame (`display` is the page's mapping in that case).
+fn sheet_region_rect(rect: [f32; 4], display: Option<extractor::DisplayPage>) -> [f32; 4] {
+    match display {
+        Some(page) => page.region_to_sheet(rect),
+        None => rect,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3596,6 +3886,18 @@ struct RegionBounds {
 
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
+///
+/// `page_height` is the height of the frame the items live in — the visible
+/// page box height for items from [`extract_text_with_positions_mem`].
+///
+/// Items from a page whose text was predominantly rotated live in a turned
+/// coordinate frame (see [`PageRotation`]). This legacy entry point infers
+/// only the counter-clockwise turn, from most items sitting at negative y;
+/// a clockwise turn is never inferred, because content drawn at negative
+/// page x looks the same. Pass the page's frame explicitly with
+/// [`collect_text_in_region_in_frame`] (frames come from
+/// [`extract_text_with_positions_and_rotations_mem`]), or use
+/// [`extract_text_in_regions_mem`], which handles both turns itself.
 pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
@@ -3612,6 +3914,32 @@ pub fn collect_text_in_region(
         ry2,
         page_height,
         infer_region_coord_space(items),
+        0.10,
+    )
+}
+
+/// [`collect_text_in_region`] with the page's coordinate frame given
+/// explicitly instead of inferred: `rotation` is the turn
+/// [`extract_text_with_positions_and_rotations_mem`] reported for the items'
+/// page (`PageRotation::Upright` for pages absent from that map). The region
+/// bbox stays in top-left page coordinates and is turned to match.
+pub fn collect_text_in_region_in_frame(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    rotation: PageRotation,
+) -> String {
+    collect_text_in_region_with_options(
+        items,
+        rx1,
+        ry1,
+        rx2,
+        ry2,
+        page_height,
+        RegionCoordSpace::from(rotation),
         0.10,
     )
 }
@@ -3664,21 +3992,26 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 
     // Simple extraction: the caller (fire-pdf) already handles reading order
     // and column splitting via the layout model. We just need to sort items
-    // top-to-bottom, left-to-right and group into lines.
+    // top-to-bottom, left-to-right and group into lines. Baselines go
+    // through `line_y`, which snaps super/subscript glyph runs onto the body
+    // baseline they are attached to: sorting raw `y` put every raised
+    // affiliation marker of an author line ahead of the names, and the 3pt
+    // window then emitted them as an orphan ",2,3,2,4,*" line.
     let mut sorted = matched;
-    sorted.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    sorted.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
+    let region_rtl = text_utils::is_rtl_text(sorted.iter().map(|i| &i.text));
 
     let y_tolerance = 3.0;
     let mut lines: Vec<extractor::TextLine> = Vec::new();
 
     for item in sorted {
         let should_merge = lines.last().is_some_and(|last_line: &extractor::TextLine| {
-            last_line.page == item.page && (last_line.y - item.y).abs() < y_tolerance
+            last_line.page == item.page && (last_line.y - item.line_y()).abs() < y_tolerance
         });
         if should_merge {
             lines.last_mut().unwrap().items.push(item);
         } else {
-            let y = item.y;
+            let y = item.line_y();
             let page = item.page;
             lines.push(extractor::TextLine {
                 items: vec![item],
@@ -3691,7 +4024,7 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 
     // Sort items within each line by X position
     for line in &mut lines {
-        text_utils::sort_line_items(&mut line.items);
+        text_utils::sort_line_items(&mut line.items, region_rtl);
     }
 
     lines
@@ -3702,9 +4035,18 @@ fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f
 }
 
 fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
-    // Rotated-page normalization currently maps y = -old_x, so most text items
-    // land at negative Y. Use this to keep `collect_text_in_region` behavior
-    // compatible for direct callers that do not have extractor metadata.
+    // Rotated-page correction negates one axis: a counter-clockwise turn
+    // maps y = -(old right edge), a clockwise turn maps x = -(old top edge),
+    // so most items land at negative y or negative x respectively. Use this
+    // to keep `collect_text_in_region` behavior compatible for direct
+    // callers that do not have extractor metadata.
+    // Legacy heuristic for callers without extractor metadata: a
+    // counter-clockwise turn maps y = -(old right edge), so most items land
+    // at negative y (the pre-existing rule, kept as is). A clockwise turn is
+    // never inferred — its signature (negative x) cannot be told apart from
+    // content drawn at negative page coordinates. Callers pass the frame
+    // explicitly through `collect_text_in_region_in_frame` or use
+    // `extract_text_in_regions_mem`, which carries the page rotation itself.
     let negative_y = items.iter().filter(|item| item.y < 0.0).count();
     if !items.is_empty() && negative_y * 2 >= items.len() {
         RegionCoordSpace::Rotated90Ccw
@@ -3713,6 +4055,9 @@ fn infer_region_coord_space(items: &[TextItem]) -> RegionCoordSpace {
     }
 }
 
+/// Convert a top-left-origin region into bounds in the item frame.
+/// `page_height` is the visible page box height: items were shifted into
+/// that box, so flipping `y` by its height lands regions on them.
 fn region_bounds(
     rx1: f32,
     ry1: f32,
@@ -3740,19 +4085,25 @@ fn region_bounds(
             y_min: -tx_max,
             y_max: -tx_min,
         },
+        RegionCoordSpace::Rotated90Cw => RegionBounds {
+            x_min: -by_max,
+            x_max: -by_min,
+            y_min: tx_min,
+            y_max: tx_max,
+        },
     }
 }
 
 /// Inclusion margin shared by the region/item overlap predicates and the
-/// exclusive-assignment area score, these MUST stay in sync: an item that
+/// exclusive-assignment area score — these MUST stay in sync: an item that
 /// passes the boolean guard must always have positive overlap area.
 const REGION_MARGIN: f32 = 1.5;
 
 /// Overlap area between an item and region bounds (same margin as the
-/// boolean test), the exclusive-assignment score.
+/// boolean test) — the exclusive-assignment score.
 fn region_item_overlap_area(item: &TextItem, bounds: RegionBounds) -> f32 {
     let item_x_max = item.x + text_utils::effective_width(item);
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
     let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
         - item.x.max(bounds.x_min - REGION_MARGIN))
     .max(0.0);
@@ -3766,7 +4117,7 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
 
     let x_overlap = (item_x_max.min(bounds.x_max + REGION_MARGIN)
         - item_x_min.max(bounds.x_min - REGION_MARGIN))
@@ -3818,7 +4169,7 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_x_min = item.x;
     let item_x_max = item.x + text_utils::effective_width(item);
     let item_y_min = item.y;
-    let item_y_max = item.y + item.height;
+    let item_y_max = item.y + text_utils::effective_height(item);
 
     let center_x = (item_x_min + item_x_max) * 0.5;
     let center_y = (item_y_min + item_y_max) * 0.5;
@@ -3858,7 +4209,7 @@ pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
     path: P,
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
-    let buffer = std::fs::read(&path)?;
+    let buffer = read_file(path.as_ref())?;
     load_document_from_mem_with_password(&buffer, password)
 }
 
@@ -3872,21 +4223,65 @@ pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
+    load_document_from_mem_with_repairs(buffer, password)
+        .map(|(doc, page_count, _)| (doc, page_count))
+}
+
+/// Repairs applied to a document's objects once it is loaded, beyond the
+/// container repairs the loader tries when a file does not parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LoadRepairs {
+    /// Form XObjects whose zero-area `/BBox` was widened
+    /// (see `form_bbox_repair`).
+    pub(crate) widened_form_bboxes: usize,
+    /// `/BBox` numerals too large for any parser, saturated in the file's
+    /// bytes before it was read (see `overlong_numerals`).
+    pub(crate) saturated_bbox_numerals: usize,
+}
+
+impl LoadRepairs {
+    /// Whether a Form XObject was repaired: a renderer given the original
+    /// bytes would lose it again.
+    pub(crate) fn repaired_forms(&self) -> bool {
+        self.widened_form_bboxes > 0 || self.saturated_bbox_numerals > 0
+    }
+}
+
+/// [`load_document_from_mem_with_password`], also reporting the repairs
+/// applied to the loaded objects.
+pub(crate) fn load_document_from_mem_with_repairs(
+    buffer: &[u8],
+    password: Option<&str>,
+) -> Result<(Document, u32, LoadRepairs), PdfError> {
+    // Drop anything before the `%PDF-` header. Cross-reference offsets are
+    // header-relative in every major reader (mupdf, pdfium, poppler, pdf.js;
+    // lopdf slices at `%PDF-` internally as well), so this keeps them exact
+    // for lopdf and for the repair candidates below. A file whose offsets are
+    // off by a constant anyway — they count the leading bytes, or a
+    // version-like mention in the leading bytes was taken for the header — is
+    // recovered by lopdf's cross-reference reconstruction, the same path every
+    // reader takes for it.
+    let buffer = strip_leading_bytes_before_header(buffer);
+
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match load_document_bytes(buf, password) {
-        Ok(doc) => doc,
+    match load_document_bytes(buf, password) {
+        Ok(doc) => {
+            let (doc, saturated) = reload_after_saturating_bbox_numerals(doc, buf, password);
+            finish_loaded_document(doc, saturated)
+        }
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
-                        let page_count = doc.get_pages().len() as u32;
-                        return Ok((doc, page_count));
+                        let (doc, saturated) =
+                            reload_after_saturating_bbox_numerals(doc, &repaired, password);
+                        return finish_loaded_document(doc, saturated);
                     }
                     Err(e) => {
                         if is_encrypted_lopdf_error(&e) {
@@ -3895,15 +4290,108 @@ pub(crate) fn load_document_from_mem_with_password(
                     }
                 }
             }
-            return Err(first_err.into());
+            Err(first_err.into())
         }
+    }
+}
+
+/// The document loaded again from `bytes` with the `/BBox` numerals of its
+/// unloaded objects saturated (see `overlong_numerals`), when that brings
+/// objects in — otherwise `doc` as it came — and then with the `/BBox`
+/// arrays its object streams could not yield recovered into it; with the
+/// count of numerals saturated either way.
+fn reload_after_saturating_bbox_numerals(
+    doc: Document,
+    bytes: &[u8],
+    password: Option<&str>,
+) -> (Document, usize) {
+    let (mut doc, count) = match overlong_numerals::saturate_overlong_bbox_numerals(bytes, &doc) {
+        Some((rewritten, count)) => match load_document_bytes(&rewritten, password) {
+            Ok(reloaded) if reloaded.objects.len() > doc.objects.len() => {
+                log::debug!("loaded PDF after saturating {count} /BBox numeral(s) no parser holds");
+                (reloaded, count)
+            }
+            _ => (doc, 0),
+        },
+        None => (doc, 0),
     };
+    let in_object_streams =
+        overlong_numerals::recover_referenced_bboxes_in_object_streams(&mut doc);
+    if in_object_streams > 0 {
+        log::debug!(
+            "recovered /BBox array(s) from object streams after saturating {in_object_streams} \
+             numeral(s) no parser holds"
+        );
+    }
+    (doc, count + in_object_streams)
+}
+
+/// A loaded document with zero pages is unusable by every caller, and with
+/// the decompression bound in place it can also mean the page tree lived in
+/// an object stream lopdf skipped for exceeding the bound. Fail the load
+/// either way rather than letting a pageless document masquerade as a
+/// successful parse.
+fn finish_loaded_document(
+    mut doc: Document,
+    saturated_bbox_numerals: usize,
+) -> Result<(Document, u32, LoadRepairs), PdfError> {
     let page_count = doc.get_pages().len() as u32;
-    Ok((doc, page_count))
+    if page_count == 0 {
+        return Err(PdfError::Parse(
+            "document has no readable pages".to_string(),
+        ));
+    }
+    // lopdf drops the contents of object streams it could not expand (over
+    // the decompression bound, or unparseable) without any signal on the
+    // returned document. The only trace either loader path leaves is a
+    // deficit between the xref size (`max_id`) and the objects actually
+    // loaded — which free xref entries also contribute to, so this is a
+    // heuristic: surface large deficits for diagnosability, worded so a
+    // legitimately sparse xref isn't reported as data loss. The document is
+    // still usable either way; unloaded objects resolve as not-found.
+    let expected = doc.max_id as usize;
+    let loaded = doc.objects.len();
+    let missing = expected.saturating_sub(loaded);
+    if missing > 1000 && missing.saturating_mul(64) > expected {
+        log::warn!(
+            "loaded {loaded} of {expected} xref object slots; the rest are free \
+             xref entries or object streams skipped over the \
+             {MAX_STREAM_DECOMPRESSED_BYTES}-byte decompression bound, and will \
+             resolve as not-found"
+        );
+    }
+    let repairs = LoadRepairs {
+        widened_form_bboxes: form_bbox_repair::widen_degenerate_form_bboxes(&mut doc),
+        saturated_bbox_numerals,
+    };
+    Ok((doc, page_count, repairs))
+}
+
+/// Per-stream decompression budget applied while loading (object streams and
+/// xref streams), and the bound within which the detector reads a font's
+/// ToUnicode CMap (`detector::font_decoder`), object streams are read again
+/// for overlong numerals (`overlong_numerals`), and a CID font's embedded
+/// program is read to tell whether its subset was renumbered
+/// (`tounicode::try_remap_subset_cmap`): none of those streams costs more
+/// than a stream the loader materializes, and changing the bound changes
+/// them all. Some tagged PDFs pack their structure tree into object
+/// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
+/// materializes every object stream eagerly at load, so without a bound one
+/// such document exhausts memory before any of our code runs. lopdf skips an
+/// object stream that would exceed the bound (its objects resolve as
+/// not-found), which the zero-page check in `load_document_from_mem_with_password`
+/// turns into a load error instead of a silently wrong answer.
+pub(crate) const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_load_options() -> lopdf::LoadOptions {
+    lopdf::LoadOptions {
+        max_decompressed_size: Some(MAX_STREAM_DECOMPRESSED_BYTES),
+        ..Default::default()
+    }
 }
 
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    match Document::load_mem(buf) {
+    match Document::load_mem_with_options(buf, bounded_load_options()) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
@@ -3920,11 +4408,14 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// non-empty password was supplied but rejected.
 fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
-    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+    let with_password = |pw: &str| lopdf::LoadOptions {
+        password: Some(pw.to_string()),
+        ..bounded_load_options()
+    };
+    match Document::load_mem_with_options(buf, with_password(pw)) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
-                .map_err(|_| inner)
+            Document::load_mem_with_options(buf, with_password("")).map_err(|_| inner)
         }
         Err(inner) => Err(inner),
     }
@@ -3935,43 +4426,33 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
-
-    let stripped = strip_leading_pdf_container_bytes(buf);
-    if let Some(stripped_buf) = stripped.as_deref() {
-        add_repair_candidate(&mut candidates, Some(stripped_buf.to_vec()), buf);
-        add_repair_candidate(
-            &mut candidates,
-            append_missing_eof_marker(stripped_buf),
-            buf,
-        );
-        add_repair_candidate(
-            &mut candidates,
-            recover_startxref_pointer(stripped_buf),
-            buf,
-        );
-    }
+    add_repair_candidate(
+        &mut candidates,
+        xref_repair::rebuild_short_xref_entries(buf),
+        buf,
+    );
 
     candidates
 }
 
 /// Some PDF writers emit a `startxref` pointer that doesn't actually point
-/// at the cross-reference table, a single corrupted byte in the offset is
+/// at the cross-reference table — a single corrupted byte in the offset is
 /// enough. lopdf trusts that pointer outright and fails to load rather than
 /// searching for the real table, unlike pypdf/pdfium which both recover by
 /// locating it directly. This finds the real (classic, non-stream) `xref`
-/// table by scanning for the keyword, validating that a plausible
+/// table by scanning for the keyword — validating that a plausible
 /// subsection header follows, not just any standalone "xref" token, since
 /// this crate processes untrusted input and a coincidental match inside
 /// unrelated stream/string content must not get "repaired" against a bogus
 /// offset (lopdf would then load successfully against garbage instead of
-/// returning a clean error), and appends a corrected trailing
+/// returning a clean error) — and appends a corrected trailing
 /// `startxref`/`%%EOF` block. lopdf's own `get_xref_start` always uses the
 /// *last* `%%EOF` in the final 512 bytes of the buffer, so ours
 /// transparently supersedes the broken one without needing to touch
 /// anything already in the file.
 ///
 /// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
-/// used by some PDF 1.5+ writers instead of a classic table), recovering
+/// used by some PDF 1.5+ writers instead of a classic table) — recovering
 /// those needs the containing object's number, not just a byte offset.
 fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
     let xref_pos = find_last_valid_xref_table_start(buf)?;
@@ -3987,7 +4468,7 @@ fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
 
 /// Finds the last standalone `xref` token in `buf` that is immediately
 /// followed by a plausible classic cross-reference subsection header
-/// (`<start-id> <count>`, e.g. "0 6"), the shape every real classic xref
+/// (`<start-id> <count>`, e.g. "0 6") — the shape every real classic xref
 /// table starts with. A single reverse byte scan: O(n) even on a
 /// pathological buffer with many non-matching or non-standalone "xref"
 /// occurrences, unlike repeatedly re-searching a shrinking prefix.
@@ -4016,7 +4497,7 @@ fn find_last_valid_xref_table_start(buf: &[u8]) -> Option<usize> {
 }
 
 /// Checks that `buf[pos..]` starts (after whitespace) with two
-/// whitespace-separated runs of ASCII digits, `<start-id> <count>`, the
+/// whitespace-separated runs of ASCII digits — `<start-id> <count>`, the
 /// first subsection header of a classic PDF cross-reference table.
 fn looks_like_xref_subsection_header(buf: &[u8], pos: usize) -> bool {
     fn skip_ws(buf: &[u8], mut pos: usize) -> usize {
@@ -4092,24 +4573,6 @@ fn contains_recent_eof_marker(buf: &[u8]) -> bool {
     buf[start..].windows(b"%%EOF".len()).any(|w| w == b"%%EOF")
 }
 
-fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
-    let mut start = if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        3
-    } else {
-        0
-    };
-
-    while start < buf.len() && buf[start].is_ascii_whitespace() {
-        start += 1;
-    }
-
-    if start > 0 && buf[start..].starts_with(b"%PDF-") {
-        Some(buf[start..].to_vec())
-    } else {
-        None
-    }
-}
-
 /// Core processing pipeline operating on a pre-loaded document.
 fn process_document(
     doc: Document,
@@ -4117,11 +4580,18 @@ fn process_document(
     options: PdfOptions,
     start: ProcessingTimer,
 ) -> Result<PdfProcessResult, PdfError> {
-    // Step 1, Detection (cheap: scans content streams for text operators)
+    // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
+    let author = detection.author;
+    let subject = detection.subject;
+    let keywords = detection.keywords;
+    let creator = detection.creator;
+    let producer = detection.producer;
+    let creation_date = detection.creation_date;
+    let mod_date = detection.mod_date;
     let confidence = detection.confidence;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
@@ -4135,9 +4605,17 @@ fn process_document(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
@@ -4151,13 +4629,21 @@ fn process_document(
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
             title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
-    // Step 2, Extraction (reuses the already-loaded document)
+    // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
         // Most page-filtered requests extract only the selected pages. Gather
@@ -4172,14 +4658,8 @@ fn process_document(
         // For Mixed/template PDFs: if normal extraction produces garbage text
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
-        //
-        // The sample judges what was *read*, so raster placeholders are
-        // excluded for the same reason `non_placeholder_alnum` excludes them:
-        // a scanned page whose only items are `[Image: ...]` would otherwise
-        // look like readable text and skip the retry that recovers its OCR
-        // layer.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+            if let Ok(((items, _, _), _, _, _, _, skipped_invisible)) = result.as_ref() {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4192,7 +4672,9 @@ fn process_document(
                     .take(200)
                     .map(|item| item.text.as_str())
                     .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
+                // Images do not count as readable text, but image-only scans
+                // without an OCR layer have nothing to recover on a second pass.
+                if *skipped_invisible && (is_garbage_text(&sample) || sample.trim().is_empty()) {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
@@ -4202,7 +4684,7 @@ fn process_document(
                     result
                 }
             } else {
-                // Normal extraction failed, try invisible as fallback
+                // Normal extraction failed — try invisible as fallback
                 extractor::extract_positioned_text_include_invisible_with_folio_context(
                     &doc,
                     &font_cmaps,
@@ -4247,15 +4729,23 @@ fn process_document(
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
+        cmap_gaps,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+        Some((
+            (items, rects, lines),
+            page_thresholds,
+            gid_encoded_pages,
+            _page_rotations,
+            cmap_coverage,
+            _skipped_invisible,
+        )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
             // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
             // passthrough actually produced readable text.  If a page's text
             // is garbage, strip its items so we don't emit mojibake.
-            // Only applies to TextBased, for Mixed PDFs, OCR flags come from
+            // Only applies to TextBased — for Mixed PDFs, OCR flags come from
             // template images rather than font encoding issues.
             let (items, rects, lines) =
                 if pages_needing_ocr.is_empty() || pdf_type != PdfType::TextBased {
@@ -4373,8 +4863,13 @@ fn process_document(
                 ))
             };
 
+            // A code no CMap could read is an encoding issue whether or not
+            // the Markdown that would show its U+FFFD is generated in this
+            // mode; a gap read from its neighbours is not one.
+            let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
             let enc = !ocr_reasons_by_page.is_empty()
                 || text_quality.has_encoding_issues
+                || cmap_unmapped
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
@@ -4383,6 +4878,7 @@ fn process_document(
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
+                font_cmap_gaps(cmap_coverage),
             )
         }
         None => (
@@ -4392,11 +4888,12 @@ fn process_document(
             std::collections::HashSet::new(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
         ),
     };
 
     // If the extracted text is predominantly garbage (non-alphanumeric) and
-    // the PDF is image-backed (Mixed/template), upgrade to Scanned, the text
+    // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
     // layer comes from a bad OCR pass, and callers should use proper OCR.
     let (pdf_type, markdown, confidence) =
         if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
@@ -4411,7 +4908,7 @@ fn process_document(
     let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
         && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
     {
-        log::debug!("TextBased PDF has garbage text, flagging all pages for OCR");
+        log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
         (None, true, true)
     } else {
         (markdown, has_encoding_issues, false)
@@ -4460,7 +4957,7 @@ fn process_document(
         let chars_per_page = md_len as f32 / page_count as f32;
         if chars_per_page < 50.0 && md_len < 500 {
             log::debug!(
-                "sparse extraction: {:.0} chars/page, recommending OCR for all {} pages",
+                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
                 chars_per_page,
                 page_count
             );
@@ -4470,7 +4967,7 @@ fn process_document(
 
     let markdown = if all_gid {
         log::debug!(
-            "all {} pages have gid-encoded fonts, suppressing markdown output",
+            "all {} pages have gid-encoded fonts — suppressing markdown output",
             page_count
         );
         None
@@ -4485,17 +4982,41 @@ fn process_document(
         processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {
-            // Detector reasons (scanned / no_text / vector_text / garbled) merged
-            // with the markdown-stage garbled detection, deduped per page.
+            // Detector reasons (scanned / no_text / vector_text /
+            // invisible_text_layer / garbled) merged with the
+            // markdown-stage garbled detection, deduped per page.
             let mut merged = detection_ocr_reasons;
             merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
             page_ocr_reasons_vec(merged)
         },
         title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
         confidence,
         layout,
         has_encoding_issues,
+        cmap_gaps,
     })
+}
+
+/// The fonts whose CMap lacked an entry for a code shown through it, with
+/// their counts, from the per-font coverage of an extraction.
+fn font_cmap_gaps(coverage: types::CMapCoverageByFont) -> Vec<FontCMapGaps> {
+    coverage
+        .into_iter()
+        .filter(|(_, stats)| stats.has_gaps())
+        .map(|(font, stats)| FontCMapGaps {
+            font,
+            codes: stats.codes,
+            interpolated: stats.interpolated,
+            unmapped: stats.unmapped,
+        })
+        .collect()
 }
 
 // =========================================================================
@@ -4548,15 +5069,15 @@ fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<Page
 ///
 /// Catches three failure modes observed in production:
 ///
-/// 1. **Header row looks like a data row**, first row starts with a numeric
+/// 1. **Header row looks like a data row** — first row starts with a numeric
 ///    value (e.g. `|2|...`), suggesting we missed the actual header above it.
 ///    Real headers almost never start with a bare number.
 ///
-/// 2. **Header has empty cells in a multi-column table**, e.g.
+/// 2. **Header has empty cells in a multi-column table** — e.g.
 ///    `|Position||Administration|Administration|` (3+ cols, ≥1 empty cell).
 ///    Indicates poor column boundary detection.
 ///
-/// 3. **Header has duplicate non-empty cells** in a multi-column table,
+/// 3. **Header has duplicate non-empty cells** in a multi-column table —
 ///    e.g. `Administration|Administration` appearing as adjacent cells means
 ///    we collapsed multi-line headers wrong.
 ///
@@ -4565,13 +5086,13 @@ fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<Page
 /// When `layout_assisted` is true (the layout model identified this region
 /// as a table), we relax boundary-detection heuristics (numeric header,
 /// empty header cells, sparse first data row) because the layout model
-/// already gave us the table bbox, we're not guessing "is this a table?"
+/// already gave us the table bbox — we're not guessing "is this a table?"
 /// anymore, only "can we extract it correctly?". Paragraph and duplicate-
 /// header checks stay, since those indicate genuine extraction quality
 /// issues regardless of how the region was identified.
 /// Return true when the captured table markdown represents only a small
 /// fraction of the text the page extractor actually saw inside the
-/// region, typically a header-only band or a sparse fragment where
+/// region — typically a header-only band or a sparse fragment where
 /// the detector found valid grid structure but missed most of the
 /// data rows below.
 ///
@@ -4592,7 +5113,7 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
 }
 
 /// Return true when the text the page extractor saw inside this region
-/// is far too little for the bbox area, a strong signal that the page
+/// is far too little for the bbox area — a strong signal that the page
 /// has a font-CMap failure: Identity-H fonts with missing or broken
 /// ToUnicode entries, Type-3 fonts without unicode metadata, etc. The
 /// rendered image still carries the visible text (so GLM-OCR will
@@ -4601,7 +5122,7 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
 ///
 /// `captured_only_a_fragment` can't catch this case on its own because
 /// `region_text_chars` is itself symmetrically low under font-decode
-/// failure, the captured-vs-region ratio still looks fine when both
+/// failure — the captured-vs-region ratio still looks fine when both
 /// numerator and denominator collapse. The area-based floor breaks the
 /// symmetry: bbox area is independent of extraction success.
 ///
@@ -4620,7 +5141,7 @@ fn captured_only_a_fragment(markdown: &str, region_text_chars: usize) -> bool {
 ///   - area > 400,000 sq pt: near-whole-A4 bboxes include large
 ///     white-space margins, so density is unreliable. Real font-
 ///     decode failures present at typical table sizes
-///     (50k-400k sq pt).
+///     (50k–400k sq pt).
 fn region_text_density_too_low(region_text_chars: usize, region_area: f32) -> bool {
     if region_text_chars < 20 {
         return false;
@@ -4903,7 +5424,7 @@ fn text_cluster_column_undercount(items: &[TextItem], shape: MarkdownTableShape)
         return false;
     }
 
-    // Count "significant" x-clusters, clusters whose item count is at
+    // Count "significant" x-clusters — clusters whose item count is at
     // least 1/4 of the dominant cluster. Filters out within-cell text
     // variation (wrapped continuations, bullet starts, indents) that
     // produces many small x-clusters not corresponding to real columns.
@@ -5125,7 +5646,7 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     let separator_line = lines.get(1).copied().unwrap_or("");
     let is_separator = |l: &str| l.chars().all(|c| matches!(c, '|' | '-' | ' '));
     if !is_separator(separator_line) {
-        // No separator after the first line, not a well-formed pipe-table.
+        // No separator after the first line — not a well-formed pipe-table.
         // table_to_markdown always emits one when it returns content, so this
         // shouldn't happen in practice. If it does, fall through to OCR.
         return true;
@@ -5151,7 +5672,7 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     }
 
     // Failure mode 1: header starts with a bare number (likely we missed
-    // the real header row above). Skip when layout-assisted, the layout
+    // the real header row above). Skip when layout-assisted — the layout
     // model's bbox includes the real header; a numeric first cell (e.g.,
     // a year "2024") is legitimate.
     if !layout_assisted {
@@ -5211,7 +5732,7 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
             let empty_data = data_inner.iter().filter(|c| c.is_empty()).count();
             // ≥3 cols, and significant portion of cells in the first data
             // row are empty → likely we mis-split a multi-row header.
-            // When layout-assisted, relax from 33% to 50%, the bbox is
+            // When layout-assisted, relax from 33% to 50% — the bbox is
             // more reliable, and real tables with one sparse first row
             // (totals, subtotals) are common.
             let threshold = if layout_assisted { 2 } else { 3 };
@@ -5386,14 +5907,24 @@ mod text_cluster_column_undercount_tests {
             height: 10.0,
             font: "F".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -5432,21 +5963,21 @@ mod text_cluster_column_undercount_tests {
 
     #[test]
     fn matching_geometry_does_not_fire() {
-        // 4-col page with 4-col markdown, no undercount.
+        // 4-col page with 4-col markdown — no undercount.
         let items = make_four_column_grid();
         assert!(!text_cluster_column_undercount(&items, shape(4)));
     }
 
     #[test]
     fn single_column_skipped() {
-        // 1-col markdown is not a table, never flag.
+        // 1-col markdown is not a table — never flag.
         let items = make_four_column_grid();
         assert!(!text_cluster_column_undercount(&items, shape(1)));
     }
 
     #[test]
     fn insufficient_items_skipped() {
-        // < 2*table_cols items, not enough signal to claim undercount.
+        // < 2*table_cols items — not enough signal to claim undercount.
         let items = vec![
             item(60.0, 700.0, "x"),
             item(145.0, 700.0, "x"),
@@ -5476,7 +6007,7 @@ mod text_cluster_column_undercount_tests {
     fn wide_table_path_still_fires() {
         // The original wide-table case: 6+ markdown cols with ≥2 extra
         // significant clusters. Builds a 12-col geometry with 8-col
-        // markdown, the legacy wide-undercount path catches this.
+        // markdown — the legacy wide-undercount path catches this.
         let mut items = Vec::new();
         let xs: Vec<f32> = (0..12).map(|i| 50.0 + i as f32 * 40.0).collect();
         for row in 0..22 {
@@ -5495,7 +6026,7 @@ mod region_text_density_tests {
 
     #[test]
     fn small_region_skips_check() {
-        // Tiny stat blocks below the area floor are never flagged,
+        // Tiny stat blocks below the area floor are never flagged —
         // can't distinguish "font failure" from "small legitimate table".
         // 100×100 = 10,000 sq pt, below the 30,000 floor.
         assert!(!region_text_density_too_low(5, 10_000.0));
@@ -5503,7 +6034,7 @@ mod region_text_density_tests {
 
     #[test]
     fn dense_full_table_passes() {
-        // Observed clean extractions sit at 0.005-0.015 chars/sq pt.
+        // Observed clean extractions sit at 0.005–0.015 chars/sq pt.
         // Full A4 ledger: 438,000 sq pt with 6,500 chars → density 0.015.
         assert!(!region_text_density_too_low(6_500, 438_000.0));
     }
@@ -5517,7 +6048,7 @@ mod region_text_density_tests {
 
     #[test]
     fn font_decode_failure_caught() {
-        // Big region, almost no extractable text, page extractor hit a
+        // Big region, almost no extractable text — page extractor hit a
         // CMap failure. 102,000 sq pt with 46 chars → density 0.0005.
         assert!(region_text_density_too_low(46, 102_000.0));
     }
@@ -5526,7 +6057,7 @@ mod region_text_density_tests {
     fn sparse_glyph_repeat_caught() {
         // Full-page Cyrillic where every glyph decoded to "Т". The text
         // extractor returned a few hundred chars, but they're all the
-        // same letter. Density 0.00025, well under the floor.
+        // same letter. Density 0.00025 — well under the floor.
         assert!(region_text_density_too_low(89, 353_000.0));
     }
 
@@ -5544,7 +6075,7 @@ mod region_text_density_tests {
         // exactly. The check rejects when density is strictly less than
         // the floor, so the boundary is treated as acceptable.
         assert!(!region_text_density_too_low(90, 30_000.0));
-        // Just under: 89 chars / 30,000 = 0.00297, flagged.
+        // Just under: 89 chars / 30,000 = 0.00297 — flagged.
         assert!(region_text_density_too_low(89, 30_000.0));
     }
 
@@ -5562,7 +6093,7 @@ mod region_text_density_tests {
     #[test]
     fn tiny_text_chars_skips_check() {
         // Synthetic / fragmentary fixtures with <20 chars in a
-        // generously-sized bbox aren't font-decode failures, they're
+        // generously-sized bbox aren't font-decode failures — they're
         // unit-test artifacts. Real prod failures decode ≥30 chars.
         // 8 chars in a 127,800 sq pt bbox would otherwise flag at
         // density 0.00006.
@@ -5584,7 +6115,7 @@ mod captured_only_a_fragment_tests {
 
     #[test]
     fn full_table_passes() {
-        // Captured markdown matches the region text, full extraction.
+        // Captured markdown matches the region text — full extraction.
         let md =
             "|Name|Year|Country|\n|---|---|---|\n|Alice|2020|US|\n|Bob|2021|UK|\n|Carol|2019|FR|";
         // Region had ~50 chars of text (rough estimate of just the data words).
@@ -5612,10 +6143,10 @@ mod captured_only_a_fragment_tests {
     fn boundary_at_25_percent_floor() {
         // Right at the 25% line: 250 captured chars of 1000 region chars.
         // The check rejects when captured*4 < region, so 250*4=1000 is NOT
-        // less than 1000, boundary is treated as acceptable.
+        // less than 1000 — boundary is treated as acceptable.
         let md = "x".repeat(250);
         assert!(!captured_only_a_fragment(&md, 1000));
-        // Just under 25%: 249*4=996 < 1000, flagged.
+        // Just under 25%: 249*4=996 < 1000 — flagged.
         let md_under = "x".repeat(249);
         assert!(captured_only_a_fragment(&md_under, 1000));
     }
@@ -5663,14 +6194,24 @@ mod table_candidate_selection_tests {
             height: 10.0,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -5876,7 +6417,7 @@ mod looks_like_partial_table_tests {
     fn two_column_with_one_empty_cell_passes() {
         // Many real two-column tables have key-only rows; don't penalise.
         let md = "|Key||\n|---|---|\n|Alice|123|\n|Bob|456|";
-        // Header "Key|" has one empty cell but only 2 cols total, keep it.
+        // Header "Key|" has one empty cell but only 2 cols total — keep it.
         assert!(!looks_like_partial_table(md));
     }
 
@@ -5890,7 +6431,7 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn no_table_at_all_returns_true() {
-        // table_to_markdown should never produce this, but defensive, if
+        // table_to_markdown should never produce this, but defensive — if
         // there's no separator, treat as not-a-table.
         let md = "Just some text\nWith multiple lines";
         // No lines start with '|' so we return false (no header to inspect).
@@ -5929,7 +6470,7 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn real_multi_word_table_is_kept() {
-        // Real table with multi-word entries, cells start with capital
+        // Real table with multi-word entries — cells start with capital
         // letters / proper nouns, NOT lowercase continuations.
         let md = "|Country|Capital|Notes|\n\
                   |---|---|---|\n\
@@ -6056,7 +6597,7 @@ mod looks_like_partial_table_tests {
 
     #[test]
     fn paragraph_still_rejected_when_layout_assisted() {
-        // Paragraph detection is not relaxed, it's a genuine extraction issue.
+        // Paragraph detection is not relaxed — it's a genuine extraction issue.
         let md = "|Approval is needed from the|Acquisitions of|\n\
                   |---|---|\n\
                   |Treasurer if the acquisition|residential and|\n\
@@ -6221,7 +6762,7 @@ fn compute_layout_complexity_with_chart_regions(
             .unwrap_or_default();
 
         let band_ranges: Vec<(f32, f32)> = if bands.is_empty() {
-            // Single region, use sentinel range that includes everything
+            // Single region — use sentinel range that includes everything
             vec![(f32::MIN, f32::MAX)]
         } else {
             bands
@@ -6451,32 +6992,124 @@ fn detect_file_type_hint(bytes: &[u8]) -> String {
     "file is not a PDF".to_string()
 }
 
+/// The `%PDF` header must *start* within this many bytes of the buffer.
+///
+/// mupdf, pdfium and poppler all accept a header that is not at offset 0
+/// (leading bytes before the header, e.g. an echoed multipart envelope or a
+/// UTF-8 BOM); this mirrors that tolerance with a bounded search.
+const PDF_HEADER_SEARCH_WINDOW: usize = 1024;
+
+/// Longest header the locator inspects: `%PDF-M.N` plus its line ending.
+const PDF_HEADER_PROBE_LEN: usize = 9;
+
+/// Byte offset of the `%PDF-` header within the first
+/// [`PDF_HEADER_SEARCH_WINDOW`] bytes of `buffer`.
+///
+/// Candidates are ranked by how much they look like a real header line, and
+/// by buffer order within a rank: a canonical `%PDF-M.N` line (starting a
+/// line and ending at a line break) first, then `%PDF-` followed by a version
+/// digit, then any other `%PDF-`. A version-like mention inside leading text
+/// (`X-Note: %PDF-1.4`, say) therefore does not outrank the actual header.
+/// lopdf's own header parser requires the literal `%PDF-`, so a bare `%PDF`
+/// is not a candidate.
+fn pdf_header_offset(buffer: &[u8]) -> Option<usize> {
+    // Only the start of the marker is bounded by the window; let the marker
+    // itself run past it.
+    let probe_end = (PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN).min(buffer.len());
+    let probe = &buffer[..probe_end];
+
+    let mut best: Option<(u8, usize)> = None;
+    for (offset, window) in probe
+        .windows(b"%PDF-".len())
+        .enumerate()
+        .take(PDF_HEADER_SEARCH_WINDOW)
+    {
+        if window != b"%PDF-" {
+            continue;
+        }
+        let version = &probe[offset + b"%PDF-".len()..];
+        let at_line_start = offset == 0 || matches!(probe[offset - 1], b'\r' | b'\n');
+        let rank = if at_line_start && is_canonical_pdf_version_line(version) {
+            return Some(offset);
+        } else if version.first().is_some_and(u8::is_ascii_digit) {
+            1
+        } else {
+            2
+        };
+        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+            best = Some((rank, offset));
+        }
+    }
+    best.map(|(_, offset)| offset)
+}
+
+/// `M.N` immediately followed by a line ending (or the end of the probe),
+/// i.e. the bytes after `%PDF-` on a canonical header line.
+fn is_canonical_pdf_version_line(version: &[u8]) -> bool {
+    matches!(version, [major, b'.', minor, rest @ ..]
+        if major.is_ascii_digit()
+            && minor.is_ascii_digit()
+            && rest.first().is_none_or(|b| matches!(b, b'\r' | b'\n')))
+}
+
+/// Return `buffer` starting at its `%PDF-` header, dropping any leading bytes.
+///
+/// Returns `buffer` unchanged when no header is found so the loader reports
+/// its own error.
+fn strip_leading_bytes_before_header(buffer: &[u8]) -> &[u8] {
+    match pdf_header_offset(buffer) {
+        Some(offset) if offset > 0 => {
+            log::debug!("dropping {offset} leading bytes before the %PDF- header");
+            &buffer[offset..]
+        }
+        _ => buffer,
+    }
+}
+
 /// Validate that a byte buffer looks like a PDF (has `%PDF-` magic).
 ///
-/// Scans the first 1024 bytes, allowing for a UTF-8 BOM and leading whitespace.
+/// The header must start within the first [`PDF_HEADER_SEARCH_WINDOW`] bytes;
+/// see [`pdf_header_offset`]. Leading bytes before it are tolerated here and
+/// dropped by the loader.
 pub(crate) fn validate_pdf_bytes(buffer: &[u8]) -> Result<(), PdfError> {
-    if buffer.is_empty() {
-        return Err(PdfError::NotAPdf(detect_file_type_hint(buffer)));
-    }
-
-    let header = &buffer[..buffer.len().min(1024)];
-    let trimmed = strip_bom_and_whitespace(header);
-
-    if trimmed.starts_with(b"%PDF-") {
+    if pdf_header_offset(buffer).is_some() {
         Ok(())
     } else {
         Err(PdfError::NotAPdf(detect_file_type_hint(buffer)))
     }
 }
 
+/// Attach `path` to an IO error so a missing input is distinguishable from
+/// a missing built-in resource. Relative paths also name the working
+/// directory they were resolved against.
+pub(crate) fn io_error_at(path: &Path, err: std::io::Error) -> PdfError {
+    let location = if path.is_absolute() {
+        path.display().to_string()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        format!("{} (working directory {})", path.display(), cwd.display())
+    } else {
+        path.display().to_string()
+    };
+    PdfError::Io(std::io::Error::new(
+        err.kind(),
+        format!("{location}: {err}"),
+    ))
+}
+
+/// Read a whole file, reporting `path` in the error.
+pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>, PdfError> {
+    std::fs::read(path).map_err(|err| io_error_at(path, err))
+}
+
 /// Validate that a file on disk looks like a PDF.
 ///
-/// Reads only the first 1024 bytes and delegates to [`validate_pdf_bytes`].
+/// Reads only the header search window and delegates to [`validate_pdf_bytes`].
 pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = [0u8; 1024];
-    let n = file.read(&mut buf)?;
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path).map_err(|err| io_error_at(path, err))?;
+    let mut buf = [0u8; PDF_HEADER_SEARCH_WINDOW + PDF_HEADER_PROBE_LEN];
+    let n = file.read(&mut buf).map_err(|err| io_error_at(path, err))?;
     validate_pdf_bytes(&buf[..n])
 }
 
@@ -6484,6 +7117,109 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn missing_file_error_names_the_path() {
+        let err = validate_pdf_file("this-file-does-not-exist.pdf").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("this-file-does-not-exist.pdf"),
+            "missing-file error should name the path, got {msg}"
+        );
+        assert!(
+            msg.contains("working directory"),
+            "relative path should name the working directory, got {msg}"
+        );
+    }
+
+    #[test]
+    fn pdf_header_offset_finds_header_at_start() {
+        assert_eq!(pdf_header_offset(b"%PDF-1.4\n%%EOF"), Some(0));
+    }
+
+    #[test]
+    fn pdf_header_offset_skips_bom_and_whitespace() {
+        let mut buf = vec![0xEF, 0xBB, 0xBF, b'\n', b'\t'];
+        buf.extend_from_slice(b"%PDF-1.7\n");
+        assert_eq!(pdf_header_offset(&buf), Some(5));
+    }
+
+    #[test]
+    fn pdf_header_offset_finds_header_after_leading_bytes() {
+        // Leading bytes before the header, e.g. an echoed multipart envelope.
+        let prefix = b"--boundary\r\nContent-Type: application/pdf\r\n\r\n";
+        let mut buf = prefix.to_vec();
+        buf.extend_from_slice(b"%PDF-1.5\n%%EOF");
+        assert_eq!(pdf_header_offset(&buf), Some(prefix.len()));
+    }
+
+    #[test]
+    fn pdf_header_offset_ignores_bare_marker_in_leading_text() {
+        let buf = b"filename=\"%PDF.pdf\"\r\n\r\n%PDF-1.6\n";
+        let expected = buf.len() - b"%PDF-1.6\n".len();
+        assert_eq!(pdf_header_offset(buf), Some(expected));
+        assert_eq!(pdf_header_offset(b"xx%PDF\n1 0 obj"), None);
+    }
+
+    #[test]
+    fn pdf_header_offset_accepts_dash_without_version_digit() {
+        assert_eq!(pdf_header_offset(b"%PDF-\n1 0 obj"), Some(0));
+    }
+
+    #[test]
+    fn pdf_header_offset_accepts_header_at_window_edge() {
+        let mut buf = vec![b' '; PDF_HEADER_SEARCH_WINDOW - 1];
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(pdf_header_offset(&buf), Some(PDF_HEADER_SEARCH_WINDOW - 1));
+    }
+
+    #[test]
+    fn pdf_header_offset_rejects_header_beyond_window() {
+        let mut buf = vec![b' '; PDF_HEADER_SEARCH_WINDOW];
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(pdf_header_offset(&buf), None);
+        assert_eq!(pdf_header_offset(b""), None);
+        assert_eq!(pdf_header_offset(b"just some text"), None);
+    }
+
+    #[test]
+    fn pdf_header_offset_ranks_canonical_header_lines_first() {
+        // dashed-only at 0, version digit at 7, canonical lines at 19 and 28.
+        let buf = b"%PDF-x\n%PDF-1 note\n%PDF-1.4\n%PDF-2.0\r\n";
+        assert_eq!(pdf_header_offset(buf), Some(19));
+        // A canonical-looking version mid-line is only a version-digit match.
+        let buf = b"X-Note: %PDF-1.4\n%PDF-1.7\n";
+        assert_eq!(pdf_header_offset(buf), Some(17));
+        assert_eq!(pdf_header_offset(b"%PDF-x\n%PDF-1 note\n"), Some(7));
+        assert_eq!(pdf_header_offset(b"%PDF-x\n"), Some(0));
+
+        // Many version-like mentions never outrank the real header line.
+        let mut buf = b"x: %PDF-1\n".repeat(50);
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        assert_eq!(
+            pdf_header_offset(&buf),
+            Some(buf.len() - b"%PDF-1.4\n".len())
+        );
+    }
+
+    #[test]
+    fn strip_leading_bytes_before_header_slices_to_header() {
+        let buf = b"junk\r\n%PDF-1.4\n%%EOF";
+        assert_eq!(strip_leading_bytes_before_header(buf), b"%PDF-1.4\n%%EOF");
+        let clean = b"%PDF-1.4\n%%EOF";
+        assert_eq!(strip_leading_bytes_before_header(clean), clean);
+        let none = b"not a pdf";
+        assert_eq!(strip_leading_bytes_before_header(none), none);
+    }
+
+    #[test]
+    fn validate_pdf_bytes_accepts_leading_bytes_and_rejects_text() {
+        assert!(validate_pdf_bytes(b"--b\r\n\r\n%PDF-1.4\n").is_ok());
+        match validate_pdf_bytes(b"This is plain text mentioning %PDF, not a PDF.") {
+            Err(PdfError::NotAPdf(hint)) => assert!(hint.contains("plain text"), "{hint}"),
+            other => panic!("expected NotAPdf, got {other:?}"),
+        }
+    }
 
     fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
         TextItem {
@@ -6494,14 +7230,24 @@ mod tests {
             height,
             font: "Helvetica".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: height,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -6694,7 +7440,7 @@ mod tests {
 
     #[test]
     fn test_detect_encoding_issues_few_dollars() {
-        // Under threshold of 10 total dollars, should not trigger
+        // Under threshold of 10 total dollars — should not trigger
         let text = "a$b c$d e$f";
         assert!(!detect_encoding_issues(text));
     }
@@ -7040,7 +7786,7 @@ mod tests {
     #[test]
     fn test_cid_garbage_detection() {
         // Simulates CID garbage from Identity-H fonts: Latin Extended chars
-        // mixed with C1 control characters (U+0080-U+009F).
+        // mixed with C1 control characters (U+0080–U+009F).
         let cid_garbage = "Ë>íÓ\tý\r\u{0088}æ&Ït\u{0094}äí;\ný;wAL¢©èåD\rü£\
                            qq\u{0096}¶Í Æ\réá; Ô 7G\u{008B}ý;èÕç¢ £ ý;C";
         assert!(
@@ -7305,16 +8051,16 @@ mod tests {
         // bounds [100, 112]; an item at native y=104 (center 108) lands in.
         use crate::tables::StructuredCell;
         let items = vec![
-            // Header text, centered in row 0 (native y=104, center 108) but
+            // Header text — centered in row 0 (native y=104, center 108) but
             // at the LEFT of the column (x=175, far left of the [410, 700]
             // data-derived band).
             test_item("Address", 175.0, 104.0, 50.0, 8.0),
-            // Data row 1, fits its cell.
+            // Data row 1 — fits its cell.
             test_item("205 W Oak St", 420.0, 84.0, 100.0, 8.0),
-            // Data row 2, fits its cell.
+            // Data row 2 — fits its cell.
             test_item("155 E Boardwalk Dr", 420.0, 64.0, 100.0, 8.0),
         ];
-        // Cells AFTER normalize_cell_bands would have run, col 0 band
+        // Cells AFTER normalize_cell_bands would have run — col 0 band
         // shifted right by data-cell centers, header cell now excludes
         // the "Address" text at center x=200.
         let mut cells = vec![
@@ -7348,7 +8094,7 @@ mod tests {
         ];
         let page_h = 200.0;
 
-        // Stage 1 mimic, fill cells via the strict rule, track claimed.
+        // Stage 1 mimic — fill cells via the strict rule, track claimed.
         let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for cell in &mut cells {
             let [x1, y1, x2, y2] = cell.page_pt_bbox;
@@ -7403,12 +8149,12 @@ mod tests {
         // both center-containment and 60% overlap fail in stage 1.
         use crate::tables::StructuredCell;
         let items = vec![
-            // Bellevue: native y=235, center 239, just below row 0's
+            // Bellevue: native y=235, center 239 — just below row 0's
             // cell native bottom (240). Closer to row 0 than row 1.
             test_item("Bellevue", 30.0, 235.0, 45.0, 8.0),
-            // Glenwood: native y=215, center 219, just below row 1.
+            // Glenwood: native y=215, center 219 — just below row 1.
             test_item("Glenwood", 30.0, 215.0, 45.0, 8.0),
-            // Metro Crossing: native y=195, center 199, just below row 2.
+            // Metro Crossing: native y=195, center 199 — just below row 2.
             test_item("Metro Crossing", 30.0, 195.0, 70.0, 8.0),
         ];
         let mut cells = vec![
@@ -7508,17 +8254,17 @@ mod tests {
             },
         ];
         // Two orphans, different rows of the PDF (y differs by 14pt = a
-        // full row), both 2pt outside their target cell, both within
+        // full row), both 2pt outside their target cell — both within
         // cap_y, both equidistant-ish to cell X. Without the same-line
         // guard they'd both land in X.
-        //   "Shawnee" should belong to cell X (row 0), center y=98 is
+        //   "Shawnee" should belong to cell X (row 0) — center y=98 is
         //   2pt below X's native min=100.
-        //   "BlueValley" should belong to cell Y (row 1), center y=84
+        //   "BlueValley" should belong to cell Y (row 1) — center y=84
         //   is 4pt above Y's native max=88.
         let items = vec![
-            // Shawnee orphan, closer to X (dy=2) than Y (dy=6 from native min=78).
+            // Shawnee orphan — closer to X (dy=2) than Y (dy=6 from native min=78).
             test_item("Shawnee", 30.0, 94.0, 50.0, 8.0),
-            // BlueValley orphan, closer to Y (dy=4) than X (dy=8 from native max=100).
+            // BlueValley orphan — closer to Y (dy=4) than X (dy=8 from native max=100).
             test_item("BlueValley", 30.0, 80.0, 60.0, 8.0),
         ];
         let claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -7579,7 +8325,7 @@ mod tests {
         use crate::tables::StructuredCell;
         let items = vec![
             test_item("Real", 50.0, 100.0, 30.0, 8.0),
-            // Far orphan, at native y=20 (page bottom edge) on a page where
+            // Far orphan — at native y=20 (page bottom edge) on a page where
             // the table sits around native y=92..104 (top-left y=96..108).
             // y-distance to nearest cell is ~70pt, far exceeding the ~12pt
             // cap from median row height.
@@ -7607,7 +8353,7 @@ mod tests {
         ];
         let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // Pretend "Real" got claimed by a different cell (won't be re-assigned).
-        // Don't claim "FigureTitle", it's the far orphan.
+        // Don't claim "FigureTitle" — it's the far orphan.
         claimed.insert(0);
 
         tsr_assign_orphan_items(
@@ -7628,7 +8374,7 @@ mod tests {
     // Direct unit tests on the byte-level scan, addressing review feedback
     // on #230: a coincidental standalone "xref" token that isn't actually
     // followed by a subsection header (start-id + count) must not be
-    // treated as a real table, accepting it would let lopdf "succeed"
+    // treated as a real table — accepting it would let lopdf "succeed"
     // against a bogus offset and silently return garbled/empty content
     // instead of a clean error.
 
@@ -7651,7 +8397,7 @@ mod tests {
     #[test]
     fn find_xref_skips_coincidental_match_and_finds_real_table_before_it() {
         // A coincidental "xref" (no subsection header) appears *after* the
-        // real table in the buffer, the scan must not stop at the first
+        // real table in the buffer — the scan must not stop at the first
         // (rightmost) standalone token it finds; it must keep looking
         // backward until one actually validates.
         let buf = b"xref\n0 3\n0000000000 65535 f \ntrailer\nsee the xref\n";
@@ -7662,7 +8408,7 @@ mod tests {
     #[test]
     fn find_xref_rejects_substring_of_startxref() {
         // "xref" is a substring of "startxref" but isn't a standalone
-        // token there (not preceded by whitespace), must not match, even
+        // token there (not preceded by whitespace) — must not match, even
         // though a number immediately follows it.
         let buf = b"startxref\n1234\n%%EOF";
         assert_eq!(find_last_valid_xref_table_start(buf), None);
@@ -7671,7 +8417,7 @@ mod tests {
     #[test]
     fn find_xref_rejects_count_run_with_trailing_garbage() {
         // "xref\n0 6garbage" has the right shape (digits, whitespace,
-        // digits) but the count run doesn't end at whitespace/EOF, it
+        // digits) but the count run doesn't end at whitespace/EOF — it
         // runs straight into non-digit garbage, so this must not be
         // accepted as a real subsection header.
         let buf = b"xref\n0 6garbage\n%%EOF";
@@ -7682,5 +8428,220 @@ mod tests {
     fn recover_startxref_pointer_returns_none_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
         assert!(recover_startxref_pointer(buf).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rotated_run_region_tests {
+    use super::*;
+    use crate::types::ItemType;
+
+    fn item(text: &str, x: f32, y: f32, width: f32, height: f32, rotation: f32) -> TextItem {
+        TextItem {
+            baseline_shift: 0.0,
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            rotation,
+            advance_known: true,
+            font: "Helvetica".to_string(),
+            font_tag: "F1".to_string(),
+            legacy_symbol_rewrite: false,
+            font_size: if rotation == 0.0 { height } else { width },
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    const STAMP: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+    #[test]
+    fn vertical_margin_run_overlaps_only_the_margin_region() {
+        // Letter page; region boxes are top-left page coordinates as the
+        // layout model reports them: a left-margin strip and the body area.
+        let page_h = 792.0;
+        let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
+        let body = region_bounds(60.0, 0.0, 612.0, 792.0, page_h, RegionCoordSpace::Standard);
+
+        let stamp = item(STAMP, 12.0, 200.0, 20.0, 400.0, 90.0);
+        assert!(region_overlaps_item(&stamp, margin));
+        assert!(!region_overlaps_item(&stamp, body));
+        assert!(region_item_overlap_area(&stamp, margin) > 0.0);
+        assert_eq!(region_item_overlap_area(&stamp, body), 0.0);
+    }
+
+    #[test]
+    fn collect_text_in_region_finds_the_vertical_run_by_its_box() {
+        let items = vec![
+            item(STAMP, 12.0, 200.0, 20.0, 400.0, 90.0),
+            item("Body text", 72.0, 500.0, 50.0, 11.0, 0.0),
+        ];
+        assert_eq!(
+            collect_text_in_region(&items, 0.0, 0.0, 50.0, 792.0, 792.0),
+            STAMP
+        );
+        assert_eq!(
+            collect_text_in_region(&items, 60.0, 0.0, 612.0, 792.0, 792.0),
+            "Body text"
+        );
+    }
+
+    #[test]
+    fn clockwise_frame_region_bounds_follow_the_turned_page() {
+        // A 270° header along the right margin of a Letter page: page box
+        // x ∈ [580, 590], y ∈ [664, 700]. In the clockwise-turned frame it
+        // sits at x = -(top), y = baseline x.
+        let page_h = 792.0;
+        let header = item("HEADER", -700.0, 580.0, 36.0, 10.0, 0.0);
+        // Top-left region boxes: a strip around the header and the body.
+        let strip = region_bounds(
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            RegionCoordSpace::Rotated90Cw,
+        );
+        let body = region_bounds(
+            60.0,
+            80.0,
+            500.0,
+            700.0,
+            page_h,
+            RegionCoordSpace::Rotated90Cw,
+        );
+        assert!(region_overlaps_item(&header, strip));
+        assert!(!region_overlaps_item(&header, body));
+
+        // The legacy heuristic recognises only the counter-clockwise frame
+        // (most items at negative y); a clockwise frame is never inferred and
+        // must be passed explicitly.
+        assert_eq!(
+            infer_region_coord_space(&[header.clone()]),
+            RegionCoordSpace::Standard
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", 100.0, -200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Rotated90Ccw
+        );
+        assert_eq!(
+            infer_region_coord_space(&[item("x", 100.0, 200.0, 36.0, 12.0, 0.0)]),
+            RegionCoordSpace::Standard
+        );
+        let strip = collect_text_in_region_in_frame(
+            &[header.clone()],
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            PageRotation::Cw,
+        );
+        assert_eq!(strip, "HEADER");
+        let misread = collect_text_in_region_in_frame(
+            &[header.clone()],
+            570.0,
+            80.0,
+            600.0,
+            140.0,
+            page_h,
+            PageRotation::Upright,
+        );
+        assert_eq!(misread, "");
+
+        // Bounds round-trip back to the top-left page box they came from.
+        for coords in [
+            RegionCoordSpace::Standard,
+            RegionCoordSpace::Rotated90Ccw,
+            RegionCoordSpace::Rotated90Cw,
+        ] {
+            let b = region_bounds(570.0, 80.0, 600.0, 140.0, page_h, coords);
+            let back = extracted_bbox_to_page_top_left(
+                [b.x_min, b.y_min, b.x_max, b.y_max],
+                page_h,
+                coords,
+            );
+            assert_eq!(back, [570.0, 80.0, 600.0, 140.0], "{coords:?}");
+        }
+    }
+
+    #[test]
+    fn tsr_line_clustering_uses_the_estimated_height_of_unknown_advances() {
+        let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, estimated, 90.0);
+        stamp.advance_known = false;
+        let lines = cluster_tsr_cell_text_lines(vec![stamp]);
+        assert_eq!(lines.len(), 1);
+        // Half the estimated extent, not the 2.5pt floor.
+        assert!(
+            (lines[0].half_height - estimated * 0.5).abs() < 1e-3,
+            "{}",
+            lines[0].half_height
+        );
+    }
+
+    #[test]
+    fn vertical_run_without_font_widths_still_overlaps_its_region() {
+        // No width information: the advance is unknown, so the run's box is
+        // one em wide and zero tall. The estimated height must keep it
+        // matchable instead of letting it vanish from region extraction.
+        let page_h = 792.0;
+        let margin = region_bounds(0.0, 0.0, 50.0, 792.0, page_h, RegionCoordSpace::Standard);
+        // Extraction lays a half-em-per-glyph estimate along the run for a
+        // width-less font and flags it (the content-stream tests cover the
+        // parser side); region matching sees that box like any other.
+        let estimated = STAMP.chars().count() as f32 * 0.5 * 20.0;
+        let mut stamp = item(STAMP, 12.0, 200.0, 20.0, estimated, 90.0);
+        stamp.advance_known = false;
+        assert!(region_overlaps_item(&stamp, margin));
+        assert!(region_item_overlap_area(&stamp, margin) > 0.0);
+        assert!(tsr_region_contains_item(&stamp, margin));
+    }
+
+    #[test]
+    fn token_splitting_leaves_rotated_runs_whole() {
+        let stamp = item("two words", 12.0, 200.0, 20.0, 100.0, 90.0);
+        let tokens = split_item_into_token_subitems(&stamp);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "two words");
+        assert_eq!((tokens[0].x, tokens[0].width), (12.0, 20.0));
+
+        // Upside-down runs advance towards -x: interpolating from the left
+        // edge would swap the tokens' cells.
+        let flipped = item("two words", 72.0, 500.0, 90.0, 10.0, 180.0);
+        assert_eq!(split_item_into_token_subitems(&flipped).len(), 1);
+
+        let body = item("two words", 72.0, 500.0, 90.0, 10.0, 0.0);
+        assert_eq!(split_item_into_token_subitems(&body).len(), 2);
+    }
+
+    #[test]
+    fn token_splitting_spreads_only_an_unknown_zero_width_run() {
+        // A known zero advance (an ActualText replacement that painted
+        // nothing) keeps its tokens where the run was drawn; a run whose
+        // advance is unknown is spread over half an em per character.
+        let zero = item("two words", 72.0, 500.0, 0.0, 10.0, 0.0);
+        let tokens = split_item_into_token_subitems(&zero);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!((tokens[0].x, tokens[1].x), (72.0, 72.0));
+
+        let mut unknown = zero;
+        unknown.advance_known = false;
+        let tokens = split_item_into_token_subitems(&unknown);
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens[1].x > tokens[0].x + 15.0, "{tokens:?}");
     }
 }

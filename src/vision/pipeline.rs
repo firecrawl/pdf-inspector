@@ -201,7 +201,8 @@ pub fn process_pdf_with_ocr(
     path: impl AsRef<Path>,
     options: OcrPdfOptions,
 ) -> Result<OcrPdfResult, OcrPipelineError> {
-    let bytes = std::fs::read(path).map_err(PdfError::from)?;
+    let path = path.as_ref();
+    let bytes = crate::read_file(path)?;
     process_pdf_with_ocr_mem(&bytes, options)
 }
 
@@ -249,10 +250,17 @@ pub fn process_pdf_with_ocr_mem(
         selected_pages_zero_indexed.as_deref(),
         options.password.as_deref(),
         &page_markdown_options,
+        options.ocr.mode != OcrMode::Off,
     )?;
     let mut native = extraction.result;
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
+    // The renderer reads the document as the loader repaired it, when it
+    // had to (a decrypted copy, when the document is encrypted; a copy that
+    // cannot be written fails the extraction above); otherwise the caller's
+    // bytes as they are.
+    let render_bytes = extraction.render_bytes;
+    let render_buffer: &[u8] = render_bytes.as_deref().unwrap_or(buffer);
     if let Some(invalid) = selected_pages
         .as_ref()
         .and_then(|pages| pages.iter().copied().find(|page| *page > page_count))
@@ -314,7 +322,7 @@ pub fn process_pdf_with_ocr_mem(
         if !native_probe_pages.is_empty() {
             let native_renderer = PdfiumRenderer::load()?;
             let recovered = native_renderer.extract_text_pages(
-                buffer,
+                render_buffer,
                 &native_probe_pages.iter().copied().collect::<Vec<_>>(),
                 options.password.as_deref(),
             )?;
@@ -380,7 +388,7 @@ pub fn process_pdf_with_ocr_mem(
         };
         let elapsed = filter_supplemental_routes_by_pixels(
             &native_renderer,
-            buffer,
+            render_buffer,
             options.password.as_deref(),
             &options.render,
             &mut fusion_routes,
@@ -422,7 +430,7 @@ pub fn process_pdf_with_ocr_mem(
         run_and_fuse_ocr_chunks(
             &renderer,
             engine.as_ref(),
-            buffer,
+            render_buffer,
             &routed,
             options.password.as_deref(),
             &options.render,
@@ -1141,14 +1149,24 @@ mod tests {
             height,
             font: "PDFium native text".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: height,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1449,6 +1467,7 @@ mod tests {
             None,
             None,
             &MarkdownOptions::default(),
+            false,
         )
         .unwrap();
         assert!(ocr.result.pages[0].needs_ocr);

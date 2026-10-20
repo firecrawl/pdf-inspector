@@ -3,26 +3,127 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
-mod content_decode;
+mod clip_boundaries;
+pub(crate) mod content_decode;
 pub(crate) mod content_stream;
-mod fonts;
+pub(crate) mod display_frame;
+pub(crate) mod fonts;
+pub(crate) mod geometry;
 mod layout;
 mod links;
+pub(crate) mod page_box;
 mod reading_order;
+mod scripts;
+mod text_paint;
+mod type1;
 pub(crate) mod underline;
+pub(crate) mod word_gaps;
 mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{CMapCoverageByFont, PageExtraction, PdfLine, PdfRect, RunCoverage, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
+use content_stream::extract_page_text_items_with_options;
+pub(crate) use content_stream::TextExtractionOptions;
+pub(crate) use display_frame::DisplayPage;
+pub use display_frame::PositionFrame;
+
+/// Options of the positioned-text and region APIs, taken by their
+/// `_with_options` variants ([`extract_text_with_positions_mem_with_options`],
+/// [`extract_text_with_positions_and_rotations_mem_with_options`],
+/// [`extract_text_in_regions_mem_with_options`](crate::extract_text_in_regions_mem_with_options),
+/// [`extract_tables_in_regions_mem_with_options`](crate::extract_tables_in_regions_mem_with_options)).
+/// The default is what the plain and `_in_frame` variants do.
+///
+/// ```
+/// use pdf_inspector::{PositionFrame, PositionOptions};
+///
+/// let options = PositionOptions::new()
+///     .frame(PositionFrame::Display)
+///     .bold_from_weight(true)
+///     .bold_weight_threshold(700);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PositionOptions {
+    /// Coordinate frame items are reported in and region rects are read
+    /// in; [`PositionFrame::Sheet`] by default.
+    pub frame: PositionFrame,
+    /// Read bold from the font's weight class as well. When set,
+    /// `TextItem::is_bold` is also `true` for items whose
+    /// `TextItem::font_weight` is `bold_weight_threshold` (600, SemiBold,
+    /// by default) or more, `TextItem::bold_source` says so, and adjacent
+    /// runs are merged by that verdict: a run the weight makes bold stays
+    /// apart from its plain neighbours, so a heavier run inside a lighter
+    /// paragraph keeps its own item, while runs whose weights differ but
+    /// agree on bold — both below the threshold, or both at or above it —
+    /// merge as usual. Off by default: `is_bold` and item merging are then
+    /// exactly what they were before the option existed, and `font_weight`
+    /// is reported either way.
+    pub bold_from_weight: bool,
+    /// The weight class from which `bold_from_weight` reads bold, on the
+    /// 100..=900 scale: 600 by default, so SemiBold and heavier faces are
+    /// bold. It matters only when `bold_from_weight` is set; a value outside
+    /// the scale is clamped into it either way.
+    pub bold_weight_threshold: u16,
+}
+
+impl Default for PositionOptions {
+    fn default() -> Self {
+        Self {
+            frame: PositionFrame::default(),
+            bold_from_weight: false,
+            bold_weight_threshold: content_stream::DEFAULT_BOLD_WEIGHT_THRESHOLD,
+        }
+    }
+}
+
+impl PositionOptions {
+    /// The defaults: sheet frame, bold not read from the weight class, a
+    /// threshold of 600 for when it is.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the coordinate frame.
+    pub fn frame(mut self, frame: PositionFrame) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    /// Set whether bold is also read from the weight class.
+    pub fn bold_from_weight(mut self, bold_from_weight: bool) -> Self {
+        self.bold_from_weight = bold_from_weight;
+        self
+    }
+
+    /// Set the weight class from which bold is read when `bold_from_weight`
+    /// is on: 600 by default, valid values 100..=900.
+    pub fn bold_weight_threshold(mut self, threshold: u16) -> Self {
+        self.bold_weight_threshold = threshold;
+        self
+    }
+
+    /// The content-stream switches these options ask for.
+    pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
+        TextExtractionOptions {
+            include_invisible,
+            bold_from_weight: self.bold_from_weight,
+            bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
+            // The position readers report no CMap coverage.
+            cmap_coverage: false,
+        }
+    }
+}
 use links::{extract_form_fields, extract_page_links};
+pub(crate) use page_box::{visible_page_box, PageBox};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
@@ -38,6 +139,7 @@ pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_re
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
+pub(crate) use scripts::merge_subscript_items;
 pub(crate) use xobjects::FormWalkBudget;
 
 // ---------------------------------------------------------------------------
@@ -74,7 +176,21 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
         .map_err(|e| PdfError::Parse(e.to_string()))
 }
 
-/// Extract text with position information from PDF file
+/// Extract text with position information from a PDF file.
+///
+/// # Coordinate frame
+///
+/// Every positioned item (text, image placeholder, link, form field) is
+/// reported in PDF points relative to the page's **visible page box**:
+/// `CropBox ∩ MediaBox` when the page has a CropBox, else the MediaBox. The
+/// box's lower-left corner is the origin and `y` grows upward. A renderer's
+/// page image and the region APIs ([`crate::extract_text_in_regions_mem`]
+/// and friends) use the same box from its top-left corner with `y` growing
+/// downward, so flipping `y` by the box height moves between the two. Raw
+/// content-stream coordinates differ whenever the CropBox or MediaBox origin
+/// is not `(0, 0)`. Pages whose text is drawn rotated by 90° are normalized
+/// into a synthetic landscape frame before the shift; `/Rotate` is not
+/// applied. See [`TextItem`] for the full note.
 pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_pages(path, None)
 }
@@ -82,7 +198,8 @@ pub fn extract_text_with_positions<P: AsRef<Path>>(path: P) -> Result<Vec<TextIt
 /// Extract text with positions from a file, limited to specific pages.
 ///
 /// `page_filter` is an optional set of 1-indexed page numbers to process.
-/// When `None`, all pages are processed.
+/// When `None`, all pages are processed. Coordinates: see
+/// [`extract_text_with_positions`].
 pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
@@ -96,7 +213,8 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
 /// decrypting with `password` when the PDF is encrypted.
 ///
 /// `page_filter` is an optional set of 1-indexed page numbers to process.
-/// When `None`, all pages are processed.
+/// When `None`, all pages are processed. Coordinates: see
+/// [`extract_text_with_positions`].
 pub fn extract_text_with_positions_pages_with_password<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
@@ -115,36 +233,208 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
+    let (extraction, _thresholds, _gid_pages, _page_rotations, _cmap_coverage, _) =
+        extract_positioned_text_from_doc_in_page_box(
+            &doc,
+            &font_cmaps,
+            page_filter,
+            PositionOptions::default(),
+        )?;
     Ok(extraction)
 }
 
-/// Extract text with positions from memory buffer
+/// Extract text with positions from a memory buffer. Coordinates: see
+/// [`extract_text_with_positions`].
 pub fn extract_text_with_positions_mem(buffer: &[u8]) -> Result<Vec<TextItem>, PdfError> {
     extract_text_with_positions_mem_pages(buffer, None)
 }
 
-/// Extract text with positions from memory buffer, limited to specific pages.
+/// Extract text with positions from a memory buffer, limited to specific
+/// pages. Coordinates: see [`extract_text_with_positions`].
 pub fn extract_text_with_positions_mem_pages(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
-    let (items, _rects, _lines) = extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
+    extract_text_with_positions_mem_in_frame(buffer, page_filter, PositionFrame::Sheet)
+}
+
+/// Extract text with positions from a memory buffer in the given coordinate
+/// frame, limited to specific pages.
+///
+/// [`PositionFrame::Sheet`] is the frame of [`extract_text_with_positions`]:
+/// the visible page box as laid out in the content stream, `/Rotate` not
+/// applied, with predominantly rotated pages turned so their text reads
+/// left-to-right. [`PositionFrame::Display`] reports every item — text and
+/// image placeholders, links and form fields alike — in the rendered page's
+/// frame instead: the visible box turned clockwise by the page's inheritable
+/// `/Rotate`, lower-left origin, `y` up, with the turn of a rotated page
+/// undone first. Baseline angles (`TextItem::rotation`) are expressed in the
+/// same frame, so text that renders horizontally reads as `0`.
+pub fn extract_text_with_positions_mem_in_frame(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    frame: PositionFrame,
+) -> Result<Vec<TextItem>, PdfError> {
+    extract_text_with_positions_mem_with_options(
+        buffer,
+        page_filter,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_with_positions_mem_in_frame`] with every option of the
+/// positioned-text APIs given as a [`PositionOptions`]: the frame, and
+/// whether bold is also read from the font's weight class
+/// (`bold_from_weight`). The default options are that function with
+/// [`PositionFrame::Sheet`].
+pub fn extract_text_with_positions_mem_with_options(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<Vec<TextItem>, PdfError> {
+    let (items, _page_rotations) =
+        extract_text_with_positions_and_rotations_mem_with_options(buffer, page_filter, options)?;
     Ok(items)
 }
 
-/// Extract text with positions and rectangles from memory buffer.
-pub(crate) fn extract_text_with_positions_mem_and_rects(
+/// Extract text with positions from a memory buffer, together with the
+/// coordinate frame of every page whose text was predominantly rotated.
+///
+/// Such pages are re-based so their dominant runs read left-to-right (see
+/// [`PageRotation`](crate::PageRotation)); their items live in the turned
+/// frame, and region boxes given in page coordinates must be turned the same
+/// way with [`collect_text_in_region_in_frame`](crate::collect_text_in_region_in_frame).
+/// Pages absent from the map are upright. Keys are 1-indexed like
+/// `TextItem::page`.
+pub fn extract_text_with_positions_and_rotations_mem(
+    buffer: &[u8],
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
+    extract_text_with_positions_and_rotations_mem_in_frame(buffer, None, PositionFrame::Sheet)
+}
+
+/// [`extract_text_with_positions_and_rotations_mem`] limited to specific
+/// pages and reporting items in the given coordinate frame (see
+/// [`extract_text_with_positions_mem_in_frame`]).
+///
+/// The returned map names the pages whose text was predominantly rotated
+/// whatever the frame: in the display frame their turn has already been
+/// undone, so the map is informational there.
+pub fn extract_text_with_positions_and_rotations_mem_in_frame(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
-) -> Result<PageExtraction, PdfError> {
+    frame: PositionFrame,
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
+    extract_text_with_positions_and_rotations_mem_with_options(
+        buffer,
+        page_filter,
+        PositionOptions::new().frame(frame),
+    )
+}
+
+/// [`extract_text_with_positions_and_rotations_mem_in_frame`] with every
+/// option given as a [`PositionOptions`] — see
+/// [`extract_text_with_positions_mem_with_options`].
+pub fn extract_text_with_positions_and_rotations_mem_with_options(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
-        extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)?;
-    Ok(extraction)
+    let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations, _cmap_coverage, _) =
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
+    if options.frame == PositionFrame::Display {
+        display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
+    }
+    Ok((items, page_rotations))
+}
+
+/// One page's geometry in the visible-page-box frame, from
+/// [`extract_page_text_items_in_page_box`].
+pub(crate) struct PageBoxExtraction {
+    pub(crate) items: Vec<TextItem>,
+    pub(crate) rects: Vec<PdfRect>,
+    pub(crate) lines: Vec<PdfLine>,
+    /// Fonts with unresolvable gid-encoded glyphs were encountered.
+    pub(crate) has_gid_fonts: bool,
+    /// How the page's frame was turned so its text reads left-to-right
+    /// (see `content_stream::correct_rotated_page`); `Upright` when it was
+    /// not.
+    pub(crate) coords_rotated: geometry::PageRotation,
+    /// Invisible (Tr 3) text was skipped and could be recovered with
+    /// `include_invisible`.
+    pub(crate) skipped_invisible: bool,
+    /// The visible page box the geometry was shifted into; its height is the
+    /// flip height for top-left-origin region inputs.
+    pub(crate) page_box: PageBox,
+}
+
+/// Page-scoped extraction for the region APIs: `extract_page_text_items`
+/// followed by the visible-page-box shift every one of them must apply, so
+/// no caller can translate items but forget rects, or skip the rotated
+/// shift. Region bounds then flip `y` with `page_box.height()`.
+pub(crate) fn extract_page_text_items_in_page_box(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<PageBoxExtraction, PdfError> {
+    extract_page_text_items_in_page_box_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        TextExtractionOptions {
+            include_invisible,
+            ..TextExtractionOptions::default()
+        },
+        style_cache,
+        form_budget,
+    )
+}
+
+/// [`extract_page_text_items_in_page_box`] with every content-stream switch
+/// given.
+pub(crate) fn extract_page_text_items_in_page_box_with_options(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<PageBoxExtraction, PdfError> {
+    let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
+    // The region APIs read one page at a time and report no CMap coverage.
+    let (
+        (mut items, mut rects, mut lines),
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+        _run_coverage,
+    ) = extract_page_text_items_with_options(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        options,
+        style_cache,
+        form_budget,
+    )?;
+    page_box.translate_page(&mut items, &mut rects, &mut lines, coords_rotated);
+    Ok(PageBoxExtraction {
+        items,
+        rects,
+        lines,
+        has_gid_fonts,
+        coords_rotated,
+        skipped_invisible,
+        page_box,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +444,25 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
 /// Per-page adaptive join thresholds from Canva-style letter-spacing detection.
 pub(crate) type PageThresholds = HashMap<u32, f32>;
 
+/// Pages (1-indexed, like `TextItem::page`) whose coordinate frame was turned
+/// because their text is predominantly rotated; pages absent from the map
+/// are upright.
+pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
+
+/// What a document-level extraction returns: the text, rectangles and lines
+/// of the extracted pages, their join thresholds, the pages with gid-encoded
+/// fonts, their frame rotations and, per font, the two-byte codes shown
+/// through the font's CMap and how many of them the CMap had no entry for.
+/// The final flag records skipped invisible text on selected pages only.
+pub(crate) type DocumentExtraction = (
+    PageExtraction,
+    PageThresholds,
+    HashSet<u32>,
+    PageRotations,
+    CMapCoverageByFont,
+    bool,
+);
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
 /// Also returns per-page adaptive join thresholds for Canva-style pages.
@@ -161,8 +470,48 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, page_filter, false, None)
+) -> Result<DocumentExtraction, PdfError> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        TextExtractionOptions::default(),
+        None,
+        CoordinateFrame::UserSpace,
+    )
+}
+
+/// [`extract_positioned_text_from_doc`] with every page's geometry shifted
+/// into the visible-page-box frame — what the public position APIs return.
+/// A page whose frame was turned (see `PageRotation`) gets the equivalently
+/// turned shift, so its items, links and form fields agree with region
+/// bounds computed from the visible box.
+pub(crate) fn extract_positioned_text_from_doc_in_page_box(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<DocumentExtraction, PdfError> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        options.text_extraction(false),
+        None,
+        CoordinateFrame::VisiblePageBox,
+    )
+}
+
+/// Coordinate frame of the geometry a positioned-text extraction returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordinateFrame {
+    /// Raw PDF user space, as written in the content stream. The markdown
+    /// pipeline works here; its page-edge heuristics never leave it.
+    UserSpace,
+    /// The visible page box ([`PageBox`]) with its lower-left corner as the
+    /// origin — the frame of a rendered page image. Public position APIs
+    /// return this so items can be intersected with rendered regions.
+    VisiblePageBox,
 }
 
 /// Extract selected pages and gather document-wide folio evidence only when a
@@ -172,7 +521,7 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
 }
 
@@ -181,7 +530,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
 }
 
@@ -190,27 +539,48 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<DocumentExtraction, PdfError> {
+    // The selected pages report their CMap coverage; the context pages
+    // gathered below for their folio evidence do not.
+    let options = TextExtractionOptions {
+        include_invisible,
+        cmap_coverage: true,
+        ..TextExtractionOptions::default()
+    };
     let Some(required_pages) = page_filter else {
-        return extract_positioned_text_impl(doc, font_cmaps, None, include_invisible, None);
+        return extract_positioned_text_impl(
+            doc,
+            font_cmaps,
+            None,
+            options,
+            None,
+            CoordinateFrame::UserSpace,
+        );
     };
 
     let (
         (mut selected_items, mut selected_rects, mut selected_lines),
         mut page_thresholds,
         mut gid_encoded_pages,
+        mut page_rotations,
+        cmap_coverage,
+        skipped_invisible,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
         Some(required_pages),
-        include_invisible,
+        options,
         None,
+        CoordinateFrame::UserSpace,
     )?;
     if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
         return Ok((
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
             gid_encoded_pages,
+            page_rotations,
+            cmap_coverage,
+            skipped_invisible,
         ));
     }
 
@@ -220,23 +590,40 @@ fn extract_positioned_text_with_folio_context_impl(
         .copied()
         .filter(|page| !required_pages.contains(page))
         .collect();
-    let ((context_items, context_rects, context_lines), context_thresholds, context_gid_pages) =
-        extract_positioned_text_impl(
-            doc,
-            font_cmaps,
-            Some(&context_pages),
-            include_invisible,
-            Some(required_pages),
-        )?;
+    // The context pages' items are dropped again once the folios are
+    // decided; their fonts' coverage is no part of the selected pages'
+    // either, so it is left out here.
+    let (
+        (context_items, context_rects, context_lines),
+        context_thresholds,
+        context_gid_pages,
+        context_rotations,
+        _context_coverage,
+        _context_skipped_invisible,
+    ) = extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        Some(&context_pages),
+        TextExtractionOptions {
+            cmap_coverage: false,
+            ..options
+        },
+        Some(required_pages),
+        CoordinateFrame::UserSpace,
+    )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
     selected_lines.extend(context_lines);
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
+    page_rotations.extend(context_rotations);
     Ok((
         (selected_items, selected_rects, selected_lines),
         page_thresholds,
         gid_encoded_pages,
+        page_rotations,
+        cmap_coverage,
+        skipped_invisible,
     ))
 }
 
@@ -246,26 +633,42 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
+) -> Result<DocumentExtraction, PdfError> {
+    extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        None,
+        TextExtractionOptions::default(),
+        Some(required_pages),
+        CoordinateFrame::UserSpace,
+    )
 }
 
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-    include_invisible: bool,
+    options: TextExtractionOptions,
     required_pages: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    frame: CoordinateFrame,
+) -> Result<DocumentExtraction, PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
+    let mut skipped_invisible = false;
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    // Per font, the codes shown through its CMap over every extracted page.
+    let mut cmap_coverage = CMapCoverageByFont::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
+    // Pages whose coordinate frame was turned (see `PageRotation`): the
+    // document-level annotation items appended below must follow.
+    let mut page_rotations: PageRotations = HashMap::new();
+    // Visible page box per extracted page, for the form-field shift below.
+    let mut page_boxes: HashMap<u32, PageBox> = HashMap::new();
 
     // Build page ObjectId → page number map for form field extraction
     let page_id_to_num: HashMap<ObjectId, u32> =
@@ -277,105 +680,130 @@ fn extract_positioned_text_impl(
                 continue;
             }
         }
-        let page_result = extract_page_text_items(
+        let page_result = extract_page_text_items_with_options(
             doc,
             page_id,
             *page_num,
             font_cmaps,
-            include_invisible,
+            options,
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
-            match page_result {
-                Ok(extraction) => extraction,
-                Err(error)
-                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
-                {
-                    debug!(
-                        "page {}: skipping context-only extraction error: {}",
-                        page_num, error
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let (
+            (mut items, mut rects, mut lines),
+            has_gid_fonts,
+            coords_rotated,
+            page_skipped_invisible,
+            mut run_coverage,
+        ) = match page_result {
+            Ok(extraction) => extraction,
+            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+                debug!(
+                    "page {}: skipping context-only extraction error: {}",
+                    page_num, error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        skipped_invisible |= page_skipped_invisible;
+        if coords_rotated != geometry::PageRotation::Upright {
+            page_rotations.insert(*page_num, coords_rotated);
+        }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
-        // the page and poisons font statistics. Rotated pages are left alone
-        // — their item coordinates are already transformed out of box space.
+        // the page and poisons font statistics. On a turned page the box is
+        // turned the same way, so the test runs in the items' own frame.
+        let page_box = visible_page_box(doc, page_id);
         let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        if !coords_rotated {
-            if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
-                const TOL: f32 = 6.0;
-                let outside = |it: &TextItem| {
-                    let cx = it.x + it.width / 2.0;
-                    !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
-                };
-                // Only clip when the off-page material reads as coherent text
-                // (neighboring-page paragraphs). Curved/rotated display text
-                // leaves short glyph fragments with artifact coordinates
-                // outside the box, and those must stay.
-                let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
-                // Judge by character mass: paragraphs are dominated by long
-                // word runs even when interleaved with short math fragments,
-                // while glyph-confetti is short items through and through.
-                let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
-                let wordy_chars: usize = off
-                    .iter()
-                    .map(|it| it.text.trim().chars().count())
-                    .filter(|&n| n >= 4)
-                    .sum();
-                // Genuine neighboring-page content is cleanly separated from
-                // on-page text. When an off-page item continues an on-page
-                // line (same baseline, near-adjacent x), the coordinates are
-                // artifacts of transforms we mis-model — don't clip those.
-                let straddles = off.iter().any(|o| {
-                    items.iter().any(|i| {
-                        !outside(i)
-                            && (i.y - o.y).abs() <= 2.0
-                            && (o.x - (i.x + i.width)).abs() <= 10.0
-                    })
-                });
-                let coherent =
-                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
-                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
-                    let before = items.len();
-                    items.retain(|it| !outside(it));
-                    if items.len() < before {
-                        debug!(
-                            "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
-                            page_num,
-                            before - items.len(),
-                            bx0,
-                            by0,
-                            bx1,
-                            by1
-                        );
-                        // Only prune off-page geometry when off-page text
-                        // existed — same neighboring-page content.
-                        let overlaps = |x: f32, y: f32, w: f32, h: f32| {
-                            let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
-                            let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
-                            x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
-                        };
-                        rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
-                        clipped_box = Some((bx0, by0, bx1, by1));
-                        lines.retain(|l| {
-                            overlaps(
-                                l.x1.min(l.x2),
-                                l.y1.min(l.y2),
-                                (l.x2 - l.x1).abs(),
-                                (l.y2 - l.y1).abs(),
-                            )
-                        });
+        let clip_box = page_box.map(|b| {
+            let (mut x, mut y, mut w, mut h) = (b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+            coords_rotated.rotate_box(&mut x, &mut y, &mut w, &mut h);
+            (x, y, x + w, y + h)
+        });
+        if let Some((bx0, by0, bx1, by1)) = clip_box {
+            const TOL: f32 = 6.0;
+            let outside = |it: &TextItem| {
+                let cx = it.x + it.width / 2.0;
+                !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
+            };
+            // Only clip when the off-page material reads as coherent text
+            // (neighboring-page paragraphs). Curved/rotated display text
+            // leaves short glyph fragments with artifact coordinates
+            // outside the box, and those must stay.
+            let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
+            // Judge by character mass: paragraphs are dominated by long
+            // word runs even when interleaved with short math fragments,
+            // while glyph-confetti is short items through and through.
+            let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
+            let wordy_chars: usize = off
+                .iter()
+                .map(|it| it.text.trim().chars().count())
+                .filter(|&n| n >= 4)
+                .sum();
+            // Genuine neighboring-page content is cleanly separated from
+            // on-page text. When an off-page item continues an on-page
+            // line (same baseline, near-adjacent x), the coordinates are
+            // artifacts of transforms we mis-model — don't clip those.
+            let straddles = off.iter().any(|o| {
+                items.iter().any(|i| {
+                    !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
+                })
+            });
+            let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
+                let before = items.len();
+                items.retain(|it| !outside(it));
+                // The runs left out take their CMap coverage with them; a
+                // run without a position (see `RunCoverage`) stays.
+                run_coverage.retain(|run| match run.position {
+                    Some((x, y, width)) => {
+                        let cx = x + width / 2.0;
+                        cx >= bx0 - TOL && cx <= bx1 + TOL && y >= by0 - TOL && y <= by1 + TOL
                     }
+                    None => true,
+                });
+                if items.len() < before {
+                    debug!(
+                        "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
+                        page_num,
+                        before - items.len(),
+                        bx0,
+                        by0,
+                        bx1,
+                        by1
+                    );
+                    // Only prune off-page geometry when off-page text
+                    // existed — same neighboring-page content.
+                    let overlaps = |x: f32, y: f32, w: f32, h: f32| {
+                        let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
+                        let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
+                        x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
+                    };
+                    rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                    clipped_box = Some((bx0, by0, bx1, by1));
+                    lines.retain(|l| {
+                        overlaps(
+                            l.x1.min(l.x2),
+                            l.y1.min(l.y2),
+                            (l.x2 - l.x1).abs(),
+                            (l.y2 - l.y1).abs(),
+                        )
+                    });
                 }
             }
         }
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
+        }
+        for RunCoverage { font, stats, .. } in run_coverage {
+            match cmap_coverage.get_mut(&*font) {
+                Some(total) => total.add(stats),
+                None => {
+                    cmap_coverage.insert(font.to_string(), stats);
+                }
+            }
         }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -408,12 +836,24 @@ fn extract_positioned_text_impl(
                 );
             }
         }
+        // Public position APIs report geometry relative to the visible page
+        // box; the markdown pipeline stays in raw user space.
+        let frame_box = page_box.unwrap_or(PageBox::LETTER);
+        if frame == CoordinateFrame::VisiblePageBox {
+            frame_box.translate_page(&mut items, &mut rects, &mut lines, coords_rotated);
+        }
+        page_boxes.insert(*page_num, frame_box);
         all_items.extend(items);
         all_rects.extend(rects);
         all_lines.extend(lines);
 
-        // Extract hyperlinks from page annotations
+        // Extract hyperlinks from page annotations. A turned page turns its
+        // annotation boxes too, so links stay on the text they cover and in
+        // the regions that text is assigned to.
         let mut links = extract_page_links(doc, page_id, *page_num);
+        for link in &mut links {
+            coords_rotated.rotate_box(&mut link.x, &mut link.y, &mut link.width, &mut link.height);
+        }
         // Annotations from the neighboring page are off-box too.
         if let Some((bx0, by0, bx1, by1)) = clipped_box {
             links.retain(|it| {
@@ -425,19 +865,47 @@ fn extract_positioned_text_impl(
                 cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && cy >= by0 - 6.0 && cy <= by1 + 6.0
             });
         }
+        if frame == CoordinateFrame::VisiblePageBox {
+            // The link rects were turned with the page above, so they take
+            // the same turned shift as the page's items.
+            frame_box.translate_items(&mut links, coords_rotated);
+        }
         all_items.extend(links);
     }
 
-    // Extract AcroForm field values
-    let form_items = extract_form_fields(doc, &page_id_to_num)
+    // Extract AcroForm field values. Widgets on a turned page turn with it,
+    // like links, so positional consumers keep them on the text they cover;
+    // in the visible-box frame they take the page's (turned) shift as well.
+    let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
         .into_iter()
-        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
+        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
+        .map(|mut item| {
+            let rotation = page_rotations
+                .get(&item.page)
+                .copied()
+                .unwrap_or(geometry::PageRotation::Upright);
+            rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            if frame == CoordinateFrame::VisiblePageBox {
+                let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
+                    pages
+                        .get(&item.page)
+                        .and_then(|&id| visible_page_box(doc, id))
+                        .unwrap_or(PageBox::LETTER)
+                });
+                frame_box.translate_items(std::slice::from_mut(&mut item), rotation);
+            }
+            item
+        })
+        .collect();
     all_items.extend(form_items);
 
     Ok((
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_encoded_pages,
+        page_rotations,
+        cmap_coverage,
+        skipped_invisible,
     ))
 }
 
@@ -592,9 +1060,11 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 
 /// Merge adjacent text items on the same line into single items.
 ///
-/// Groups items by (page, Y-position) with a 5pt tolerance, sorts within each
-/// group by X, then merges consecutive items that share a similar font size
-/// and are close horizontally.
+/// Groups items into lines ([`group_fragments_into_lines`]: on one page,
+/// within 5 pt of the line's first fragment and within a window that follows
+/// the type size of a fragment already on the line), sorts within
+/// each line by X, then merges consecutive items that share a similar font
+/// size and are close horizontally.
 /// Cap item width for merge-gap computation to guard against Tw inflation.
 ///
 /// When PDF word-spacing (Tw) is large (used for text justification), the
@@ -604,9 +1074,27 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 ///
 /// Only applies to non-CJK items whose text contains spaces (where Tw
 /// contributes) and whose average width-per-character is abnormally high.
+/// Extent used to detect overlapping (backtracking) paint order: the merge
+/// width for measured runs, the estimated box for width-less ones — an
+/// estimate is still evidence of where a fragment ends, and taking it as zero
+/// would let a tagged widthless ActualText line be x-sorted out of order.
+fn order_extent(item: &TextItem) -> f32 {
+    if item.advance_known {
+        effective_merge_width(item)
+    } else {
+        item.width
+    }
+}
+
 fn effective_merge_width(item: &TextItem) -> f32 {
     use crate::text_utils::is_cjk_char;
 
+    // An estimated box (font without widths) is the best extent there is for
+    // word-gap decisions — as it was when `effective_width` estimated it here;
+    // the Tw cap below only makes sense for measured widths.
+    if !item.advance_known {
+        return item.width;
+    }
     if item.width <= 0.0 || item.font_size <= 0.0 {
         return item.width;
     }
@@ -633,6 +1121,61 @@ fn effective_merge_width(item: &TextItem) -> f32 {
     }
 }
 
+/// Width, as a share of the font size, under which a measured run is a
+/// glyph without advance.
+const ZERO_WIDTH_MARK_EM: f32 = 0.01;
+
+/// Most characters a dependent sign shown as a run of its own decodes to:
+/// a sign, or one that decodes to two code points. A longer run without
+/// advance is hidden text, not a sign.
+const ZERO_WIDTH_MARK_MAX_CHARS: usize = 2;
+
+/// Whether `item` is a dependent sign shown as a run of its own: a glyph
+/// without advance — a vowel sign, a subscript letter, an accent — by its
+/// measured width, or a run of nothing but combining marks, of a character
+/// or two either way. Such a sign is drawn over the glyph before it, behind
+/// the pen, and the line's right edge does not move for it.
+fn is_zero_width_mark(item: &TextItem) -> bool {
+    let text = item.text.trim();
+    if !(1..=ZERO_WIDTH_MARK_MAX_CHARS).contains(&text.chars().count())
+        || !matches!(item.item_type, crate::types::ItemType::Text)
+    {
+        return false;
+    }
+    (item.advance_known && item.width.abs() <= item.font_size.abs() * ZERO_WIDTH_MARK_EM)
+        || text.chars().all(crate::bidi::is_combining_mark)
+}
+
+/// Whether `x` lies inside the advance of `item`: from its origin to short
+/// of its end, whichever way it reads.
+fn inside_advance(item: &TextItem, x: f32) -> bool {
+    let end = item.x + item.width;
+    x >= item.x.min(end) && x < item.x.max(end)
+}
+
+/// Sort a line's fragments along +x, keeping a dependent sign right after
+/// the base it was shown on. A zero-width sign whose origin lies inside
+/// the advance of the fragment shown before it — over that fragment, short
+/// of its end — takes that fragment's x as its key and follows it; by its
+/// own x it would land after the next base when that base is kerned in
+/// ahead of the pen.
+fn sort_along_x_keeping_marks(group: &mut [&TextItem]) {
+    let mut keys: Vec<f32> = Vec::with_capacity(group.len());
+    // The fragment the one before this sorts with: itself, or for a sign
+    // kept after its base, that base.
+    let mut previous_base: Option<usize> = None;
+    for (index, item) in group.iter().enumerate() {
+        let base = previous_base
+            .filter(|&base| is_zero_width_mark(item) && inside_advance(group[base], item.x));
+        keys.push(base.map_or(item.x, |base| keys[base]));
+        previous_base = Some(base.unwrap_or(index));
+    }
+    let mut order: Vec<usize> = (0..group.len()).collect();
+    order.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
+    let sorted: Vec<&TextItem> = order.iter().map(|&index| group[index]).collect();
+    group.copy_from_slice(&sorted);
+}
+
 fn is_standalone_bullet_text(text: &str) -> bool {
     matches!(text.trim(), "•" | "○" | "●" | "◦")
 }
@@ -653,6 +1196,166 @@ fn has_phrase_continuation_shape(text: &str) -> bool {
         .chars()
         .take(24)
         .any(|ch| ch.is_whitespace() || matches!(ch, '-'))
+}
+
+/// The fraction of an em within which two baselines belong to one line
+/// (see [`baseline_tolerance`]).
+const LINE_BASELINE_TOLERANCE_EM: f32 = 0.6;
+
+/// The widest the line window gets, in points: the fixed window that
+/// grouped lines before the window followed the type, kept as its ceiling
+/// so that a junction of two fragments of ordinary size groups exactly as
+/// it did.
+const LINE_BASELINE_TOLERANCE_MAX_PT: f32 = 5.0;
+
+/// The type size at which [`baseline_tolerance`] reaches its ceiling: the
+/// size a fragment without one is given, so that it keeps the window of old.
+const LINE_BASELINE_LEGACY_EM: f32 = LINE_BASELINE_TOLERANCE_MAX_PT / LINE_BASELINE_TOLERANCE_EM;
+
+/// A fragment's type size for the line test: its rendered em size — the
+/// box height of an unrotated run, the font size of a rotated one, whose
+/// box mixes the advance into its height — else its font size, else the
+/// size that keeps the 5 pt window of old, which an image gets too, its
+/// height being the image's and not a type size.
+fn line_em(item: &TextItem) -> f32 {
+    let em = item.cross_extent();
+    if matches!(item.item_type, crate::types::ItemType::Image) {
+        LINE_BASELINE_LEGACY_EM
+    } else if em > 0.0 {
+        em
+    } else if item.font_size > 0.0 {
+        item.font_size
+    } else {
+        LINE_BASELINE_LEGACY_EM
+    }
+}
+
+/// How far apart two baselines may lie for fragments of type sizes `a` and
+/// `b` to sit on one line: `LINE_BASELINE_TOLERANCE_EM` of the larger of
+/// the two, no farther than the smaller, and never more than
+/// `LINE_BASELINE_TOLERANCE_MAX_PT` — the fixed window of old, which two
+/// fragments of 8⅓ pt and above therefore keep. Below that the window
+/// follows the type. A raised or lowered mark is displaced by less than
+/// its own em — a superscript of six tenths of its line's type rises a
+/// third of that type, half its own size — so every such mark stays with
+/// its line, while type of any size cannot pull a fragment of smaller type
+/// farther than that fragment's em: a line of 4 pt labels beside a column
+/// of 11 pt text 5 pt lower keeps its own line, and two lines of small
+/// type on a pitch under 5 pt — a stacked table header at 4.7 pt — stay
+/// apart, where the fixed window put them in one line and, shown glyph by
+/// glyph as small kerned type is, interleaved their glyphs along the
+/// baseline.
+fn baseline_tolerance(a: f32, b: f32) -> f32 {
+    (LINE_BASELINE_TOLERANCE_EM * a.max(b))
+        .min(a.min(b))
+        .min(LINE_BASELINE_TOLERANCE_MAX_PT)
+}
+
+/// How far apart two baselines must lie to be recorded separately on a
+/// line, in points.
+const LINE_BASELINE_RECORD_SPACING: f32 = 0.05;
+
+/// The most distinct baselines a line records: as many as the record
+/// spacing admits inside the fixed window either side of the line's first
+/// fragment, so no fragment inside that window is ever measured against a
+/// stale baseline — glyph-by-glyph type set on a slight slope records one
+/// per glyph — while the walk over them stays bounded.
+const LINE_BASELINES_MAX: usize =
+    (2.0 * LINE_BASELINE_TOLERANCE_MAX_PT / LINE_BASELINE_RECORD_SPACING) as usize;
+
+/// A line as the fragments are grouped: its page, the baseline of the
+/// fragment it was seeded with, the distinct baselines its fragments sit
+/// on (at most `LINE_BASELINES_MAX` of them, each with the largest type
+/// size seen on it, so that a small glyph shown first on a baseline — a
+/// bullet, a mark — does not narrow the window for the text that follows
+/// it), and the fragments.
+struct FragmentLine {
+    page: u32,
+    y: f32,
+    baselines: Vec<(f32, f32)>,
+    /// Indices into the fragments being grouped, in stream order.
+    fragments: Vec<usize>,
+}
+
+impl FragmentLine {
+    /// Whether a fragment at baseline `y` with type size `em` belongs to
+    /// this line: within the fixed window of the line's first fragment, as
+    /// always, and within [`baseline_tolerance`] of a baseline a fragment
+    /// of the line already sits on, each at its own type size — so a
+    /// subscript joins the base text it hangs from though the line's first
+    /// fragment lies a little higher, a mark joins the text it is raised
+    /// over though a smaller fragment sits nearer to it, and a line of
+    /// small type a whole pitch away does not join. The fixed window is
+    /// tested first, so only the baselines of lines that start within it
+    /// are walked.
+    fn admits(&self, page: u32, y: f32, em: f32) -> bool {
+        page == self.page
+            && (y - self.y).abs() < LINE_BASELINE_TOLERANCE_MAX_PT
+            && self
+                .baselines
+                .iter()
+                .any(|&(line_y, line_em)| (y - line_y).abs() < baseline_tolerance(em, line_em))
+    }
+
+    fn push(&mut self, index: usize, item: &TextItem, em: f32) {
+        let known = self
+            .baselines
+            .iter()
+            .position(|&(line_y, _)| (line_y - item.y).abs() < LINE_BASELINE_RECORD_SPACING);
+        match known {
+            Some(i) => self.baselines[i].1 = self.baselines[i].1.max(em),
+            None if self.baselines.len() < LINE_BASELINES_MAX => {
+                self.baselines.push((item.y, em));
+            }
+            None => {}
+        }
+        self.fragments.push(index);
+    }
+}
+
+/// The lines the fragments of `items` fall into — by page, then by
+/// baseline (see [`FragmentLine::admits`]) — as the fragments' indices,
+/// lines in the order their first fragment was walked and fragments in
+/// stream order within each. The walk is one pass in stream order, as it
+/// always was: the fragment that seeds a line anchors its fixed window,
+/// and a baseline's type size grows as larger type lands on it, so text
+/// shown after a small glyph on its baseline still gets its full window.
+/// The subscript pass buckets its rough lines with it too, so the order
+/// it fixes agrees with the lines made here.
+fn group_indices_into_lines(items: &[TextItem]) -> Vec<Vec<usize>> {
+    let mut lines: Vec<FragmentLine> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let em = line_em(item);
+        match lines
+            .iter_mut()
+            .find(|line| line.admits(item.page, item.y, em))
+        {
+            Some(line) => line.push(index, item, em),
+            None => lines.push(FragmentLine {
+                page: item.page,
+                y: item.y,
+                baselines: vec![(item.y, em)],
+                fragments: vec![index],
+            }),
+        }
+    }
+    lines.into_iter().map(|line| line.fragments).collect()
+}
+
+/// [`group_indices_into_lines`] as (page, baseline of the first fragment,
+/// fragments).
+fn group_fragments_into_lines(items: &[TextItem]) -> Vec<(u32, f32, Vec<&TextItem>)> {
+    group_indices_into_lines(items)
+        .into_iter()
+        .map(|indices| {
+            let first = &items[indices[0]];
+            (
+                first.page,
+                first.y,
+                indices.iter().map(|&i| &items[i]).collect(),
+            )
+        })
+        .collect()
 }
 
 fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
@@ -702,13 +1405,13 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
     let mut sorted_by_x = group.to_vec();
     sorted_by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
     let cluster_start = sorted_by_x[0].x;
-    let mut cluster_end = cluster_start + effective_merge_width(sorted_by_x[0]);
+    let mut cluster_end = cluster_start + order_extent(sorted_by_x[0]);
     for item in sorted_by_x.iter().skip(1) {
         let gap = item.x - cluster_end;
         if gap > max_font_size * 2.5 {
             return false;
         }
-        cluster_end = cluster_end.max(item.x + effective_merge_width(item));
+        cluster_end = cluster_end.max(item.x + order_extent(item));
     }
     if cluster_end - cluster_start > max_font_size * 36.0 {
         return false;
@@ -721,7 +1424,7 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
         let backtrack_threshold = font_size * 0.25;
         let previous_start = previous.x;
         let next_start = next.x;
-        let next_end = next.x + effective_merge_width(next);
+        let next_end = next.x + order_extent(next);
         if next_start < previous_start - backtrack_threshold
             && next_end > previous_start + backtrack_threshold
         {
@@ -775,7 +1478,7 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
 /// Han/Kana scripts write without inter-word spaces. Hangul (Korean) DOES
 /// space between words and deliberately stays out of this set — a Korean
 /// tracked run keeps normal word-boundary handling.
-fn is_spaceless_cjk(c: char) -> bool {
+pub(crate) fn is_spaceless_cjk(c: char) -> bool {
     matches!(c,
         '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
         | '\u{3040}'..='\u{309F}' // Hiragana
@@ -803,9 +1506,6 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     let mut end_x = first.x + effective_merge_width(first);
     let mut end = start;
     for (offset, next) in group[start + 1..].iter().enumerate() {
-        if next.text.trim().chars().count() != 1 {
-            break;
-        }
         if (next.font_size - fs).abs() > fs * 0.20 {
             break;
         }
@@ -816,12 +1516,25 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
         {
             break;
         }
+        let next_end = next.x + effective_merge_width(next);
+        // A dependent sign over the letter before it — of a character or
+        // two — is no letter of the run, and the line's right edge does
+        // not move for it (as in the merge loop): the next letter's gap
+        // is measured from the pen the letter under the sign left.
+        if is_zero_width_mark(next) {
+            end_x = end_x.max(next_end);
+            end = start + 1 + offset;
+            continue;
+        }
+        if next.text.trim().chars().count() != 1 {
+            break;
+        }
         let gap = next.x - end_x;
         if gap > fs * 0.5 || gap < -fs * 0.5 {
             break;
         }
         gaps.push(gap / fs);
-        end_x = next.x + effective_merge_width(next);
+        end_x = next_end;
         end = start + 1 + offset;
     }
     if gaps.len() < 2 {
@@ -976,60 +1689,593 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+/// The combining mark a spacing accent stands for. These are the accents
+/// the standard Latin encodings carry as glyphs of their own, each with an
+/// advance: macron, acute, grave, circumflex, tilde, dieresis, caron,
+/// breve, ring, cedilla, ogonek, dot accent and double acute. `None` for
+/// any other character.
+fn combining_mark_of_spacing_accent(c: char) -> Option<char> {
+    Some(match c {
+        '\u{00AF}' => '\u{0304}', // macron
+        '\u{00B4}' => '\u{0301}', // acute
+        '\u{0060}' => '\u{0300}', // grave
+        '\u{02C6}' => '\u{0302}', // circumflex
+        '\u{02DC}' => '\u{0303}', // tilde
+        '\u{00A8}' => '\u{0308}', // dieresis
+        '\u{02C7}' => '\u{030C}', // caron
+        '\u{02D8}' => '\u{0306}', // breve
+        '\u{02DA}' => '\u{030A}', // ring
+        '\u{00B8}' => '\u{0327}', // cedilla
+        '\u{02DB}' => '\u{0328}', // ogonek
+        '\u{02D9}' => '\u{0307}', // dot accent
+        '\u{02DD}' => '\u{030B}', // double acute
+        _ => return None,
+    })
+}
+
+/// The combining mark of a fragment that is one spacing accent and nothing
+/// else: a show operator of the single accent glyph.
+fn lone_spacing_accent(item: &TextItem) -> Option<char> {
+    let mut chars = item.text.chars();
+    let accent = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    combining_mark_of_spacing_accent(accent)
+}
+
+/// The end of a run a detached accent is matched against: the glyph that
+/// begins the run or the glyph that closes it.
+#[derive(Clone, Copy)]
+enum RunEnd {
+    First,
+    Last,
+}
+
+/// The glyph at `end` of `text`: its character, the byte range it takes in
+/// the text and the number of whitespace characters between it and that
+/// end of the run. `None` for a run of nothing but whitespace.
+fn end_glyph(text: &str, end: RunEnd) -> Option<(char, std::ops::Range<usize>, usize)> {
+    let found = match end {
+        RunEnd::First => text
+            .char_indices()
+            .enumerate()
+            .find(|(_, (_, c))| !c.is_whitespace()),
+        RunEnd::Last => text
+            .char_indices()
+            .rev()
+            .enumerate()
+            .find(|(_, (_, c))| !c.is_whitespace()),
+    };
+    found.map(|(skipped, (offset, c))| (c, offset..offset + c.len_utf8(), skipped))
+}
+
+/// How much of a detached accent lies over the glyph at `end` of `run`, in
+/// points along the baseline; `None` when it does not stand over that
+/// glyph. Both must be text runs of one page on a level baseline (a
+/// `rotation` of exactly 0: the axis-aligned box of an oblique run is no
+/// baseline), with measured advances and without right-to-left letters — a
+/// run of those may have been painted under a mirrored matrix, which reads
+/// as a level run whose glyphs advance leftwards, so which glyph stands at
+/// which end of its box is not known from the item, and none of the accents
+/// composes with such a letter anyway — their baselines within 0.3 em of
+/// each other (an accent over a capital is set a little higher than one
+/// over a small letter). The item keeps no advance per glyph, so the
+/// glyph's window along the baseline is estimated: each whitespace
+/// character is counted at 0.28 em (at the run's uniform advance for a
+/// fixed-pitch face), the rest of the width is shared equally among the
+/// other characters, and the window is that share or 0.6 em, whichever is
+/// wider, so a capital W or M under the accent is covered although the
+/// run's letters average half of it. The accent stands over the glyph when
+/// its centre falls within the window, with a quarter of the accent's own
+/// width of play beyond the run's edge for an accent overhanging a narrow
+/// letter. An accent shown beside a glyph rather than over it, a circumflex
+/// or grave that is text of its own, has its centre at least half its width
+/// beyond that edge and is never matched.
+fn accent_overlap(accent: &TextItem, run: &TextItem, end: RunEnd) -> Option<f32> {
+    let level_text = |item: &TextItem| {
+        matches!(item.item_type, crate::types::ItemType::Text)
+            && item.rotation == 0.0
+            && item.advance_known
+            && item.width > 0.0
+            && !item.text.chars().any(crate::text_utils::is_rtl_char)
+    };
+    if run.page != accent.page
+        || !level_text(run)
+        || !level_text(accent)
+        || run.font_size <= 0.0
+        || (accent.y - run.y).abs() > run.font_size * 0.3
+    {
+        return None;
+    }
+    let (_, _, skipped) = end_glyph(&run.text, end)?;
+    let em = run.font_size;
+    let chars = run.text.chars().count();
+    let spaces = run.text.chars().filter(|c| c.is_whitespace()).count();
+    let space_advance = if run.fixed_pitch == Some(true) {
+        run.width / chars as f32
+    } else {
+        em * 0.28
+    };
+    let ink = run.width - space_advance * spaces as f32;
+    if ink <= 0.0 {
+        return None;
+    }
+    // `end_glyph` found a glyph, so the run has more characters than spaces.
+    let advance = ink / (chars - spaces) as f32;
+    let window = advance.max(em * 0.6);
+    let (left, right) = match end {
+        RunEnd::First => {
+            let left = run.x + space_advance * skipped as f32;
+            (left, left + window)
+        }
+        RunEnd::Last => {
+            let right = run.x + run.width - space_advance * skipped as f32;
+            (right - window, right)
+        }
+    };
+    let centre = accent.x + accent.width / 2.0;
+    let play = accent.width * 0.25;
+    if centre < left - play || centre > right + play {
+        return None;
+    }
+    Some(((accent.x + accent.width).min(right) - accent.x.max(left)).max(0.0))
+}
+
+/// Composes a spacing accent shown as a text object of its own with the
+/// letter it is painted over.
+///
+/// Some producers set an accented letter as three show operators: the run
+/// up to the letter, one glyph of a spacing accent placed by its own text
+/// matrix over the letter, and the run from the letter on. The standard
+/// Latin encodings carry these accents (`macron`, `acute`, `caron` and
+/// their kin) as glyphs with an advance of their own, and the producer
+/// spells the letter by overprinting one on the other. Rendered, the accent
+/// lands on the letter; read back, it is a fragment of one glyph that
+/// starts a fraction of a point to the right of the run it decorates, and
+/// the line's fragments sorted along the baseline put it after that whole
+/// run: a stray accent a word on, and a letter without its mark.
+///
+/// So, before the line is ordered, a fragment that is nothing but a spacing
+/// accent is matched against the fragments shown just before and just
+/// after it: it stands over the last glyph of the one or the first glyph of
+/// the other when their baselines lie within 0.3 em and the accent's centre
+/// falls within that glyph's advance (`accent_overlap`, which also asks for
+/// level, measured runs without right-to-left letters; the glyph with the
+/// larger overlap wins when both qualify). That glyph and the accent's
+/// combining mark are then replaced by their canonical composition, when
+/// Unicode has one character for the pair, and the accent fragment is
+/// dropped; a dotless i or j under the accent composes as the dotted letter,
+/// the dot being what the accent replaces. An accent over neither
+/// neighbour, or over a glyph its mark does not compose with, is left
+/// exactly as shown: a lone circumflex or grave in code or mathematics has
+/// no letter under it and stays a character of its own.
+///
+/// `clips` runs parallel to `items` (see `merge_text_items_with_clips`);
+/// the entries of dropped fragments go with them. `replaced_text` marks,
+/// parallel to `items` too, the runs whose text is a producer's ActualText
+/// replacement rather than their glyphs' decoding: such a run's characters
+/// need not stand for its glyphs one by one, so it neither gives nor takes
+/// an accent.
+fn compose_detached_spacing_accents<'a>(
+    mut items: Vec<TextItem>,
+    clips: &'a [Option<clip_boundaries::ClipRect>],
+    replaced_text: &[bool],
+) -> (Vec<TextItem>, Cow<'a, [Option<clip_boundaries::ClipRect>]>) {
+    let replaced = |index: usize| replaced_text.get(index).copied().unwrap_or(false);
+    let mut dropped: Vec<usize> = Vec::new();
+    for i in 0..items.len() {
+        if replaced(i) {
+            continue;
+        }
+        let Some(mark) = lone_spacing_accent(&items[i]) else {
+            continue;
+        };
+        let neighbours = [
+            (i.checked_sub(1), RunEnd::Last),
+            (
+                Some(i + 1).filter(|&next| next < items.len()),
+                RunEnd::First,
+            ),
+        ];
+        // The neighbour whose end glyph the accent lies over and composes
+        // with; when it lies over both, the one it overlaps more. A glyph
+        // that has no composition with the mark is no candidate, so an
+        // accent over a `t` and an `o` composes with the `o` however the
+        // overlaps compare.
+        let mut best: Option<(usize, std::ops::Range<usize>, char, f32)> = None;
+        for (index, end) in neighbours {
+            let Some(index) = index else {
+                continue;
+            };
+            if replaced(index) || lone_spacing_accent(&items[index]).is_some() {
+                continue;
+            }
+            let Some(overlap) = accent_overlap(&items[i], &items[index], end) else {
+                continue;
+            };
+            let Some((glyph, range, _)) = end_glyph(&items[index].text, end) else {
+                continue;
+            };
+            // A dotless i or j is the form a typesetter puts an accent over,
+            // the dot being what the accent replaces: it composes as the
+            // dotted letter.
+            let base = match glyph {
+                '\u{0131}' => 'i',
+                '\u{0237}' => 'j',
+                other => other,
+            };
+            let Some(composed) = unicode_normalization::char::compose(base, mark) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, _, other)| overlap > *other)
+            {
+                best = Some((index, range, composed, overlap));
+            }
+        }
+        let Some((index, range, composed, _)) = best else {
+            continue;
+        };
+        items[index]
+            .text
+            .replace_range(range, composed.encode_utf8(&mut [0; 4]));
+        dropped.push(i);
+    }
+    if dropped.is_empty() {
+        return (items, Cow::Borrowed(clips));
+    }
+    let mut kept = vec![true; items.len()];
+    for &index in &dropped {
+        kept[index] = false;
+    }
+    let clips: Vec<Option<clip_boundaries::ClipRect>> = clips
+        .iter()
+        .zip(&kept)
+        .filter(|(_, &keep)| keep)
+        .map(|(clip, _)| *clip)
+        .collect();
+    let mut index = 0;
+    items.retain(|_| {
+        let keep = kept[index];
+        index += 1;
+        keep
+    });
+    (items, Cow::Owned(clips))
+}
+
+#[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
+    merge_text_items_with_clips(items, &[], false, &[])
+}
+
+/// The separators a number is written with: point, comma, colon, slash
+/// and the Arabic decimal and thousands separators.
+fn is_number_separator(c: char) -> bool {
+    matches!(c, '.' | ',' | ':' | '/' | '\u{066B}' | '\u{066C}')
+}
+
+/// A fragment of a number: digits of any script, at least one, with the
+/// separators that join them and nothing else.
+fn numeric_fragment(text: &str) -> bool {
+    let text = text.trim();
+    text.chars().any(char::is_numeric)
+        && text
+            .chars()
+            .all(|c| c.is_numeric() || is_number_separator(c))
+}
+
+/// A fragment of nothing but number separators: a comma or point shown
+/// apart from its digits.
+fn separator_fragment(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && text.chars().all(is_number_separator)
+}
+
+/// Whether the junction of two neighbouring fragments lies inside a
+/// number: both are number material and at least one holds a digit — a
+/// separator shown apart from its digits belongs to the number beside it,
+/// while two lone separators make no number.
+fn inside_number(a: &str, b: &str) -> bool {
+    let material = |text: &str| numeric_fragment(text) || separator_fragment(text);
+    material(a) && material(b) && (numeric_fragment(a) || numeric_fragment(b))
+}
+
+/// Word-gap floor for a line of right-to-left text shown one glyph per
+/// item, from its own gaps: the letter gaps of such a line cluster below
+/// its word gaps. Declared advance widths are often off for these fonts,
+/// so the fixed em fractions that serve word-by-word runs would put a space
+/// after every narrow letter. The gaps are given and the floor returned in
+/// em — of the smaller font beside each gap, so a word gap next to a
+/// footnote mark or a run of a smaller font is measured by the glyphs it
+/// separates. They are split into two classes where the variance between
+/// them is largest (Otsu's threshold), and the floor sits between the
+/// classes when the upper one is a space's worth apart from the lower —
+/// glyphs of a second font with true widths, digits at zero gap beside
+/// letters at a small one, form no such class. With one class of gaps the
+/// floor is infinite when even the wide ones are mid-word gaps (under the
+/// 0.13 em a junction inside a word may open to), so a line of one word
+/// holds together; gaps of one class that are wider than that could as
+/// well be the word gaps of one-letter words, and the fixed thresholds
+/// decide them: `None`.
+fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
+    if gaps.len() < 3 {
+        return None;
+    }
+    let mut sorted: Vec<f32> = gaps.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let total: f32 = sorted.iter().sum();
+    let n = sorted.len() as f32;
+    let mut best: Option<(f32, f32, f32)> = None; // (between-class variance, low mean, high mean)
+    let mut low_sum = 0.0f32;
+    for (k, &value) in sorted.iter().enumerate().take(sorted.len() - 1) {
+        low_sum += value;
+        let low_n = (k + 1) as f32;
+        let high_n = n - low_n;
+        let low_mean = low_sum / low_n;
+        let high_mean = (total - low_sum) / high_n;
+        let variance = low_n * high_n * (high_mean - low_mean).powi(2);
+        if best.is_none_or(|(v, _, _)| variance > v) {
+            best = Some((variance, low_mean, high_mean));
+        }
+    }
+    let upper_quartile = sorted[sorted.len() * 3 / 4];
+    match best {
+        Some((_, low_mean, high_mean)) if high_mean - low_mean >= 0.12 && high_mean >= 0.2 => {
+            Some((low_mean + high_mean) / 2.0)
+        }
+        _ if upper_quartile <= 0.13 => Some(f32::INFINITY),
+        _ => None,
+    }
+}
+
+/// Bold and plain runs are kept apart whatever said they were bold: with
+/// `PositionOptions::bold_from_weight` the weight class has already had its
+/// say in `is_bold` (see `content_stream::read_bold_from_weight`), so runs
+/// of different weight split only where the bold verdict changes.
+/// `visual_rtl` says the page's right-to-left runs are stored in visual
+/// order (see `text_utils::fix_visual_order_rtl`): the lines holding them
+/// are then read back into logical order here, as they merge.
+/// `replaced_text` marks, parallel to `items` like `clips`, the runs whose
+/// text is a producer's ActualText replacement rather than their glyphs'
+/// decoding (see `compose_detached_spacing_accents`).
+fn merge_text_items_with_clips(
+    items: Vec<TextItem>,
+    clips: &[Option<clip_boundaries::ClipRect>],
+    visual_rtl: bool,
+    replaced_text: &[bool],
+) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
     }
 
-    // Group items by (page, Y position) with 5pt tolerance
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+    // A spacing accent shown as a fragment of its own over a letter of the
+    // run before or after it is composed with that letter first, so the
+    // line is ordered without it.
+    let (items, owned_clips) = compose_detached_spacing_accents(items, clips, replaced_text);
+    let clips: &[Option<clip_boundaries::ClipRect>] = &owned_clips;
 
-    for item in &items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
-            group.push(item);
-        } else {
-            line_groups.push((item.page, item.y, vec![item]));
-        }
+    // References into `items` remain stable throughout grouping and sorting.
+    // Keep clipping provenance private rather than changing the public item type.
+    let clip_by_item: HashMap<*const TextItem, clip_boundaries::ClipRect> = items
+        .iter()
+        .zip(clips)
+        .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
+        .collect();
+
+    let line_groups = group_fragments_into_lines(&items);
+
+    // Each page's own direction: a line with right-to-left letters on a
+    // right-to-left page reads right to left even when its Latin letters
+    // outnumber them.
+    let page_rtl: HashMap<u32, bool> = items
+        .iter()
+        .map(|item| item.page)
+        .collect::<std::collections::HashSet<u32>>()
+        .into_iter()
+        .map(|page| {
+            let rtl = is_rtl_text(items.iter().filter(|i| i.page == page).map(|i| &i.text));
+            (page, rtl)
+        })
+        .collect();
+
+    /// One line's fragments, in the order they are walked.
+    struct LineGroup<'a> {
+        page: u32,
+        y: f32,
+        group: Vec<&'a TextItem>,
+        /// Each fragment's text as it reads: its own, or on a visual-order
+        /// page the stretch of the line's logical text that is its.
+        texts: Vec<Cow<'a, str>>,
+        preserve_stream_order: bool,
+        /// Holds right-to-left letters: walked in reading order, not along +x.
+        bidi: bool,
+        /// For a `bidi` line, each fragment's position in screen order.
+        display_index: Vec<usize>,
+        /// For a `bidi` line, the gap between each pair of screen
+        /// neighbours, in points, by screen position: from the line's right
+        /// edge so far, which a dependent sign does not move.
+        display_gaps: Vec<f32>,
+        /// For a `bidi` line shown one glyph per fragment, the word-gap
+        /// floor its own gaps give (`glyph_run_word_gap_floor`), in em of
+        /// the smaller font at a junction.
+        glyph_floor: Option<f32>,
     }
-
-    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool)> = Vec::new();
+    let mut ordered_line_groups: Vec<LineGroup<'_>> = Vec::new();
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
     for (page, y, mut group) in line_groups {
-        let rtl = is_rtl_text(group.iter().map(|i| &i.text));
-        let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
-        if rtl {
-            group.sort_by(|a, b| b.x.total_cmp(&a.x));
-            // Embedded LTR phrases must recover screen order before merging
-            // bakes the concatenation in — later sort_line_items passes can
-            // no longer separate a merged item.
-            crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
-        } else if !preserve_stream_order {
-            group.sort_by(|a, b| a.x.total_cmp(&b.x));
+        // A line with right-to-left letters, whichever direction dominates
+        // it, is walked in reading order below.
+        let bidi = group
+            .iter()
+            .any(|i| i.text.chars().any(crate::text_utils::is_rtl_char));
+        let preserve_stream_order = !bidi && should_preserve_overlapping_stream_order(&group);
+        let texts: Vec<Cow<'_, str>>;
+        let mut display_index: Vec<usize> = Vec::new();
+        let mut display_gaps: Vec<f32> = Vec::new();
+        let mut glyph_floor: Option<f32> = None;
+        if bidi {
+            // Screen order first; the fragments are then taken in the reading
+            // order the Unicode Bidirectional Algorithm gives the line, so an
+            // embedded Latin phrase or number keeps its own order when the
+            // concatenation below bakes the order in. On a visual-order page
+            // the fragments' glyphs are the display line itself, and each
+            // fragment gets its stretch of the logical text back.
+            let rtl_base = crate::text_utils::rtl_line_base(
+                &group,
+                |i| *i,
+                page_rtl.get(&page).copied().unwrap_or(false),
+            );
+            // Screen order, with a dependent sign kept after the letter it
+            // was shown on, as on a left-to-right line.
+            sort_along_x_keeping_marks(&mut group);
+            // The gaps between screen neighbours, taken once here: two
+            // glyphs at one x (a mark over its letter) sort either way, and
+            // the reading order below must index the same sequence. A
+            // dependent sign sits behind the pen and does not move the
+            // line's right edge: the fragment after it is measured from
+            // where the letter under it left the pen.
+            display_gaps = Vec::with_capacity(group.len().saturating_sub(1));
+            let mut right_edge: Option<f32> = None;
+            for item in &group {
+                let end = item.x + effective_merge_width(item);
+                if let Some(edge) = right_edge {
+                    display_gaps.push(item.x - edge);
+                }
+                right_edge = Some(match right_edge {
+                    Some(edge) if is_zero_width_mark(item) => edge.max(end),
+                    _ => end,
+                });
+            }
+            // Glyph-by-glyph positioned RTL text clusters into words by the
+            // line's own gaps: adjacent glyphs abut, word gaps do not, with
+            // the floor below where declared widths are off. Junctions
+            // inside a number are never word gaps and say nothing about the
+            // letters' gaps either (digits of another font keep true
+            // widths), so they stay out of the sample, and so do the
+            // junctions at a dependent sign, which is no letter of the
+            // line. The same floor separates the words for the bidi
+            // analysis and, below, for the merge.
+            let single_glyphs = group
+                .iter()
+                .filter(|i| i.text.trim().chars().count() == 1)
+                .count();
+            if group.len() >= 4 && single_glyphs * 10 >= group.len() * 7 {
+                let gaps: Vec<f32> = group
+                    .windows(2)
+                    .zip(&display_gaps)
+                    .filter(|(pair, _)| {
+                        !inside_number(&pair[0].text, &pair[1].text)
+                            && !is_zero_width_mark(pair[0])
+                            && !is_zero_width_mark(pair[1])
+                    })
+                    .map(|(pair, gap)| gap / pair[0].font_size.min(pair[1].font_size).max(1.0))
+                    .collect();
+                glyph_floor = glyph_run_word_gap_floor(&gaps);
+            }
+            let order = crate::bidi::logical_line_order(
+                &group,
+                |i| i.text.as_str(),
+                |i| (i.x, i.width),
+                |i| i.font_size,
+                |_| visual_rtl,
+                glyph_floor,
+                rtl_base,
+            );
+            let reordered: Vec<&TextItem> = order.iter().map(|&(index, _)| group[index]).collect();
+            display_index = order.iter().map(|&(index, _)| index).collect();
+            texts = order
+                .into_iter()
+                .map(|(index, logical)| {
+                    if visual_rtl {
+                        Cow::Owned(logical)
+                    } else {
+                        Cow::Borrowed(group[index].text.as_str())
+                    }
+                })
+                .collect();
+            group = reordered;
+        } else {
+            if !preserve_stream_order {
+                sort_along_x_keeping_marks(&mut group);
+            }
+            texts = group
+                .iter()
+                .map(|i| Cow::Borrowed(i.text.as_str()))
+                .collect();
         }
-        ordered_line_groups.push((page, y, group, preserve_stream_order));
+        ordered_line_groups.push(LineGroup {
+            page,
+            y,
+            group,
+            texts,
+            preserve_stream_order,
+            bidi,
+            display_index,
+            display_gaps,
+            glyph_floor,
+        });
     }
 
     // Sort groups by page then Y descending (top of page first)
-    ordered_line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+    ordered_line_groups.sort_by(|a, b| a.page.cmp(&b.page).then_with(|| b.y.total_cmp(&a.y)));
 
     let mut merged = Vec::new();
 
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+    for line in &ordered_line_groups {
+        let LineGroup {
+            group,
+            texts,
+            preserve_stream_order,
+            bidi,
+            display_index,
+            display_gaps,
+            glyph_floor,
+            ..
+        } = line;
+        // A line of right-to-left text is walked in reading order, which
+        // runs leftwards through its RTL words and rightwards through an
+        // embedded Latin phrase or number, but its word gaps are gaps between
+        // neighbours on the page. The gap at a junction of the walk is the
+        // gap between the two fragments when they are neighbours in screen
+        // order; where the walk jumps into or out of an embedded run, it is
+        // the gap between that run's near end and the fragment it turned
+        // from — the wider of the two screen gaps that flank the jump, the
+        // other being inside a run.
+        let junction_gap = |from: usize, to: usize| -> f32 {
+            let (a, b) = (display_index[from], display_index[to]);
+            if a.abs_diff(b) == 1 {
+                return display_gaps[a.min(b)];
+            }
+            let towards = |at: usize, other: usize| {
+                if other > at {
+                    display_gaps.get(at).copied()
+                } else {
+                    at.checked_sub(1).and_then(|k| display_gaps.get(k).copied())
+                }
+            };
+            match (towards(a, b), towards(b, a)) {
+                (Some(x), Some(y)) => x.max(y),
+                (Some(x), None) | (None, Some(x)) => x,
+                (None, None) => 0.0,
+            }
+        };
+        let glyph_floor = *glyph_floor;
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
-            let mut text = first.text.clone();
+            let mut text = texts[i].to_string();
+            let mut legacy_symbol_rewrite = first.legacy_symbol_rewrite;
             let mut end_x = first.x + effective_merge_width(first);
+            let mut box_right = first.x + first.width;
+            let mut box_left = first.x;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
-            let tracked = if *preserve_stream_order {
+            let tracked = if *preserve_stream_order || *bidi {
                 None
             } else {
                 tracked_run_space_floor(group, i)
@@ -1038,10 +2284,15 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
+                let next_text: &str = &texts[j];
+                let gap = if *bidi {
+                    junction_gap(j - 1, j)
+                } else {
+                    next.x - end_x
+                };
                 // A small-caps junction is mid-word: it both survives the
                 // font-size band below and must never take a space.
-                let small_caps_join =
-                    is_small_caps_continuation(&text, first, next, next.x - end_x);
+                let small_caps_join = is_small_caps_continuation(&text, first, next, gap);
                 // Must be similar font size, except for genuine small-caps
                 // runs, where the shrunken capitals are the same word as the
                 // full-size initial (see helper).
@@ -1050,20 +2301,28 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 {
                     break;
                 }
-                // Never merge across style boundaries: the merged item
-                // carries `first`'s flags, so absorbing a styled run into a
-                // plain neighbor (or vice versa) silently erases the styling
-                // that markdown emission and downstream inline-styling need —
-                // and OR-ing underline instead would stretch `<u>` spans over
-                // neighboring plain text.
-                if next.is_bold != first.is_bold
-                    || next.is_italic != first.is_italic
+                // Preserve the existing join behavior at non-bold style
+                // boundaries, including italic fragments within formulas.
+                if next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
                     || next.is_strikeout != first.is_strikeout
                 {
                     break;
                 }
-                let gap = next.x - end_x;
+                // Merging walks along +x, which is only the reading direction
+                // of upright runs. A vertical stamp whose box bottom shares a
+                // baseline with a body line must not be glued onto it, two
+                // side-by-side vertical runs are separate lines, and the
+                // fragments of an upside-down run read towards -x, so an
+                // ascending walk would concatenate them reversed.
+                if !first.is_upright() || !next.is_upright() {
+                    break;
+                }
+                // A merged item carries one `advance_known`: never fold a
+                // measured run and an estimated one into the same item.
+                if next.advance_known != first.advance_known {
+                    break;
+                }
                 let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
                 } else {
@@ -1072,7 +2331,36 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 if gap > x_gap_max {
                     break;
                 }
-                if gap < -first.font_size * 0.5 && !preserve_stream_order {
+                // A dependent sign is drawn over the glyph before it, as far
+                // behind the pen as that glyph is wide: it stays with it.
+                if gap < -first.font_size * 0.5
+                    && !preserve_stream_order
+                    && !is_zero_width_mark(next)
+                {
+                    break;
+                }
+                let previous = group[j - 1];
+                if clip_boundaries::separated_runs(
+                    previous,
+                    clip_by_item.get(&(previous as *const TextItem)),
+                    next,
+                    clip_by_item.get(&(next as *const TextItem)),
+                ) {
+                    break;
+                }
+                // Vertically stacked DIGITS at different baselines — the
+                // numerator over the denominator of a case fraction ("1"
+                // over "3") — are not one number even though they share the
+                // 5pt band and overlap in x. Letters keep merging: rotated
+                // running headers and diagram labels stack letters too, and
+                // splitting those only scatters fragments into body text.
+                let digits = |t: &str| !t.is_empty() && t.chars().all(char::is_numeric);
+                if !preserve_stream_order
+                    && (next.y - first.y).abs() > first.font_size * 0.3
+                    && gap < -effective_merge_width(next) * 0.5
+                    && digits(text.trim())
+                    && digits(next_text.trim())
+                {
                     break;
                 }
                 // Insert space at word boundaries.
@@ -1081,7 +2369,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 // that shift advance widths relative to Td positioning.
                 let threshold = {
                     let prev_last = text.trim_end().chars().last();
-                    let next_first = next.text.trim_start().chars().next();
+                    let next_first = next_text.trim_start().chars().next();
                     // Never insert space before joining punctuation
                     if next_first.is_some_and(|c| matches!(c, '.' | ',' | ';' | ')' | ']' | '}')) {
                         first.font_size * 0.25
@@ -1090,23 +2378,73 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     {
                         // Lowercase→lowercase: likely mid-word, use wider threshold
                         first.font_size * 0.13
+                    } else if prev_last.is_some_and(crate::text_utils::is_rtl_char)
+                        && next_first.is_some_and(crate::text_utils::is_rtl_char)
+                    {
+                        // Two pieces of one Hebrew or Arabic word, split where
+                        // the producer kerned or rejoined a glyph run: as
+                        // mid-word as a lowercase junction.
+                        first.font_size * 0.13
                     } else {
                         first.font_size * 0.08
                     }
                 };
                 let needs_bullet_space = *preserve_stream_order
                     && is_standalone_bullet_text(&text)
-                    && !next.text.trim().is_empty();
-                let effective_threshold = match tracked {
-                    Some((run_end, floor)) if j <= run_end => floor,
+                    && !next_text.trim().is_empty();
+                let effective_threshold = match (tracked, glyph_floor) {
+                    (Some((run_end, floor)), _) if j <= run_end => floor,
+                    (_, Some(floor_em)) => {
+                        floor_em * group[j - 1].font_size.min(next.font_size).max(1.0)
+                    }
                     _ => threshold,
                 };
-                if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
+                let bold_boundary = next.is_bold != first.is_bold;
+                let explicit_bold_space = bold_boundary
+                    && (text.ends_with(char::is_whitespace)
+                        || next_text.starts_with(char::is_whitespace));
+                // Numeric fragments have their own joining thresholds in
+                // line assembly. Injecting a word space here would split a
+                // number whose decimal point or digits use a bold font.
+                let numeric_boundary = bold_boundary
+                    && match (text.chars().last(), next_text.chars().next()) {
+                        (Some(p), Some(c)) if p.is_ascii_digit() => {
+                            c.is_ascii_digit() || matches!(c, '.' | ',' | '%')
+                        }
+                        (Some('.' | ','), Some(c)) if c.is_ascii_digit() => {
+                            let prefix = &text[..text.len() - 1];
+                            // A separate decimal glyph can start a fractional
+                            // number even without a preceding integer run.
+                            prefix.trim().is_empty()
+                                || prefix.chars().last().is_some_and(|c| c.is_ascii_digit())
+                        }
+                        (Some('+' | '-'), Some(c)) => c.is_ascii_digit(),
+                        _ => false,
+                    };
+                if !small_caps_join
+                    && (needs_bullet_space || (gap > effective_threshold && !numeric_boundary))
+                    && !explicit_bold_space
+                    && !text.ends_with(char::is_whitespace)
+                {
                     text.push(' ');
                 }
-                text.push_str(&next.text);
+                // Keep bold runs separate, but preserve the same word-space
+                // decision as an unstyled merge. Otherwise the later line
+                // assembler's wider joining threshold can glue words when
+                // newly recovered font flags split a previously merged run.
+                if bold_boundary {
+                    break;
+                }
+                text.push_str(next_text);
+                legacy_symbol_rewrite |= next.legacy_symbol_rewrite;
+                box_right = box_right.max(next.x + next.width);
+                box_left = box_left.min(next.x);
                 let next_end = next.x + effective_merge_width(next);
-                end_x = if *preserve_stream_order {
+                // The line's right edge does not move for a dependent sign
+                // drawn behind the pen: the fragment after the sign is
+                // measured from where the glyph under it left the pen, not
+                // from the sign's origin.
+                end_x = if *preserve_stream_order || is_zero_width_mark(next) {
                     end_x.max(next_end)
                 } else {
                     next_end
@@ -1114,22 +2452,52 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 j += 1;
             }
 
+            // Hebrew and Arabic presentation forms stand for letters; now
+            // that the text reads in logical order, a ligature's letters
+            // come out in reading order, and the joiners that held the
+            // characters of one glyph together through the read-back have
+            // done their work.
+            let mut text = crate::bidi::normalize_presentation_forms(&text).into_owned();
+            crate::bidi::strip_glyph_joiners(&mut text);
+
             merged.push(TextItem {
                 text,
-                x: first.x,
+                // An estimated run's item is the union of the estimated boxes
+                // it merged, including any fragment that backtracked in x; so
+                // is a run with right-to-left text, whose fragments were
+                // walked in reading order rather than along +x.
+                x: if first.advance_known && !*bidi {
+                    first.x
+                } else {
+                    box_left
+                },
                 y: first.y,
-                width: end_x - first.x,
+                width: if first.advance_known && !*bidi {
+                    end_x - first.x
+                } else {
+                    box_right - box_left
+                },
                 height: first.height,
                 font: first.font.clone(),
                 font_tag: first.font_tag.clone(),
+                legacy_symbol_rewrite,
                 font_size: first.font_size,
                 page: first.page,
                 is_bold: first.is_bold,
                 is_italic: first.is_italic,
+                font_weight: first.font_weight,
+                bold_source: first.bold_source,
+                fixed_pitch: first.fixed_pitch,
+                fill_color: first.fill_color,
+                stroke_color: first.stroke_color,
+                render_mode: first.render_mode,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                rotation: first.rotation,
+                advance_known: first.advance_known,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
+                baseline_shift: 0.0,
             });
 
             i = j;
@@ -1137,127 +2505,6 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     }
 
     merged
-}
-
-/// Merge subscript/superscript items into their adjacent parent items.
-///
-/// Subscripts (e.g. "2" in H₂O) are rendered as separate text items with a
-/// much smaller font size and a slight Y offset. This pass finds such items
-/// and absorbs them into the preceding normal-sized item so that downstream
-/// table detection and line grouping see complete text (e.g. "H2O" not "H"+"2"+"O").
-pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    if items.len() < 2 {
-        return items;
-    }
-
-    // Group items by (page, approximate Y) with generous tolerance to capture
-    // both the parent line and the subscript/superscript offset.
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<TextItem>)> = Vec::new();
-
-    for item in items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
-            group.push(item);
-        } else {
-            let page = item.page;
-            let y = item.y;
-            line_groups.push((page, y, vec![item]));
-        }
-    }
-
-    let mut result = Vec::new();
-
-    for (_, _, mut group) in line_groups {
-        // Sort by X position
-        group.sort_by(|a, b| a.x.total_cmp(&b.x));
-
-        // Find the dominant (most common) font size in this group
-        let max_fs = group.iter().map(|i| i.font_size).fold(0.0_f32, f32::max);
-
-        if max_fs < 1.0 {
-            result.extend(group);
-            continue;
-        }
-
-        let sub_threshold = max_fs * 0.75;
-
-        // Walk through items and merge subscripts into their preceding parent
-        let mut merged: Vec<TextItem> = Vec::new();
-        for item in group {
-            if item.font_size < sub_threshold
-                && item.font_size > 0.0
-                && item.text.len() <= 4
-                && item.text.chars().all(|c| c.is_ascii_digit())
-            {
-                // This is a candidate numeric subscript/superscript (e.g. "2" in H₂O).
-                // Only merge purely numeric text to avoid false positives with small
-                // bullets, ordinal indicators, or letter-based labels.
-                if let Some(parent) = merged.last_mut() {
-                    // Only merge into a parent that is normal-sized, not another subscript,
-                    // and whose text ends with a letter. This prevents merging into numbers
-                    // (e.g. "33" + "1" in "33 1/3%") or punctuation, while preserving
-                    // chemical formulas (NH + "3") and footnote refs (word + "2").
-                    let ends_with_letter = parent
-                        .text
-                        .chars()
-                        .last()
-                        .is_some_and(|c| c.is_alphabetic());
-                    // Strikeout boundaries block the merge (a struck word
-                    // must not extend its strike over a live footnote digit,
-                    // and a struck digit must not lose its own mark). An
-                    // underlined parent with an unmarked digit DOES merge:
-                    // the drawn rule easily misses the tiny digit's overlap
-                    // window, and refusing costs the whole subscript token
-                    // ("b"+"2" staying split). Visually the rule spans both.
-                    let marks_ok = parent.is_strikeout == item.is_strikeout
-                        && (parent.is_underline == item.is_underline
-                            || (parent.is_underline && !item.is_underline));
-                    if parent.font_size >= sub_threshold && ends_with_letter && marks_ok {
-                        let parent_right = parent.x + parent.width;
-                        let gap = item.x - parent_right;
-                        // Subscripts must be tightly adjacent (within ~1pt)
-                        if gap < parent.font_size * 0.2 && gap > -parent.font_size * 0.3 {
-                            // Preserve the script when absorbing it: map the
-                            // digits to Unicode sub/superscript forms so the
-                            // raised/lowered rendering survives in extracted
-                            // text ("H"+"2" → "H₂", "word"+"2" → "word²").
-                            // NFKC/NFKD normalization folds these back to
-                            // plain digits, so text matching downstream is
-                            // unaffected. Direction from the baseline offset
-                            // (y-up here): raised → superscript (footnote
-                            // refs), lowered/level → subscript (chemistry).
-                            let raised = item.y > parent.y + parent.font_size * 0.1;
-                            parent.text.push_str(&map_script_digits(&item.text, raised));
-                            parent.width = (item.x + item.width) - parent.x;
-                            continue;
-                        }
-                    }
-                }
-            }
-            merged.push(item);
-        }
-        result.extend(merged);
-    }
-
-    result
-}
-
-/// Map ASCII digits to their Unicode superscript (`raised`) or subscript
-/// forms. Callers guarantee digit-only input (see `merge_subscript_items`);
-/// anything else passes through unchanged.
-fn map_script_digits(text: &str, raised: bool) -> String {
-    const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
-    const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
-    text.chars()
-        .map(|c| match c.to_digit(10) {
-            Some(d) if raised => SUP[d as usize],
-            Some(d) => SUB[d as usize],
-            None => c,
-        })
-        .collect()
 }
 
 /// Helper to get f32 from Object
@@ -1269,46 +2516,6 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
     }
 }
 
-/// Visible page box: CropBox if present, else MediaBox, walking page-tree
-/// inheritance (both attributes are inheritable). Returns normalized
-/// (x0, y0, x1, y1) in PDF space.
-fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
-    fn find_box(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
-        let mut id = page_id;
-        for _ in 0..32 {
-            let dict = doc.get_dictionary(id).ok()?;
-            if let Ok(obj) = dict.get(key) {
-                let arr = match obj {
-                    Object::Array(a) => Some(a.clone()),
-                    Object::Reference(r) => match doc.get_object(*r) {
-                        Ok(Object::Array(a)) => Some(a.clone()),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some(arr) = arr {
-                    let vals: Vec<f32> = arr.iter().filter_map(get_number).collect();
-                    if vals.len() >= 4 {
-                        return Some(vals);
-                    }
-                }
-            }
-            match dict.get(b"Parent") {
-                Ok(Object::Reference(p)) => id = *p,
-                _ => return None,
-            }
-        }
-        None
-    }
-    let v = find_box(doc, page_id, b"CropBox").or_else(|| find_box(doc, page_id, b"MediaBox"))?;
-    Some((
-        v[0].min(v[2]),
-        v[1].min(v[3]),
-        v[0].max(v[2]),
-        v[1].max(v[3]),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,6 +2524,54 @@ mod tests {
     use layout::{detect_columns, is_newspaper_layout, ColumnRegion};
 
     /// Glyph-per-item run at `fs`=12 with the given inter-glyph gap (pt).
+    #[test]
+    fn numeric_fragments_are_digits_of_any_script_with_their_separators() {
+        assert!(numeric_fragment("12"));
+        assert!(numeric_fragment(" 1,234.5 "));
+        assert!(numeric_fragment("\u{0662}\u{0664}"));
+        assert!(numeric_fragment("\u{0663}\u{066B}\u{0665}"));
+        assert!(!numeric_fragment(""));
+        assert!(!numeric_fragment("a1"));
+        assert!(!numeric_fragment("\u{05D0}"));
+        assert!(!numeric_fragment("-"));
+        // A separator on its own is no number, but belongs to the number
+        // beside it.
+        assert!(!numeric_fragment(","));
+        assert!(separator_fragment(","));
+        assert!(inside_number("21", ","));
+        assert!(inside_number(",", "847"));
+        assert!(inside_number("1", "2"));
+        assert!(!inside_number(".", "."));
+        assert!(!inside_number("a", "1"));
+        assert!(!inside_number("1", "\u{05D0}"));
+    }
+
+    #[test]
+    fn glyph_run_word_gap_floor_splits_letter_gaps_from_word_gaps() {
+        // Letter gaps under a tenth of an em and two word gaps of a third:
+        // the floor sits between the classes.
+        let gaps = [0.06, 0.08, 0.07, 0.34, 0.09, 0.06, 0.32, 0.08];
+        let floor = glyph_run_word_gap_floor(&gaps).expect("two classes");
+        assert!(floor > 0.09 && floor < 0.32, "{floor}");
+    }
+
+    #[test]
+    fn glyph_run_word_gap_floor_holds_one_word_together() {
+        // One class of gaps, all mid-word sized: the line is one word.
+        let gaps = [0.06, 0.09, 0.11, 0.07, 0.10];
+        assert_eq!(glyph_run_word_gap_floor(&gaps), Some(f32::INFINITY));
+    }
+
+    #[test]
+    fn glyph_run_word_gap_floor_leaves_uniform_wide_gaps_to_the_thresholds() {
+        // One class of gaps as wide as word spaces (one-letter words, or a
+        // short run whose gaps do not tell): no floor of its own.
+        let gaps = [0.24, 0.26, 0.25, 0.25];
+        assert_eq!(glyph_run_word_gap_floor(&gaps), None);
+        // Too few gaps to read a distribution from.
+        assert_eq!(glyph_run_word_gap_floor(&[0.05, 0.3]), None);
+    }
+
     fn glyph_run(chars: &str, start_x: f32, glyph_w: f32, gap: f32) -> Vec<TextItem> {
         let mut x = start_x;
         let mut out = Vec::new();
@@ -1426,15 +2681,38 @@ mod tests {
             height: 12.0,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn explicit_trailing_space_is_not_doubled_across_a_word_gap() {
+        // "for " already carries its space run; the 4pt gap (0.33 em) that
+        // run left clears the word threshold but must not add a second one.
+        let items = vec![
+            make_merge_item("for ", 100.0, 21.6),
+            make_merge_item("the", 125.6, 21.6),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "for the");
     }
 
     fn with_mcid(mut item: TextItem) -> TextItem {
@@ -1462,6 +2740,225 @@ mod tests {
         assert!(preview.ends_with('\u{FFFD}'));
     }
 
+    /// `text` shown glyph by glyph at `size`, each glyph its own fragment
+    /// with the advance of Helvetica-Bold, as small kerned type is shown.
+    fn glyph_fragments(text: &str, x0: f32, y: f32, size: f32) -> Vec<TextItem> {
+        let advance = |ch: char| -> f32 {
+            let units = match ch {
+                'A' | 'U' => 722.0,
+                'E' | 'P' | 'S' => 667.0,
+                'M' => 833.0,
+                'O' => 778.0,
+                'W' => 944.0,
+                'd' | 'g' | 'n' | 'o' | 'p' => 611.0,
+                'i' | 'l' => 278.0,
+                'r' => 389.0,
+                't' => 333.0,
+                _ => 556.0,
+            };
+            units * size / 1000.0
+        };
+        let mut items = Vec::new();
+        let mut x = x0;
+        for ch in text.chars() {
+            let w = advance(ch);
+            if ch != ' ' {
+                let mut item = make_merge_item(&ch.to_string(), x, w);
+                item.y = y;
+                item.height = size;
+                item.font_size = size;
+                items.push(item);
+            }
+            x += if ch == ' ' { 278.0 * size / 1000.0 } else { w };
+        }
+        items
+    }
+
+    /// The merged items' letters along each baseline, top line first,
+    /// spaces left out: what a line reads as, whatever its word breaks.
+    fn letters_by_baseline(merged: &[TextItem]) -> Vec<(f32, String)> {
+        let mut lines: Vec<(f32, Vec<&TextItem>)> = Vec::new();
+        for item in merged {
+            match lines.iter_mut().find(|(y, _)| (*y - item.y).abs() < 0.01) {
+                Some((_, line)) => line.push(item),
+                None => lines.push((item.y, vec![item])),
+            }
+        }
+        lines.sort_by(|a, b| b.0.total_cmp(&a.0));
+        lines
+            .into_iter()
+            .map(|(y, mut line)| {
+                line.sort_by(|a, b| a.x.total_cmp(&b.x));
+                (y, line.iter().map(|i| i.text.replace(' ', "")).collect())
+            })
+            .collect()
+    }
+
+    fn sized_item(text: &str, x: f32, width: f32, y: f32, size: f32) -> TextItem {
+        let mut item = make_merge_item(text, x, width);
+        item.y = y;
+        item.height = size;
+        item.font_size = size;
+        item
+    }
+
+    /// Two lines of 4.7 pt type on a 4.5 pt pitch, each shown glyph by
+    /// glyph, keep their own lines and read in order; on a 6 pt pitch they
+    /// always did.
+    #[test]
+    fn small_lines_under_five_points_apart_keep_their_own_lines() {
+        let mut items = glyph_fragments("Apples Picked", 100.0, 700.0, 4.7);
+        items.extend(glyph_fragments("Oranges Sold", 100.6, 695.5, 4.7));
+        assert_eq!(
+            letters_by_baseline(&merge_text_items(items)),
+            vec![
+                (700.0, "ApplesPicked".to_string()),
+                (695.5, "OrangesSold".to_string())
+            ]
+        );
+        let mut items = glyph_fragments("Water Usage", 100.0, 650.0, 4.7);
+        items.extend(glyph_fragments("Energy Mix", 101.2, 644.0, 4.7));
+        assert_eq!(
+            letters_by_baseline(&merge_text_items(items)),
+            vec![
+                (650.0, "WaterUsage".to_string()),
+                (644.0, "EnergyMix".to_string())
+            ]
+        );
+    }
+
+    /// The line window follows the type where either fragment is small and
+    /// is the 5 pt of old between two fragments of ordinary size: markers
+    /// raised a third of an em stay with their line, a run raised 5 pt over
+    /// 12 pt type keeps its own line as it always did, a line of small type
+    /// under larger type keeps its own, a small glyph shown first does not
+    /// narrow the window for the text after it, sloped glyph-by-glyph type
+    /// stays one line past the baselines a line records, images keep the
+    /// window of old without pulling small type, and fragments without a
+    /// type size keep the 5 pt window.
+    #[test]
+    fn the_line_window_follows_the_type_size() {
+        // A 7.97 pt affiliation marker raised 4.3 pt over an 11.96 pt name.
+        let name = sized_item("Huo", 100.0, 20.0, 700.0, 11.96);
+        let marker = sized_item("1", 120.5, 4.0, 704.3, 7.97);
+        assert_eq!(group_fragments_into_lines(&[name, marker]).len(), 1);
+        // A 5.5 pt marker raised 3 pt over 8 pt type.
+        let word = sized_item("word", 100.0, 16.0, 700.0, 8.0);
+        let mark = sized_item("2", 116.2, 3.0, 703.0, 5.5);
+        assert_eq!(group_fragments_into_lines(&[word, mark]).len(), 1);
+        // A run raised 5 pt over 12 pt type is not within the window,
+        // exactly as before.
+        let base = sized_item("base", 100.0, 24.0, 500.0, 12.0);
+        let raised = sized_item("super", 124.0, 30.0, 505.0, 12.0);
+        assert_eq!(group_fragments_into_lines(&[base, raised]).len(), 2);
+        // A 7 pt reference mark raised 4 pt over 12 pt text stays with it.
+        let word = sized_item("word", 100.0, 24.0, 700.0, 12.0);
+        let mark = sized_item("1", 124.2, 3.5, 704.0, 7.0);
+        assert_eq!(group_fragments_into_lines(&[word, mark]).len(), 1);
+        // A 10 pt line 16 pt under a 40 pt heading, a 4 pt line 4.5 pt
+        // under a 7 pt one, and a 4 pt line 4.5 pt under a 12 pt one: type
+        // of any size pulls a fragment of smaller type no farther than that
+        // fragment's em.
+        let heading = sized_item("Title", 100.0, 100.0, 700.0, 40.0);
+        let body = sized_item("body", 100.0, 20.0, 684.0, 10.0);
+        assert_eq!(group_fragments_into_lines(&[heading, body]).len(), 2);
+        let line = sized_item("line", 100.0, 14.0, 700.0, 7.0);
+        let tiny = sized_item("tiny", 100.0, 8.0, 695.5, 4.0);
+        assert_eq!(group_fragments_into_lines(&[line, tiny]).len(), 2);
+        let line = sized_item("line", 100.0, 24.0, 700.0, 12.0);
+        let tiny = sized_item("tiny", 100.0, 8.0, 695.5, 4.0);
+        assert_eq!(group_fragments_into_lines(&[line, tiny]).len(), 2);
+        // Forty 10 pt glyphs on a slope of a tenth of a point each are one
+        // line, past the baselines the line records.
+        let sloped: Vec<TextItem> = (0..40)
+            .map(|i| {
+                sized_item(
+                    "g",
+                    100.0 + 6.0 * i as f32,
+                    6.0,
+                    700.0 + 0.1 * i as f32,
+                    10.0,
+                )
+            })
+            .collect();
+        assert_eq!(group_fragments_into_lines(&sloped).len(), 1);
+        // An image keeps the window of old: a 2 pt tall one 3 pt under a
+        // 10 pt line groups with it, as before, and a tall one 0.4 pt from
+        // a line of 0.55 pt type does not pull a second such line, 0.4 pt
+        // beyond the first, into the same line.
+        let text = sized_item("text", 100.0, 20.0, 700.0, 10.0);
+        let mut rule = sized_item("[Image]", 100.0, 200.0, 697.0, 2.0);
+        rule.item_type = ItemType::Image;
+        rule.font_size = 0.0;
+        assert_eq!(group_fragments_into_lines(&[text, rule]).len(), 1);
+        let mut figure = sized_item("[Image]", 28.7, 564.0, 435.1, 317.5);
+        figure.item_type = ItemType::Image;
+        figure.font_size = 0.0;
+        let upper = sized_item("materials", 87.9, 20.0, 434.68, 0.55);
+        let lower = sized_item("respective", 29.4, 20.0, 434.27, 0.55);
+        let beside_figure = [figure, upper, lower];
+        let lines = group_fragments_into_lines(&beside_figure);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].2.len(), 1);
+        // A 3 pt bullet shown first on the baseline does not narrow the
+        // window for the 10 pt text after it: its 6 pt marker raised 3.5 pt
+        // still joins.
+        let bullet = sized_item("•", 90.0, 3.0, 700.0, 3.0);
+        let text = sized_item("text", 100.0, 20.0, 700.0, 10.0);
+        let marker = sized_item("2", 120.2, 3.0, 703.5, 6.0);
+        assert_eq!(group_fragments_into_lines(&[bullet, text, marker]).len(), 1);
+        // A mark joins the text it is raised over though a smaller fragment
+        // sits nearer to it: a 4 pt mark 3.8 pt over 12 pt text, with a 4 pt
+        // glyph hanging 1 pt below that text.
+        let text = sized_item("word", 100.0, 24.0, 700.0, 12.0);
+        let hanging = sized_item("n", 125.0, 2.0, 701.0, 4.0);
+        let mark = sized_item("1", 124.2, 2.0, 703.8, 4.0);
+        assert_eq!(group_fragments_into_lines(&[text, hanging, mark]).len(), 1);
+        // Forty-eight glyphs of 4.7 pt type on a slope of a tenth of a point each
+        // stay one line as far as the fixed window reaches: the line records
+        // every baseline inside it.
+        let sloped: Vec<TextItem> = (0..48)
+            .map(|i| {
+                sized_item(
+                    "g",
+                    100.0 + 3.0 * i as f32,
+                    3.0,
+                    700.0 + 0.1 * i as f32,
+                    4.7,
+                )
+            })
+            .collect();
+        assert_eq!(group_fragments_into_lines(&sloped).len(), 1);
+        // Two 4.7 pt lines 4.5 pt apart, and two 6 pt apart.
+        let a = sized_item("a", 100.0, 3.0, 700.0, 4.7);
+        let b = sized_item("b", 100.0, 3.0, 695.5, 4.7);
+        let c = sized_item("c", 100.0, 3.0, 694.0, 4.7);
+        assert_eq!(group_fragments_into_lines(&[a.clone(), b]).len(), 2);
+        assert_eq!(group_fragments_into_lines(&[a, c]).len(), 2);
+        // The same two lines set 3° off level: each run's box is 10 pt
+        // tall, but its type is still 4.7 pt.
+        let mut a = sized_item("Apples Picked", 100.0, 100.0, 700.0, 4.7);
+        let mut b = sized_item("Oranges Sold", 100.0, 100.0, 695.5, 4.7);
+        for run in [&mut a, &mut b] {
+            run.rotation = 3.0;
+            run.height = 10.0;
+        }
+        assert_eq!(group_fragments_into_lines(&[a, b]).len(), 2);
+        // A 4 pt subscript 2.3 pt under its 7 pt base text, on a line
+        // whose first fragment sits 2 pt above that text: it joins by the
+        // base text's baseline, though the first fragment is 4.3 pt away.
+        let first = sized_item("and time horizons", 56.7, 56.0, 332.92, 7.0);
+        let base = sized_item("tons of CO", 133.2, 130.0, 330.92, 7.0);
+        let sub = sized_item("2", 262.7, 2.2, 328.63, 4.06);
+        assert_eq!(group_fragments_into_lines(&[first, base, sub]).len(), 1);
+        // No type size: the 5 pt window of old.
+        let p = sized_item("p", 100.0, 5.0, 700.0, 0.0);
+        let q = sized_item("q", 110.0, 5.0, 695.1, 0.0);
+        let r = sized_item("r", 100.0, 5.0, 694.9, 0.0);
+        assert_eq!(group_fragments_into_lines(&[p.clone(), q]).len(), 1);
+        assert_eq!(group_fragments_into_lines(&[p, r]).len(), 2);
+    }
+
     #[test]
     fn merge_items_breaks_at_style_boundaries() {
         // A styled run adjacent to plain text must stay a separate item —
@@ -1482,6 +2979,241 @@ mod tests {
         assert!(merged[1].is_italic && !merged[1].is_underline);
         assert!(merged[2].is_underline && !merged[2].is_italic);
         assert!(!merged[3].is_underline && !merged[3].is_italic);
+    }
+
+    #[test]
+    fn merge_follows_the_bold_verdict_not_the_weight_class() {
+        use crate::types::BoldSource;
+
+        // A medium-weight label leading a light paragraph: neither is bold,
+        // so the runs merge into one item whatever their weight classes,
+        // and the item carries its first run's weight.
+        let mut label = make_merge_item("Label:", 100.0, 36.0);
+        label.font_weight = Some(500);
+        let mut body = make_merge_item("body", 137.2, 24.0);
+        body.font_weight = Some(300);
+        let mut more = make_merge_item("text", 163.6, 24.0);
+        more.font_weight = Some(300);
+        let items = vec![label.clone(), body.clone(), more.clone()];
+        let merged = merge_text_items_with_clips(items, &[], false, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Label: body text");
+        assert_eq!(merged[0].font_weight, Some(500));
+
+        // Once the weight class has made the label bold (the option's pass,
+        // `read_bold_from_weight`), the label stays its own item, and the
+        // merge still decides the word space the way an unstyled merge
+        // would, so the later line assembler does not glue "Label:" onto
+        // "body".
+        let mut items = vec![label, body, more];
+        super::content_stream::read_bold_from_weight(&mut items, 500);
+        let apart = merge_text_items_with_clips(items, &[], false, &[]);
+        assert_eq!(apart.len(), 2);
+        assert_eq!(apart[0].text, "Label: ");
+        assert!(apart[0].is_bold);
+        assert_eq!(apart[0].bold_source, Some(BoldSource::WeightClass));
+        assert_eq!(apart[1].text, "body text");
+        assert!(!apart[1].is_bold);
+        assert_eq!(apart[1].bold_source, None);
+
+        // Runs of different weight that agree on bold merge: a 700 face
+        // beside a 400 face whose name says bold are one item, which keeps
+        // the first run's weight class and bold source.
+        let mut heavy = make_merge_item("Heavy", 100.0, 30.0);
+        heavy.font_weight = Some(700);
+        let mut named = make_merge_item("named", 132.0, 30.0);
+        named.font_weight = Some(400);
+        named.is_bold = true;
+        named.bold_source = Some(BoldSource::FontName);
+        let mut items = vec![heavy, named];
+        super::content_stream::read_bold_from_weight(&mut items, 600);
+        let merged = merge_text_items_with_clips(items, &[], false, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Heavy named");
+        assert_eq!(merged[0].font_weight, Some(700));
+        assert_eq!(merged[0].bold_source, Some(BoldSource::WeightClass));
+
+        // Runs that know no weight merge as before.
+        let unknown = vec![
+            make_merge_item("no", 100.0, 12.0),
+            make_merge_item("weight", 113.2, 36.0),
+        ];
+        assert_eq!(
+            merge_text_items_with_clips(unknown, &[], false, &[]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_bold_from_weight_credits_the_weight_class_after_name_and_flags() {
+        use crate::types::BoldSource;
+
+        let mut named = make_merge_item("named", 0.0, 10.0);
+        named.font_weight = Some(700);
+        named.is_bold = true;
+        named.bold_source = Some(BoldSource::FontName);
+        let mut painted = make_merge_item("painted", 20.0, 10.0);
+        painted.font_weight = Some(650);
+        painted.is_bold = true;
+        painted.bold_source = Some(BoldSource::Painted);
+        let mut light = make_merge_item("light", 40.0, 10.0);
+        light.font_weight = Some(300);
+        let unknown = make_merge_item("unknown", 60.0, 10.0);
+        let mut items = vec![named, painted, light, unknown];
+        super::content_stream::read_bold_from_weight(&mut items, 600);
+        // The name outranks the weight class; the weight class outranks the
+        // paint, since the face itself is heavy.
+        assert_eq!(items[0].bold_source, Some(BoldSource::FontName));
+        assert_eq!(items[1].bold_source, Some(BoldSource::WeightClass));
+        assert!(!items[2].is_bold && items[2].bold_source.is_none());
+        assert!(!items[3].is_bold && items[3].bold_source.is_none());
+
+        // The threshold is inclusive and honoured as given.
+        let mut items = vec![make_merge_item("x", 0.0, 10.0)];
+        items[0].font_weight = Some(500);
+        super::content_stream::read_bold_from_weight(&mut items, 500);
+        assert!(items[0].is_bold);
+        assert_eq!(items[0].bold_source, Some(BoldSource::WeightClass));
+    }
+
+    #[test]
+    fn recovered_bold_preserves_word_spacing_at_style_boundary() {
+        // A 0.1-em gap is a word boundary in merging, but the later line
+        // assembler joins gaps below 0.15 em. Recovering bold must not lose
+        // the space that the original all-plain merge would have emitted.
+        let plain = vec![
+            make_merge_item("KEY", 100.0, 24.0),
+            make_merge_item("Body", 125.2, 24.0),
+        ];
+        let original = merge_text_items(plain.clone());
+        let mut styled = plain;
+        styled[0].is_bold = true;
+        let recovered = merge_text_items(styled);
+        assert_eq!(original[0].text, "KEY Body");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].is_bold && !recovered[1].is_bold);
+        assert_eq!(recovered[0].text, "KEY ");
+        assert_eq!(recovered[1].text, "Body");
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            original[0].text
+        );
+        let line = TextLine {
+            items: recovered,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "KEY Body");
+        assert_eq!(
+            line.text_with_formatting(true, false, false),
+            "**KEY** Body"
+        );
+    }
+
+    #[test]
+    fn recovered_bold_keeps_zero_gap_word_fragments_joined() {
+        let plain = vec![
+            make_merge_item("un", 100.0, 12.0),
+            make_merge_item("known", 112.0, 30.0),
+        ];
+        let original = merge_text_items(plain.clone());
+        let mut styled = plain;
+        styled[0].is_bold = true;
+        let recovered = merge_text_items(styled);
+        assert_eq!(original[0].text, "unknown");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].is_bold && !recovered[1].is_bold);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>(),
+            original[0].text
+        );
+        let line = TextLine {
+            items: recovered,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(line.text(), "unknown");
+        assert_eq!(line.text_with_formatting(true, false, false), "**un**known");
+    }
+
+    #[test]
+    fn bold_numeric_fragments_keep_line_assembly_spacing() {
+        for (parts, gap, expected) in [
+            (
+                vec![("0", false), (".", true), ("86", false)],
+                1.2,
+                "0**.**86",
+            ),
+            (vec![("0.", true), ("86", false)], 1.2, "**0.**86"),
+            (vec![(".", true), ("42", false)], 1.2, "**.**42"),
+            (
+                vec![("12 ", false), (".", true), ("55", false)],
+                1.2,
+                "12 **.**55",
+            ),
+            (
+                vec![("12", false), (" .", true), ("55", false)],
+                1.2,
+                "12 **.**55",
+            ),
+            (vec![("1", false), ("23", true)], 1.2, "1**23**"),
+            (vec![("12", true), ("%", false)], 1.2, "**12**%"),
+            (vec![("+", true), ("12", false)], 1.2, "**+**12"),
+            (
+                vec![("1", false), (",", true), ("25", false)],
+                1.2,
+                "1**,**25",
+            ),
+            (vec![("Done.", true), ("2", false)], 1.2, "**Done.** 2"),
+            (vec![("0. ", true), ("86", false)], 1.2, "**0.** 86"),
+            (vec![("0.", true), ("86", false)], 4.8, "**0.** 86"),
+            (vec![("KEY ", true), ("Body", false)], 1.2, "**KEY** Body"),
+            (vec![("KEY", true), (" Body", false)], 1.2, "**KEY** Body"),
+        ] {
+            let mut x = 100.0;
+            let items = parts
+                .into_iter()
+                .map(|(text, bold)| {
+                    let width = text.len() as f32 * 6.0;
+                    let mut item = make_merge_item(text, x, width);
+                    item.is_bold = bold;
+                    x += width + gap;
+                    item
+                })
+                .collect();
+            let line = TextLine {
+                items: merge_text_items(items),
+                y: 100.0,
+                page: 1,
+                adaptive_threshold: 0.1,
+            };
+            assert_eq!(line.text_with_formatting(true, false, false), expected);
+            assert_eq!(line.text(), expected.replace("**", ""));
+        }
+    }
+
+    #[test]
+    fn non_bold_style_boundaries_keep_existing_spacing() {
+        for style in 0..3 {
+            let mut first = make_merge_item("KEY", 100.0, 24.0);
+            match style {
+                0 => first.is_italic = true,
+                1 => first.is_underline = true,
+                _ => first.is_strikeout = true,
+            }
+            let merged = merge_text_items(vec![first, make_merge_item("Body", 125.2, 24.0)]);
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].text, "KEY");
+            assert_eq!(merged[1].text, "Body");
+        }
     }
 
     #[test]
@@ -1652,29 +3384,6 @@ mod tests {
     }
 
     #[test]
-    fn subscript_digit_with_different_marks_is_not_absorbed() {
-        // A struck-out word followed by an unmarked footnote digit: merging
-        // would widen the parent's strikeout claim over the digit (and the
-        // reverse would drop the digit's own mark). Style boundaries break
-        // the merge, as in merge_text_items.
-        let mut word = make_merge_item("word", 100.0, 24.0);
-        word.font_size = 10.0;
-        word.is_strikeout = true;
-        let mut digit = make_merge_item("2", 124.5, 4.0);
-        digit.font_size = 6.0;
-        digit.y = word.y + 3.0;
-
-        let merged = merge_subscript_items(vec![word.clone(), digit.clone()]);
-        assert_eq!(merged.len(), 2);
-
-        // Same marks still merge (footnote ref inside the strike).
-        digit.is_strikeout = true;
-        let merged = merge_subscript_items(vec![word, digit]);
-        assert_eq!(merged.len(), 1);
-        assert!(merged[0].text.starts_with("word"));
-    }
-
-    #[test]
     fn test_group_into_lines() {
         let items = vec![
             TextItem {
@@ -1685,14 +3394,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "World".into(),
@@ -1702,14 +3421,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "Next line".into(),
@@ -1719,14 +3448,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
         ];
 
@@ -2506,14 +4245,24 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "Prague".into(),
@@ -2523,14 +4272,24 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "Rules".into(),
@@ -2540,14 +4299,24 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
         ];
 
@@ -2568,14 +4337,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "A".into(),
@@ -2585,14 +4364,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "V".into(),
@@ -2602,14 +4391,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
         ];
 
@@ -2632,14 +4431,24 @@ mod tests {
                 height: 13.3,
                 font: "F4".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 13.3,
                 page: 1,
                 is_bold: true,
                 is_italic: false,
+                font_weight: None,
+                bold_source: Some(crate::types::BoldSource::FontName),
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }
         }
 
@@ -2669,14 +4478,24 @@ mod tests {
                 height: 13.3,
                 font: "F5".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 13.3,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }
         }
 
@@ -2707,14 +4526,24 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "履行義務".into(),
@@ -2724,14 +4553,24 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "を識別す".into(),
@@ -2741,14 +4580,24 @@ mod tests {
                 height: 12.0,
                 font: "C2_0".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
         ];
 
@@ -2766,14 +4615,24 @@ mod tests {
             height: 12.0,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -2906,14 +4765,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "\u{05D1}".into(), // bet at x=200 (rightmost)
@@ -2923,17 +4792,27 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
         ];
-        sort_line_items(&mut items);
+        sort_line_items(&mut items, false);
         // RTL: rightmost (higher X) comes first
         assert_eq!(items[0].x, 200.0);
         assert_eq!(items[1].x, 100.0);
@@ -2950,14 +4829,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
             TextItem {
                 text: "World".into(),
@@ -2967,17 +4856,27 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             },
         ];
-        sort_line_items(&mut items);
+        sort_line_items(&mut items, false);
         // LTR: leftmost comes first
         assert_eq!(items[0].x, 100.0);
         assert_eq!(items[1].x, 200.0);
@@ -3010,14 +4909,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }],
         };
 
@@ -3057,14 +4966,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }],
         };
 
@@ -3104,14 +5023,24 @@ mod tests {
                 height: 12.0,
                 font: "F1".into(),
                 font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 12.0,
                 page,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }],
         };
 
@@ -3144,15 +5073,62 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
+    }
+
+    #[test]
+    fn stacked_fraction_glyphs_are_not_merged_into_one_run() {
+        // "1" over "3" (a TeX case fraction): same x, baselines 8pt apart,
+        // both inside the body line's 5pt band. They are two items; the
+        // script detector then sees a superscript and a subscript.
+        let items = vec![
+            make_item_fs("about 3", 91.9, 511.3, 103.2, 10.0),
+            make_item_fs("1", 196.3, 515.2, 3.7, 7.4),
+            make_item_fs("3", 196.3, 507.3, 3.7, 7.4),
+            make_item_fs("bits", 201.5, 511.3, 18.0, 10.0),
+        ];
+        let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"1") && texts.contains(&"3"), "{texts:?}");
+        // Side-by-side same-size raised symbol still joins its word.
+        let items = vec![
+            make_item_fs("Freon", 100.0, 500.0, 26.0, 10.0),
+            make_item_fs("®", 126.0, 502.0, 6.0, 10.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Freon®");
+        // Stacked LETTERS in the same band (a rotated label beside body
+        // text) keep merging as before — only digit pairs are fractions.
+        let items = vec![
+            make_item_fs("x", 91.9, 511.3, 5.0, 10.0),
+            make_item_fs("a", 96.9, 515.2, 3.7, 7.4),
+            make_item_fs("r", 96.9, 507.3, 3.7, 7.4),
+        ];
+        let merged = merge_text_items(items);
+        assert!(
+            merged.iter().any(|i| i.text.contains("ar")),
+            "{:?}",
+            merged.iter().map(|i| i.text.as_str()).collect::<Vec<_>>()
+        );
     }
 
     /// Small caps as typesetters emit them: a full-size capital at 9.98pt
@@ -3295,114 +5271,645 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_subscript_items_chemical_formula() {
-        // NH₃: "NH" at fs=8 followed by subscript "3" at fs=4.7
-        let items = vec![
-            make_item_fs("NH", 78.0, 499.0, 12.0, 8.0),
-            make_item_fs("3", 90.0, 496.0, 2.3, 4.7),
-            make_item_fs("Cl", 100.0, 499.0, 7.0, 8.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
-        // Lowered baseline → Unicode subscript form (NFKC folds back to "NH3")
-        assert_eq!(merged[0].text, "NH₃");
-        assert_eq!(merged[1].text, "Cl");
-    }
+    fn vertical_run_never_merges_with_body_text_sharing_its_baseline() {
+        // A 12pt margin stamp whose box bottom lands on a body line's
+        // baseline, 2pt left of the body text: same y-group, tiny gap, same
+        // font — every merge criterion but orientation says "join". The same
+        // items set upright DO merge, so orientation is what blocks it.
+        let mut stamp = make_merge_item("arXiv:2301.00001", 12.0, 12.0);
+        stamp.height = 120.0;
+        stamp.rotation = 90.0;
+        let body = make_merge_item("Body text", 26.0, 54.0);
 
-    #[test]
-    fn test_merge_subscript_items_h2o() {
-        // H₂O: "H" then subscript "2" then "O"
-        let items = vec![
-            make_item_fs("H", 250.0, 499.0, 5.0, 8.0),
-            make_item_fs("2", 255.0, 496.0, 2.3, 4.7),
-            make_item_fs("O", 257.5, 499.0, 6.0, 8.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].text, "H₂");
-        assert_eq!(merged[1].text, "O");
-    }
+        let merged = merge_text_items(vec![stamp.clone(), body.clone()]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0].text, "arXiv:2301.00001");
+        assert_eq!(merged[1].text, "Body text");
 
-    #[test]
-    fn test_merge_subscript_items_raised_marker_becomes_superscript() {
-        // Footnote reference: "word" followed by a RAISED small "2" → word²
-        let mut marker = make_item_fs("2", 90.0, 502.5, 2.3, 4.7);
-        marker.y = 502.5; // raised above the 499.0 parent baseline
-        let items = vec![make_item_fs("word", 78.0, 499.0, 12.0, 8.0), marker];
-        let merged = merge_subscript_items(items);
+        stamp.height = 12.0;
+        stamp.rotation = 0.0;
+        stamp.width = 96.0;
+        let body_after_upright_stamp = make_merge_item("Body text", 110.0, 54.0);
+        let merged = merge_text_items(vec![stamp, body_after_upright_stamp]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].text, "word²");
+        assert_eq!(merged[0].text, "arXiv:2301.00001 Body text");
     }
 
     #[test]
-    fn test_merge_subscript_items_no_merge_far_gap() {
-        // Subscript-sized item that's far from the parent should NOT merge
-        let items = vec![
-            make_item_fs("Text", 78.0, 499.0, 20.0, 8.0),
-            make_item_fs("▶", 120.0, 498.0, 3.0, 3.7),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].text, "Text");
-        assert_eq!(merged[1].text, "▶");
+    fn link_annotations_turn_with_a_rotated_page() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        // Two 90° runs make the page rotated; the link annotation covering
+        // the first one (page box x 188..200, y 100..140) must land in the
+        // same turned frame as the text: x = old y, y = -(old right edge).
+        let mut doc = lopdf::Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
+                .to_vec(),
+        )));
+        let link_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![188.into(), 100.into(), 200.into(), 140.into()],
+            "A" => dictionary! {
+                "S" => "URI",
+                "URI" => Object::string_literal("https://example.com/"),
+            },
+        });
+        // An AcroForm text field drawn over the second run (page box
+        // x 228..240, y 100..150) must turn the same way.
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => Object::string_literal("field"),
+            "V" => Object::string_literal("value"),
+            "Rect" => vec![228.into(), 100.into(), 240.into(), 150.into()],
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Annots" => vec![Object::Reference(link_id), Object::Reference(widget_id)],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(widget_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, page_rotations, _, _) =
+            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
+        let field = items
+            .iter()
+            .find(|i| matches!(i.item_type, ItemType::FormField))
+            .expect("form field item");
+        assert_eq!(
+            (field.x, field.y, field.width, field.height),
+            (100.0, -240.0, 50.0, 12.0)
+        );
+        let hello = items.iter().find(|i| i.text == "HELLO").unwrap();
+        assert_eq!(hello.rotation, 0.0);
+        assert!((hello.x - 100.0).abs() < 0.01 && (hello.y + 200.0).abs() < 0.01);
+        let link = items
+            .iter()
+            .find(|i| matches!(i.item_type, ItemType::Link(_)))
+            .expect("link item");
+        assert_eq!(
+            (link.x, link.y, link.width, link.height),
+            (100.0, -200.0, 40.0, 12.0)
+        );
+        assert_eq!(link.rotation, 0.0);
     }
 
     #[test]
-    fn test_merge_subscript_items_no_merge_long_text() {
-        // Long subscript-sized text should NOT merge (not a true subscript)
-        let items = vec![
-            make_item_fs("Title", 78.0, 499.0, 30.0, 8.0),
-            make_item_fs("footnote", 108.0, 496.0, 20.0, 4.7),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
+    fn upside_down_fragments_are_never_concatenated_reversed() {
+        // A 180° run shown as two operators: "HELLO" is painted first, at
+        // the right, and "WORLD" continues towards -x. Walking x ascending
+        // would merge them as "WORLD HELLO"; they must stay separate.
+        let mut hello = make_merge_item("HELLO", 310.0, 50.0);
+        hello.rotation = 180.0;
+        let mut world = make_merge_item("WORLD", 258.0, 50.0);
+        world.rotation = 180.0;
+        let merged = merge_text_items(vec![hello, world]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|i| i.text == "HELLO"));
+        assert!(merged.iter().any(|i| i.text == "WORLD"));
     }
 
     #[test]
-    fn test_merge_subscript_items_no_merge_same_font_size() {
-        // Same font size items should NOT be treated as subscripts
-        let items = vec![
-            make_item_fs("NH", 78.0, 499.0, 12.0, 8.0),
-            make_item_fs("3", 90.0, 496.0, 2.3, 8.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
+    fn measured_and_estimated_runs_never_merge() {
+        // A width-less font's run (estimated box) next to a measured one on
+        // the same baseline: the pair must stay two items, whichever comes
+        // first, so `advance_known` keeps describing each item truthfully.
+        let measured = make_merge_item("known", 100.0, 30.0);
+        let mut estimated = make_merge_item("guess", 132.0, 30.0);
+        estimated.advance_known = false;
+        assert_eq!(
+            merge_text_items(vec![measured.clone(), estimated.clone()]).len(),
+            2
+        );
+        assert_eq!(merge_text_items(vec![estimated, measured]).len(), 2);
     }
 
     #[test]
-    fn test_merge_subscript_items_no_merge_non_numeric() {
-        // Non-numeric subscript text (e.g. "sol", "º", "vf") should NOT merge
-        let items = vec![
-            make_item_fs("∆", 200.0, 639.0, 5.5, 8.0),
-            make_item_fs("sol", 205.8, 636.9, 5.7, 4.7),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].text, "∆");
-        assert_eq!(merged[1].text, "sol");
+    fn merged_estimated_runs_keep_the_union_of_their_boxes() {
+        // Two width-less runs positioned at their estimated advance (half an
+        // em per glyph at 12pt) walk like measured ones — gap 0, no space —
+        // and the merged item is the union of the two estimated boxes.
+        let mut first = make_merge_item("ab", 100.0, 12.0);
+        first.advance_known = false;
+        let mut second = make_merge_item("cdefg", 112.0, 30.0);
+        second.advance_known = false;
+        let merged = merge_text_items(vec![first, second]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "abcdefg");
+        assert!(!merged[0].advance_known);
+        assert!((merged[0].x - 100.0).abs() < 1e-3, "x = {}", merged[0].x);
+        assert!(
+            (merged[0].width - 42.0).abs() < 1e-3,
+            "width = {}",
+            merged[0].width
+        );
     }
 
     #[test]
-    fn test_merge_subscript_items_no_merge_parent_ends_with_digit() {
-        // "33" + "1" in "33 1/3%" — parent ends with digit, should NOT merge
-        let items = vec![
-            make_item_fs("33", 78.0, 499.0, 10.0, 8.0),
-            make_item_fs("1", 88.0, 496.0, 2.3, 4.7),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].text, "33");
-        assert_eq!(merged[1].text, "1");
+    fn estimated_fragments_that_backtrack_keep_the_union_box() {
+        // Stream order "abc" (x 100), "de" (x 94, a backtrack), "fg" (x 118):
+        // whichever order the merge walks, the estimated item spans from the
+        // leftmost fragment to the rightmost box edge.
+        let mut a = make_merge_item("abc", 100.0, 18.0);
+        let mut b = make_merge_item("de", 94.0, 10.0);
+        let mut c = make_merge_item("fg", 118.0, 12.0);
+        for item in [&mut a, &mut b, &mut c] {
+            item.advance_known = false;
+            item.mcid = Some(1);
+        }
+        let merged = merge_text_items(vec![a, b, c]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert!(!merged[0].advance_known);
+        assert!((merged[0].x - 94.0).abs() < 1e-3, "x = {}", merged[0].x);
+        assert!(
+            (merged[0].width - 36.0).abs() < 1e-3,
+            "width = {}",
+            merged[0].width
+        );
     }
 
     #[test]
-    fn test_merge_subscript_items_no_merge_parent_ends_with_space() {
-        // "Health " + "1" — parent ends with space (table credit), should NOT merge
+    fn side_by_side_vertical_runs_stay_separate_lines() {
+        // Two lines of a vertical stamp are adjacent em columns with the
+        // same bottom: walking x would glue them into one "line".
+        let mut first = make_merge_item("line one", 12.0, 12.0);
+        first.height = 80.0;
+        first.rotation = 90.0;
+        let mut second = make_merge_item("line two", 24.0, 12.0);
+        second.height = 80.0;
+        second.rotation = 90.0;
+        let merged = merge_text_items(vec![first, second]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    #[test]
+    fn detached_accent_before_its_letter_composes_with_the_next_run() {
+        // An accented letter set as three show operators: the run up to the
+        // letter, the macron placed by its own text matrix over the "o"
+        // that begins the next run (raised a fraction of a point, as
+        // accents are), and the run from that letter on. Sorted along the
+        // baseline the accent starts right of "ohoku" and would land after
+        // it; composed, the line reads "Tōhoku".
+        let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+        accent.y = 700.2;
         let items = vec![
-            make_item_fs("Health ", 78.0, 499.0, 30.0, 8.0),
-            make_item_fs("1", 108.0, 496.0, 2.3, 4.7),
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
         ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "T\u{014D}hoku");
+    }
+
+    #[test]
+    fn detached_accent_after_its_letter_composes_with_the_previous_run() {
+        // A run positioned glyph by glyph, the accent shown after the letter
+        // it stands over: "m", "a", the macron over the "a", "jas".
+        let mut accent = make_merge_item("\u{00AF}", 111.3, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("m", 100.0, 10.0),
+            make_merge_item("a", 110.0, 6.7),
+            accent,
+            make_merge_item("jas", 116.7, 15.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "m\u{0101}jas");
+    }
+
+    #[test]
+    fn detached_accent_over_the_last_glyph_of_a_longer_run_composes_with_it() {
+        // "sta", the macron over its closing "a", "tus": the glyph's advance
+        // is read as a third of the run's width.
+        let mut accent = make_merge_item("\u{00AF}", 113.0, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("sta", 100.0, 18.0),
+            accent,
+            make_merge_item("tus", 118.0, 16.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "st\u{0101}tus");
+    }
+
+    #[test]
+    fn spacing_accent_over_no_letter_stays_a_character_of_its_own() {
+        // A grave shown a word gap away from the runs on either side is
+        // text of its own, a quotation mark or a code delimiter, not an
+        // accent.
+        let items = vec![
+            make_merge_item("code", 100.0, 24.0),
+            make_merge_item("\u{0060}", 128.0, 4.0),
+            make_merge_item("more", 136.0, 24.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "code \u{0060} more");
+    }
+
+    #[test]
+    fn spacing_accent_shown_beside_a_letter_is_not_composed() {
+        // "a", a circumflex whose advance follows the "a" exactly, "b": an
+        // exponent operator set glyph by glyph. The accent stands beside
+        // both letters and over neither, and keeps its place in "aˆb".
+        let items = vec![
+            make_merge_item("a", 100.0, 6.7),
+            make_merge_item("\u{02C6}", 106.7, 4.0),
+            make_merge_item("b", 110.7, 6.7),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "a\u{02C6}b");
+    }
+
+    #[test]
+    fn accent_over_two_glyphs_composes_with_the_one_that_can() {
+        // The macron overlaps the `t` before it more than the `o` after it;
+        // `t` has no composition with a macron, `o` has.
+        let mut accent = make_merge_item("\u{00AF}", 104.5, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("t", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "t\u{014D}hoku");
+    }
+
+    #[test]
+    fn accent_whose_pair_has_no_composed_character_is_left_as_shown() {
+        // A macron over a "t": Unicode has no single character for the
+        // pair, so nothing is rewritten and the accent fragment survives.
+        let mut accent = make_merge_item("\u{00AF}", 107.0, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("u", 100.0, 6.7),
+            accent,
+            make_merge_item("tter", 106.7, 16.0),
+        ];
+        let merged = merge_text_items(items);
+        assert!(merged.iter().any(|item| item.text == "utter"), "{merged:?}");
+        assert!(
+            merged.iter().any(|item| item.text == "\u{00AF}"),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn accent_on_another_baseline_is_not_composed() {
+        // The same glyphs with the accent a third of an em above the
+        // letters' baseline: not an accent over them.
+        let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+        accent.y = 704.0;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let merged = merge_text_items(items);
+        assert!(
+            merged.iter().any(|item| item.text == "Tohoku"),
+            "{merged:?}"
+        );
+        assert!(
+            merged.iter().any(|item| item.text == "\u{00AF}"),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn detached_accent_over_a_dotless_i_composes_as_the_dotted_letter() {
+        // "Garc", the acute over the dotless i that begins "ıa": the
+        // typesetter's form of the letter under an accent reads "García".
+        let mut accent = make_merge_item("\u{00B4}", 123.4, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("Garc", 100.0, 24.0),
+            accent,
+            make_merge_item("\u{0131}a", 124.0, 9.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "Garc\u{00ED}a");
+    }
+
+    #[test]
+    fn composing_an_accent_drops_its_clip_entry_with_it() {
+        let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("ohoku", 107.3, 33.0),
+        ];
+        let (items, clips) = compose_detached_spacing_accents(items, &[None, None, None], &[]);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(clips.len(), 2);
+        assert_eq!(items[1].text, "\u{014D}hoku");
+    }
+
+    #[test]
+    fn detached_accent_over_a_wide_capital_composes_with_it() {
+        // "Herr", the circumflex centred over the W that begins "Willi": the
+        // W is nearly an em wide where the run's letters average less than
+        // half of one, so the endpoint window is held open to 0.6 em.
+        let mut accent = make_merge_item("\u{02C6}", 130.37, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("Herr", 100.0, 23.34),
+            accent,
+            make_merge_item("Willi", 126.7, 22.01),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "Herr \u{0174}illi");
+    }
+
+    #[test]
+    fn detached_accent_over_the_last_letter_before_trailing_spaces_composes() {
+        // "Kovac" with its word gap written into the run as two spaces, the
+        // caron over the "c", then "and": the spaces are counted at their
+        // own advance, not at the run's average, so the "c" is found where
+        // it stands. The run keeps its own spaces.
+        let mut accent = make_merge_item("\u{02C7}", 128.34, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("Kovac  ", 100.0, 40.06),
+            accent,
+            make_merge_item("and", 140.06, 20.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "Kova\u{010D}  and");
+    }
+
+    #[test]
+    fn accent_beside_a_replacement_text_run_is_not_composed() {
+        // The run after the accent carries a producer's ActualText
+        // replacement: its characters need not stand for its glyphs one by
+        // one, so the accent is left as shown.
+        let mut accent = make_merge_item("\u{00B4}", 108.6, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("eal", 107.3, 20.0),
+        ];
+        let merged = merge_text_items_with_clips(items, &[], false, &[false, false, true]);
+        assert!(
+            merged.iter().any(|item| item.text.contains('\u{00B4}')),
+            "{merged:?}"
+        );
+        assert!(
+            !merged.iter().any(|item| item.text.contains('\u{00E9}')),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn accent_beside_a_run_with_right_to_left_letters_is_not_composed() {
+        // A run holding Hebrew letters may have been painted under a
+        // mirrored matrix, so which of its glyphs stands at which end of its
+        // box is not known from the item: even the Latin "a" at its start
+        // under the accent is left alone.
+        let mut accent = make_merge_item("\u{00B4}", 108.6, 4.0);
+        accent.y = 700.2;
+        let items = vec![
+            make_merge_item("T", 100.0, 7.3),
+            accent,
+            make_merge_item("a\u{05D0}\u{05D1}", 107.3, 20.0),
+        ];
+        let merged = merge_text_items(items);
+        assert!(
+            merged.iter().any(|item| item.text.contains('\u{00B4}')),
+            "{merged:?}"
+        );
+        assert!(
+            !merged.iter().any(|item| item.text.contains('\u{00E1}')),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn accent_over_an_oblique_run_is_not_composed() {
+        // A text matrix skewed by a degree and a half (a deskewed OCR layer)
+        // makes an axis-aligned box that is no baseline: nothing is composed,
+        // whichever of the two carries the skew.
+        for skewed in 0..2 {
+            let mut accent = make_merge_item("\u{00AF}", 108.6, 4.0);
+            accent.y = 700.2;
+            let mut run = make_merge_item("ohoku", 107.3, 33.0);
+            if skewed == 0 {
+                accent.rotation = 1.5;
+            } else {
+                run.rotation = 1.5;
+            }
+            let items = vec![make_merge_item("T", 100.0, 7.3), accent, run];
+            let merged = merge_text_items(items);
+            assert!(
+                merged.iter().any(|item| item.text.contains('\u{00AF}')),
+                "{merged:?}"
+            );
+            assert!(
+                !merged.iter().any(|item| item.text.contains('\u{014D}')),
+                "{merged:?}"
+            );
+        }
+    }
+
+    /// The six glyphs of a word in a script whose subscript letters and
+    /// vowel signs have zero advance, shown one `Tm` and `Tj` per glyph at
+    /// 12 pt: each sign sits about 0.23 em behind the pen, over the glyph
+    /// before it, and the glyph after it starts where the pen was.
+    fn signed_word_glyphs() -> Vec<TextItem> {
+        vec![
+            make_merge_item("\u{1789}\u{17D2}", 20.0, 11.496),
+            make_merge_item("\u{1789}", 28.82, 0.0),
+            make_merge_item("\u{179C}", 31.496, 4.128),
+            make_merge_item("\u{178F}\u{17D2}", 35.624, 9.9),
+            make_merge_item("\u{1790}", 42.572, 0.0),
+            make_merge_item("\u{17BB}", 45.524, 3.312),
+        ]
+    }
+
+    #[test]
+    fn signs_behind_the_pen_open_no_gap_before_the_next_glyph() {
+        // The glyph after a sign is measured from where the glyph under the
+        // sign left the pen, not from the sign's origin 2.7 pt behind it;
+        // the merged box ends where the last glyph does.
+        let merged = merge_text_items(signed_word_glyphs());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].text,
+            "\u{1789}\u{17D2}\u{1789}\u{179C}\u{178F}\u{17D2}\u{1790}\u{17BB}"
+        );
+        assert!((merged[0].x + merged[0].width - 48.836).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_word_gap_after_a_sign_is_still_a_space() {
+        // The second half of the word moved 4 pt (a third of an em) on
+        // from where the pen was: a word gap after the sign.
+        let mut items = signed_word_glyphs();
+        for item in &mut items[3..] {
+            item.x += 4.0;
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].text,
+            "\u{1789}\u{17D2}\u{1789}\u{179C} \u{178F}\u{17D2}\u{1790}\u{17BB}"
+        );
+    }
+
+    #[test]
+    fn a_sign_within_its_glyphs_advance_keeps_its_place_past_a_kerned_glyph() {
+        // Shown as glyph, sign, glyph, with the second glyph kerned in
+        // 0.5 pt ahead of the pen and the sign 0.2 pt behind it: by x
+        // alone the sign would follow the second glyph.
+        let items = vec![
+            make_merge_item("\u{1780}", 20.0, 11.496),
+            make_merge_item("\u{17BB}", 31.3, 0.0),
+            make_merge_item("\u{1781}", 31.0, 4.128),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "\u{1780}\u{17BB}\u{1781}");
+
+        // A sign shown before the glyph it is over sorts by its own x, as
+        // any fragment does.
+        let items = vec![
+            make_merge_item("\u{1780}", 20.0, 11.496),
+            make_merge_item("\u{17BB}", 40.0, 0.0),
+            make_merge_item("\u{1781}", 31.496, 4.128),
+            make_merge_item("\u{1782}", 35.624, 9.9),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "\u{1780}\u{1781}\u{1782}\u{17BB}");
+    }
+
+    #[test]
+    fn a_two_character_sign_inside_a_tracked_run_keeps_the_run_tracked() {
+        // Display tracking with a sign that decodes to two combining marks
+        // over the `O`: the sign is no letter of the run, the run reads its
+        // tracking across it, and the sign stays in its place without a
+        // space on either side.
+        let mut items = glyph_run("HOW", 100.0, 10.0, 2.3);
+        items.insert(2, make_merge_item("\u{0301}\u{0300}", 118.0, 0.0));
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "HO\u{0301}\u{0300}W");
+    }
+
+    /// A pointed right-to-left word shown one glyph per item by a producer
+    /// walking the line right to left: the first letter, then the second
+    /// with its vowel sign 0.3 em behind the pen, then the third.
+    fn pointed_rtl_word() -> Vec<TextItem> {
+        vec![
+            make_merge_item("\u{05D1}", 130.0, 6.0),
+            make_merge_item("\u{05D0}", 124.0, 6.0),
+            make_merge_item("\u{05B8}", 126.4, 0.0),
+            make_merge_item("\u{05DC}", 118.0, 6.0),
+        ]
+    }
+
+    #[test]
+    fn a_sign_on_a_right_to_left_line_follows_its_letter_in_the_reading() {
+        // The sign follows the letter it was shown on once the line is
+        // read into logical order, with no space on either side, whether
+        // the page stores its runs in visual or in logical order.
+        for visual in [false, true] {
+            let merged = merge_text_items_with_clips(pointed_rtl_word(), &[], visual, &[]);
+            assert_eq!(merged.len(), 1, "visual={visual}: {merged:?}");
+            assert_eq!(
+                merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}",
+                "visual={visual}"
+            );
+        }
+        // The next letter kerned in over the end of the pointed one, the
+        // sign a hair past it in x: the sign still sorts after its letter.
+        let mut items = pointed_rtl_word();
+        items[0].x = 129.7;
+        items[2].x = 129.8;
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}");
+        // A quarter em from the sign's letter to the next is a word gap,
+        // measured from the letter, not from the sign behind the pen.
+        let mut items = pointed_rtl_word();
+        items[3].x = 115.0;
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "\u{05D1}\u{05D0}\u{05B8} \u{05DC}");
+    }
+
+    #[test]
+    fn a_longer_run_without_advance_is_hidden_text_not_a_sign() {
+        // Many zero-advance glyphs shown at the pen after a display-size
+        // number, over which a line of body text starts: hidden text, not
+        // a sign. It sorts by its own x, after the body text, and stays an
+        // item of its own as before.
+        let mut number = make_merge_item("24", 20.0, 120.0);
+        number.font_size = 148.0;
+        let mut hidden = make_merge_item("++3737++33", 139.0, 0.0);
+        hidden.font_size = 148.0;
+        let body = make_merge_item("tank with", 100.0, 60.0);
+        let merged = merge_text_items(vec![number, hidden, body]);
+        let texts: Vec<&str> = merged.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["24", "tank with", "++3737++33"]);
+    }
+
+    #[test]
+    fn a_sign_deep_behind_the_pen_stays_with_its_glyph() {
+        // A sign over the middle of a wide glyph, 0.55 em behind the pen:
+        // the backward-gap break that ends an item does not apply to it,
+        // and the glyph after it is measured from the pen.
+        let items = vec![
+            make_merge_item("\u{1780}", 20.0, 14.4),
+            make_merge_item("\u{17BB}", 27.8, 0.0),
+            make_merge_item("\u{1781}", 34.4, 4.128),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "\u{1780}\u{17BB}\u{1781}");
     }
 }
