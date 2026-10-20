@@ -4262,6 +4262,7 @@ pub(crate) fn load_document_from_mem_with_repairs(
     // recovered by lopdf's cross-reference reconstruction, the same path every
     // reader takes for it.
     let buffer = strip_leading_bytes_before_header(buffer);
+    extractor::content_decode::reset_document_content_budget(buffer.len());
 
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which

@@ -143,11 +143,29 @@ fn scan_page<'a>(
         .unwrap_or_default();
     let mut state = ContentScanState::new(doc, page_box, true);
     let mut counts = ContentCounts::default();
+    // The page's streams are read within the extractor's page bound of
+    // decompressed bytes, together: from the stream that would pass it,
+    // nothing more of the page is read, as the extractor reads none of it.
+    let mut bytes_left = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
     for content_id in doc.get_page_contents(page_id) {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = stream
-                .decompressed_content()
-                .unwrap_or_else(|_| stream.content.clone());
+            let content = match crate::extractor::content_decode::decompressed_content_within(
+                stream, bytes_left,
+            ) {
+                Ok(content) => content,
+                Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
+                    ..
+                })) => {
+                    state.incomplete = true;
+                    break;
+                }
+                Err(_) if stream.content.len() > bytes_left => {
+                    state.incomplete = true;
+                    break;
+                }
+                Err(_) => stream.content.clone(),
+            };
+            bytes_left = bytes_left.saturating_sub(content.len());
             counts.add(scan_content_stream(
                 &content,
                 unique_chars,

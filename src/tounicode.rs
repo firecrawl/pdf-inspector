@@ -3671,21 +3671,24 @@ impl FontCMaps {
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited, 0);
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited, 0);
             }
         }
     }
 
-    /// Recursively collect font CMaps from XObjects in a resource dictionary.
+    /// Recursively collect font CMaps from XObjects in a resource dictionary
+    /// `depth` forms deep (0 for the page's), following nested forms no
+    /// deeper than the detector's resource walk does.
     fn walk_xobject_fonts(
         resources: &lopdf::Dictionary,
         doc: &Document,
         by_obj_num: &mut HashMap<u32, CMapEntry>,
         visited: &mut HashSet<ObjectId>,
+        depth: usize,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
             Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
@@ -3739,8 +3742,10 @@ impl FontCMaps {
                     }
                     Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
                 }
-                // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                // Recurse into nested XObjects, up to the depth cap.
+                if depth < crate::detector::MAX_RESOURCE_FORM_DEPTH {
+                    Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited, depth + 1);
+                }
             }
         }
     }

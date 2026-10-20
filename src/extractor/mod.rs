@@ -1313,21 +1313,49 @@ impl FragmentLine {
 /// shown after a small glyph on its baseline still gets its full window.
 /// The subscript pass buckets its rough lines with it too, so the order
 /// it fixes agrees with the lines made here.
+///
+/// Lines are found through an index of their first fragment's baseline, in
+/// slots one fixed window wide on each page: only a line seeded in the
+/// slots around a fragment's can admit it, and the first of those that
+/// does, in the order the lines were made, is the line the walk over every
+/// line would have found.
 fn group_indices_into_lines(items: &[TextItem]) -> Vec<Vec<usize>> {
+    let slot_of =
+        |y: f32| (f64::from(y) / f64::from(LINE_BASELINE_TOLERANCE_MAX_PT)).floor() as i64;
     let mut lines: Vec<FragmentLine> = Vec::new();
+    let mut slots: HashMap<(u32, i64), Vec<usize>> = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         let em = line_em(item);
-        match lines
-            .iter_mut()
-            .find(|line| line.admits(item.page, item.y, em))
-        {
-            Some(line) => line.push(index, item, em),
-            None => lines.push(FragmentLine {
-                page: item.page,
-                y: item.y,
-                baselines: vec![(item.y, em)],
-                fragments: vec![index],
-            }),
+        let found = if item.y.is_finite() {
+            let slot = slot_of(item.y);
+            (-2..=2)
+                .filter_map(|offset| slots.get(&(item.page, slot.saturating_add(offset))))
+                .filter_map(|seeded| {
+                    seeded
+                        .iter()
+                        .copied()
+                        .find(|&line| lines[line].admits(item.page, item.y, em))
+                })
+                .min()
+        } else {
+            None
+        };
+        match found {
+            Some(line) => lines[line].push(index, item, em),
+            None => {
+                if item.y.is_finite() {
+                    slots
+                        .entry((item.page, slot_of(item.y)))
+                        .or_default()
+                        .push(lines.len());
+                }
+                lines.push(FragmentLine {
+                    page: item.page,
+                    y: item.y,
+                    baselines: vec![(item.y, em)],
+                    fragments: vec![index],
+                });
+            }
         }
     }
     lines.into_iter().map(|line| line.fragments).collect()
@@ -5902,5 +5930,78 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "\u{1780}\u{17BB}\u{1781}");
+    }
+
+    /// The line grouping as one walk over every line made so far, for
+    /// fragment after fragment.
+    fn lines_by_walking_every_line(items: &[TextItem]) -> Vec<Vec<usize>> {
+        let mut lines: Vec<FragmentLine> = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let em = line_em(item);
+            match lines
+                .iter_mut()
+                .find(|line| line.admits(item.page, item.y, em))
+            {
+                Some(line) => line.push(index, item, em),
+                None => lines.push(FragmentLine {
+                    page: item.page,
+                    y: item.y,
+                    baselines: vec![(item.y, em)],
+                    fragments: vec![index],
+                }),
+            }
+        }
+        lines.into_iter().map(|line| line.fragments).collect()
+    }
+
+    /// The indexed line grouping finds the lines the walk over every line
+    /// finds: fragments of mixed sizes on nearby and slot-straddling
+    /// baselines across pages, sloped runs, and baselines that are not
+    /// finite.
+    #[test]
+    fn indexed_line_grouping_matches_the_walk_over_every_line() {
+        let sizes = [0.0, 3.0, 4.0, 5.5, 7.0, 8.0, 10.0, 12.0, 20.0];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        for _ in 0..40 {
+            let mut items = Vec::new();
+            for i in 0..400 {
+                let y = match next() % 50 {
+                    0 => f32::NAN,
+                    1 => f32::INFINITY,
+                    2 => -5.0 * (next() % 4) as f32,
+                    3 => 5.0 * (next() % 8) as f32 - 0.001,
+                    _ => (next() % 4_000) as f32 / 100.0,
+                };
+                let size = sizes[next() as usize % sizes.len()];
+                let mut item = sized_item("w", i as f32, 4.0, y, size);
+                item.page = 1 + next() % 3;
+                items.push(item);
+            }
+            assert_eq!(
+                group_indices_into_lines(&items),
+                lines_by_walking_every_line(&items)
+            );
+        }
+    }
+
+    /// Tens of thousands of fragments, each on its own baseline across the
+    /// pages, are grouped without measuring each against every line.
+    #[test]
+    fn fragments_on_many_distinct_baselines_group_one_line_each() {
+        let items: Vec<TextItem> = (0..80_000)
+            .map(|i| {
+                let mut item = sized_item("w", 72.0, 4.0, (i % 100) as f32 * 7.0, 10.0);
+                item.page = 1 + i / 100;
+                item
+            })
+            .collect();
+        let lines = group_indices_into_lines(&items);
+        assert_eq!(lines.len(), items.len());
     }
 }

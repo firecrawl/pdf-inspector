@@ -11060,3 +11060,69 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+/// A page whose resources bind a Form XObject whose resources bind the
+/// next, twenty thousand forms deep, converts like any other page: the
+/// resource walks stop at their depth cap rather than following the chain.
+#[test]
+fn deeply_nested_form_resources_convert() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    const FORMS: usize = 20_000;
+    let mut doc = Document::with_version("1.5");
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let mut inner: Option<lopdf::ObjectId> = None;
+    for _ in 0..FORMS {
+        let mut resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+        if let Some(id) = inner {
+            resources.set("XObject", dictionary! { "X" => id });
+        }
+        let form = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => resources,
+            },
+            b"BT /F1 12 Tf 72 72 Td (inner) Tj ET".to_vec(),
+        );
+        inner = Some(doc.add_object(form));
+    }
+    let content = doc.add_object(Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 72 700 Td (Nested forms page) Tj ET".to_vec(),
+    ));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+            "XObject" => dictionary! { "X" => inner.unwrap() },
+        },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut pdf = Vec::new();
+    doc.save_to(&mut pdf).unwrap();
+
+    let result = process_pdf_mem(&pdf).expect("convert nested-form PDF");
+    assert!(result
+        .markdown
+        .unwrap_or_default()
+        .contains("Nested forms page"));
+}
