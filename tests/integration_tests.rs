@@ -11060,3 +11060,95 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+fn make_mixed_scan_with_ocr_layer(with_ocr: bool) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+    let mut doc = Document::with_version("1.4");
+    let pages_id = doc.new_object_id();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let image = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+        },
+        vec![128],
+    ));
+    let native = (0..12)
+        .map(|i| {
+            format!(
+                "BT /F1 12 Tf 72 {} Td (Ordinary body text on the native page) Tj ET\n",
+                700 - i * 20,
+            )
+        })
+        .collect::<String>();
+    let mut scan = String::from("q 612 0 0 792 0 0 cm /Im0 Do Q\n");
+    if with_ocr {
+        scan.push_str(
+            "BT /F1 12 Tf 3 Tr 72 700 Td (Invisible OCR text from the scanned page) Tj ET\n",
+        );
+    }
+    let mut kids = Vec::new();
+    for content in [native, scan] {
+        let stream = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im0" => image },
+            },
+            "Contents" => stream,
+        });
+        kids.push(Object::Reference(page));
+    }
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages", "Count" => 2, "Kids" => kids,
+        }
+        .into(),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut pdf = Vec::new();
+    doc.save_to(&mut pdf).unwrap();
+    pdf
+}
+
+/// Image placeholders must not hide the recoverable OCR layer when a
+/// scanned page is selected from a Mixed document.
+#[test]
+fn test_mixed_ocr_retry_ignores_image_placeholders_in_the_sample() {
+    let pdf = make_mixed_scan_with_ocr_layer(true);
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::default().pages([2]))
+        .expect("fixture should process");
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    let text = result.markdown.unwrap_or_default();
+    assert!(
+        text.contains("Invisible OCR text from the scanned page"),
+        "got: {text:?}"
+    );
+    assert!(!text.contains("Ordinary body text"));
+}
+
+#[test]
+fn test_mixed_image_only_selection_without_ocr_stays_empty() {
+    let pdf = make_mixed_scan_with_ocr_layer(false);
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::default().pages([2]))
+        .expect("fixture should process");
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    assert!(result.markdown.unwrap_or_default().trim().is_empty());
+}
+
+#[test]
+fn test_mixed_ocr_layer_on_unselected_page_is_not_included() {
+    let pdf = make_mixed_scan_with_ocr_layer(true);
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::default().pages([1]))
+        .expect("fixture should process");
+    assert_eq!(result.pdf_type, PdfType::Mixed);
+    let text = result.markdown.unwrap_or_default();
+    assert!(text.contains("Ordinary body text"));
+    assert!(!text.contains("Invisible OCR text"));
+}

@@ -644,7 +644,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _, _) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -4659,19 +4659,22 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
+            if let Ok(((items, _, _), _, _, _, _, skipped_invisible)) = result.as_ref() {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
-                        options
-                            .page_filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.contains(&item.page))
+                        !matches!(item.item_type, types::ItemType::Image)
+                            && options
+                                .page_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(&item.page))
                     })
                     .take(200)
                     .map(|item| item.text.as_str())
                     .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
+                // Images do not count as readable text, but image-only scans
+                // without an OCR layer have nothing to recover on a second pass.
+                if *skipped_invisible && (is_garbage_text(&sample) || sample.trim().is_empty()) {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
@@ -4734,6 +4737,7 @@ fn process_document(
             gid_encoded_pages,
             _page_rotations,
             cmap_coverage,
+            _skipped_invisible,
         )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
