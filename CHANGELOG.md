@@ -25,6 +25,14 @@ version and date. Earlier releases are described in their
   advances reads as a space. Word justifies lines with Arial's en and em
   spaces, which came out as U+FFFD between every word
   (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+- A strikethrough drawn as a filled path under 1pt tall (word processors
+  draw it as a 0.9pt quad of `l` segments, not `re`) is a strikeout rule.
+  The fill pass kept only rects taller than 1pt, so these rules never
+  reached the decoration pass and struck text came out plain.
+- A rule through the glyph band of a text item is a strikeout even when
+  same-span rules repeat down the page. A struck paragraph draws one rule
+  per line at the same x span, which the table-ruling filter discarded as
+  row separators; table rulings sit between rows, not through the glyphs.
 
 ## [1.25.2] - 2026-09-28
 

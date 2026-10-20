@@ -2466,7 +2466,7 @@ pub(crate) fn extract_page_text_items_with_options(
                             && ys
                                 .iter()
                                 .all(|&y| (y - min_y).abs() < eps || (y - max_y).abs() < eps);
-                        if axis_aligned && w > 1.0 && h > 1.0 {
+                        if axis_aligned && w > 1.0 && (h > 1.0 || (h > 0.05 && w > 3.0)) {
                             let x_dev = min_x * ctm[0] + min_y * ctm[2] + ctm[4];
                             let y_dev = min_x * ctm[1] + min_y * ctm[3] + ctm[5];
                             let w_dev = w * ctm[0];
@@ -3578,6 +3578,19 @@ BT /F1 12 Tf 1 0 0 1 100 480 Tm (THIN) Tj ET
 
         assert!(!thick.is_underline);
         assert!(thin.is_underline);
+    }
+
+    #[test]
+    fn sub_point_filled_path_through_glyphs_marks_strikeout() {
+        // Word-processor strikethrough: a filled 0.9pt-tall quad built from
+        // `l` segments (not `re`), crossing the glyphs at mid height.
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (STRUCK) Tj ET
+100 503.5 m 149 503.5 l 149 504.4 l 100 504.4 l h f";
+
+        let items = extract_simple_items(content);
+        let struck = items.iter().find(|item| item.text == "STRUCK").unwrap();
+
+        assert!(struck.is_strikeout);
     }
 
     #[test]
