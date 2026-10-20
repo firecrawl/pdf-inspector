@@ -162,9 +162,8 @@ fn discard_repeated_ruling_rules(
             // always rulings — each segment snugly owns its column label,
             // so snugness must not override that check.
             !is_segmented_row_ruling_rule(rule, &rules)
-                && (strikes_any_item(rule, items)
-                    || (has_snug_text_owner(rule, items)
-                        && !has_flanking_verticals(rule, rects, lines, page))
+                && (((strikes_any_item(rule, items) || has_snug_text_owner(rule, items))
+                    && !has_flanking_verticals(rule, rects, lines, page))
                     || !is_repeated_ruling_rule(rule, &rules))
         })
         .cloned()

@@ -2466,7 +2466,14 @@ pub(crate) fn extract_page_text_items_with_options(
                             && ys
                                 .iter()
                                 .all(|&y| (y - min_y).abs() < eps || (y - max_y).abs() < eps);
-                        if axis_aligned && w > 1.0 && (h > 1.0 || (h > 0.05 && w > 3.0)) {
+                        // Under 1pt tall the eps test above can't tell a
+                        // shallow diagonal band from a rect: check each edge.
+                        let thin_rect = h > 0.05
+                            && w > 3.0
+                            && segs.iter().all(|&(x1, y1, x2, y2)| {
+                                (y1 - y2).abs() < 0.01 || (x1 - x2).abs() < 0.01
+                            });
+                        if axis_aligned && w > 1.0 && (h > 1.0 || thin_rect) {
                             let x_dev = min_x * ctm[0] + min_y * ctm[2] + ctm[4];
                             let y_dev = min_x * ctm[1] + min_y * ctm[3] + ctm[5];
                             let w_dev = w * ctm[0];
@@ -3591,6 +3598,19 @@ BT /F1 12 Tf 1 0 0 1 100 480 Tm (THIN) Tj ET
         let struck = items.iter().find(|item| item.text == "STRUCK").unwrap();
 
         assert!(struck.is_strikeout);
+    }
+
+    #[test]
+    fn sub_point_diagonal_band_through_glyphs_is_not_strikeout() {
+        // Same 0.9pt-tall footprint, but the long edges slant: a shallow
+        // diagonal band, not a rect.
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm (STRUCK) Tj ET
+100 503.5 m 149 504.3 l 149 504.4 l 100 503.6 l h f";
+
+        let items = extract_simple_items(content);
+        let item = items.iter().find(|item| item.text == "STRUCK").unwrap();
+
+        assert!(!item.is_strikeout);
     }
 
     #[test]
