@@ -162,12 +162,20 @@ fn discard_repeated_ruling_rules(
             // always rulings — each segment snugly owns its column label,
             // so snugness must not override that check.
             !is_segmented_row_ruling_rule(rule, &rules)
-                && ((has_snug_text_owner(rule, items)
+                && (((strikes_any_item(rule, items) || has_snug_text_owner(rule, items))
                     && !has_flanking_verticals(rule, rects, lines, page))
                     || !is_repeated_ruling_rule(rule, &rules))
         })
         .cloned()
         .collect()
+}
+
+/// Table rulings sit between rows; a rule through the glyph band of a text
+/// item is a strikeout even when it repeats down the page (struck paragraph).
+fn strikes_any_item(rule: &Rule, items: &[TextItem]) -> bool {
+    items
+        .iter()
+        .any(|item| is_underline_candidate(item) && rule_strikes_item(rule, item))
 }
 
 /// True when the rule falls in the underline window or the strike band of
@@ -909,6 +917,28 @@ mod tests {
         mark_underlined_items(&mut items, &[], &lines, 1);
         assert!(items[0].is_strikeout);
         assert!(!items[0].is_underline);
+    }
+
+    #[test]
+    fn struck_paragraph_survives_repeated_ruling_filter() {
+        // Same-span rules through the glyphs of every line of a paragraph look
+        // like table rulings to the repetition check; they are strikeouts.
+        let mut items: Vec<TextItem> = (0..4)
+            .map(|i| {
+                item(
+                    "struck line of a paragraph",
+                    100.0,
+                    500.0 - 14.0 * i as f32,
+                    300.0,
+                    10.0,
+                )
+            })
+            .collect();
+        let lines: Vec<UnderlineLine> = (0..4)
+            .map(|i| hline(99.0, 401.0, 503.0 - 14.0 * i as f32))
+            .collect();
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(items.iter().all(|it| it.is_strikeout));
     }
 
     #[test]
