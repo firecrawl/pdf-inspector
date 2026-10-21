@@ -1,7 +1,8 @@
 //! PP-OCRv6 Small implementation backed by OAR and ONNX Runtime.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
 use image::RgbImage;
@@ -33,6 +34,14 @@ pub enum OarOcrError {
     /// OCR was invoked while the caller explicitly disabled it.
     #[error("OCR is disabled; select Auto or Force before invoking the engine")]
     OcrDisabled,
+    /// A poolless fallback worker is already processing a page. Retrying
+    /// after the active call completes is safe; waiting here is not, since
+    /// the caller may be a Rayon task needed by that active call.
+    #[error("sequential OCR fallback worker is busy; retry after the active call completes")]
+    FallbackWorkerBusy,
+    /// A panic may have left the fallback worker's model sessions unusable.
+    #[error("sequential OCR fallback worker was poisoned by a panic; recreate the OCR engine")]
+    FallbackWorkerPoisoned,
     /// Confidence thresholds must match the normalized engine output range.
     #[error("minimum OCR confidence must be finite and between 0 and 1, got {value}")]
     InvalidMinimumConfidence {
@@ -109,6 +118,69 @@ struct OcrWorker {
     /// Built on this worker's first dense fine-print page. `None` inside the
     /// cell records a failed build so it is not retried per page.
     escalated: std::sync::OnceLock<Option<TextDetectionPredictor>>,
+    /// Invariant: both `recognize` branches (sequential and parallel) run a
+    /// page's work inside `pool.install(..)`. oar-ocr calls rayon
+    /// internally (`par_iter`/`par_chunks*`) while holding this worker's
+    /// session mutex; on a one-thread pool that call only ever finds work
+    /// in its own local deque, so it cannot pick up another page's job.
+    /// If the first pool cannot start, the fallback admits only one page
+    /// at a time and rejects competing or reentrant callers without
+    /// blocking a Rayon thread needed by the active page.
+    pool: WorkerPool,
+}
+
+/// A worker's dedicated pool, or a nonblocking admission gate when no
+/// dedicated thread could be started. The gate covers the entire page,
+/// including nested Rayon work performed while OAR holds its session lock.
+enum WorkerPool {
+    Dedicated(rayon::ThreadPool),
+    Sequential(Mutex<()>),
+}
+
+/// Runs page work with exclusive access to one worker's model sessions.
+/// Admission failures and page failures share the worker's error type so
+/// neither dispatch branch can accidentally ignore a failed admission.
+trait PageWorker: Sync {
+    type Error: Send;
+
+    fn install<R: Send>(
+        &self,
+        f: impl FnOnce() -> Result<R, Self::Error> + Send,
+    ) -> Result<R, Self::Error>;
+}
+
+impl PageWorker for WorkerPool {
+    type Error = OarOcrError;
+
+    fn install<R: Send>(
+        &self,
+        f: impl FnOnce() -> Result<R, Self::Error> + Send,
+    ) -> Result<R, Self::Error> {
+        match self {
+            Self::Dedicated(pool) => pool.install(f),
+            Self::Sequential(gate) => {
+                // Never wait, spin, or yield while another page owns this
+                // gate. This caller may be nested Rayon work that the owner
+                // itself is waiting for, including reentry on the same thread.
+                let _guard = gate.try_lock().map_err(|error| match error {
+                    TryLockError::WouldBlock => OarOcrError::FallbackWorkerBusy,
+                    TryLockError::Poisoned(_) => OarOcrError::FallbackWorkerPoisoned,
+                })?;
+                f()
+            }
+        }
+    }
+}
+
+impl PageWorker for OcrWorker {
+    type Error = OarOcrError;
+
+    fn install<R: Send>(
+        &self,
+        f: impl FnOnce() -> Result<R, Self::Error> + Send,
+    ) -> Result<R, Self::Error> {
+        self.pool.install(f)
+    }
 }
 
 /// CPU PP-OCRv6 Small engine using OAR's detection and recognition components.
@@ -116,12 +188,15 @@ struct OcrWorker {
 /// Construction accepts only [`ModelPaths`] that have already passed
 /// pdf-inspector's manifest size and SHA-256 verification. OAR's independent
 /// model auto-download feature is deliberately not enabled.
+///
+/// If no dedicated worker thread can start, uncontended calls still run
+/// sequentially. Overlapping page calls in that fallback return
+/// [`OarOcrError::FallbackWorkerBusy`] rather than blocking; callers may
+/// retry after the active call completes.
 pub struct OarOcrEngine {
     workers: Vec<OcrWorker>,
     detection_path: PathBuf,
     intra_threads: usize,
-    /// Present only when more than one worker exists; sized to match.
-    pool: Option<rayon::ThreadPool>,
     model: ModelIdentity,
 }
 
@@ -129,7 +204,7 @@ impl std::fmt::Debug for OarOcrEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OarOcrEngine")
             .field("workers", &self.workers.len())
-            .field("parallel", &self.pool.is_some())
+            .field("parallel", &(self.workers.len() > 1))
             .field("model", &self.model)
             .finish()
     }
@@ -221,8 +296,16 @@ fn build_workers(
     count: usize,
     intra_threads: usize,
 ) -> Result<Vec<OcrWorker>, OarOcrError> {
-    let mut workers = Vec::with_capacity(count);
-    for _ in 0..count {
+    // Pools are planned (and any failure resolved) before any model session
+    // is built, so a worker whose pool never starts never wastes a session.
+    let pools = plan_worker_pools(count, |index| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(move |_| format!("pdf-inspector-ocr-{index}"))
+            .build()
+    });
+    let mut workers = Vec::with_capacity(pools.len());
+    for pool in pools {
         let detector = build_detector(detection, DETECTION_LIMIT_STANDARD, intra_threads)?;
         let recognizer = TextRecognitionPredictor::builder()
             .dict_path(dictionary)
@@ -232,9 +315,47 @@ fn build_workers(
             detector,
             recognizer,
             escalated: std::sync::OnceLock::new(),
+            pool,
         });
     }
     Ok(workers)
+}
+
+/// Builds up to `count` worker pools with `build`, stopping at the first
+/// failure instead of returning it: environments with a thread limit (a
+/// container's pids limit, for example) must still be able to run OCR.
+///
+/// A failure at index 0 falls back to a single worker with a nonblocking
+/// admission gate. Uncontended calls still run sequentially, but competing
+/// or reentrant calls fail with `FallbackWorkerBusy` before entering OAR.
+/// A failure at any later index keeps the workers already built and drops
+/// the rest, rather than falling back further.
+fn plan_worker_pools<E: std::fmt::Display>(
+    count: usize,
+    mut build: impl FnMut(usize) -> Result<rayon::ThreadPool, E>,
+) -> Vec<WorkerPool> {
+    let mut pools = Vec::with_capacity(count);
+    for index in 0..count {
+        match build(index) {
+            Ok(pool) => pools.push(WorkerPool::Dedicated(pool)),
+            Err(error) if index == 0 => {
+                log::warn!(
+                    "OCR worker thread pool unavailable, falling back to a single \
+                     sequential worker (concurrent calls return a busy error): {error}"
+                );
+                pools.push(WorkerPool::Sequential(Mutex::new(())));
+                break;
+            }
+            Err(error) => {
+                log::warn!(
+                    "OCR worker thread pool unavailable after {index} worker(s) started; \
+                     continuing with {index}: {error}"
+                );
+                break;
+            }
+        }
+    }
+    pools
 }
 
 impl OarOcrEngine {
@@ -254,20 +375,11 @@ impl OarOcrEngine {
             concurrency,
             intra_threads,
         )?;
-        let pool = if concurrency > 1 {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(concurrency)
-                .build()
-                .ok()
-        } else {
-            None
-        };
         let model = ModelIdentity::new(models.manifest_id(), models.revision());
         Ok(Self {
             workers,
             detection_path: detection.to_path_buf(),
             intra_threads,
-            pool,
             model,
         })
     }
@@ -375,10 +487,9 @@ impl OarOcrEngine {
         &self,
         page: &RenderedPage,
         options: &OcrOptions,
-        worker: usize,
+        worker: &OcrWorker,
     ) -> Result<OcrPage, OarOcrError> {
         let started = Instant::now();
-        let worker = &self.workers[worker % self.workers.len()];
         let image = Arc::new(rendered_page_to_rgb(page)?);
         let boxes = self.detect_boxes(page, &image, worker)?;
         // Reading order, matching what the combined pipeline produced.
@@ -536,6 +647,106 @@ fn default_onnx_runtime_library() -> PathBuf {
     PathBuf::from(NAME)
 }
 
+/// Runs `f` over `pages` on `workers.len()` dedicated dispatch threads, each
+/// pulling the next unclaimed page index from a shared atomic cursor and
+/// running its job through that worker's own pool (`PageWorker::install`),
+/// never directly on the dispatch thread or the global rayon pool.
+///
+/// Pages are returned in their original order. On error, the error for the
+/// lowest page index that failed is returned — matching
+/// `Iterator::collect::<Result<Vec<_>, _>>()` — and once any thread observes
+/// a failure or panic, threads stop claiming further pages. A panic in `f`
+/// is caught and re-raised on the caller's thread after every dispatch
+/// thread has stopped, matching rayon's panic propagation.
+fn map_pages_on_workers<W: PageWorker, P: Sync, R: Send>(
+    workers: &[W],
+    pages: &[P],
+    f: impl Fn(&W, &P) -> Result<R, W::Error> + Sync,
+) -> Result<Vec<R>, W::Error> {
+    if pages.is_empty() {
+        return Ok(Vec::new());
+    }
+    debug_assert!(!workers.is_empty(), "at least one worker is required");
+
+    let cursor = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let error_slot: Mutex<Option<(usize, W::Error)>> = Mutex::new(None);
+    let panic_slot: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let results: Vec<Mutex<Option<R>>> = (0..pages.len()).map(|_| Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for worker in workers {
+            scope.spawn(|| loop {
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let index = cursor.fetch_add(1, Ordering::Relaxed);
+                if index >= pages.len() {
+                    return;
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.install(|| f(worker, &pages[index]))
+                }));
+                match outcome {
+                    Ok(Ok(value)) => {
+                        *results[index].lock().unwrap() = Some(value);
+                    }
+                    Ok(Err(error)) => {
+                        failed.store(true, Ordering::Relaxed);
+                        let mut slot = error_slot.lock().unwrap();
+                        if slot.as_ref().is_none_or(|(existing, _)| index < *existing) {
+                            *slot = Some((index, error));
+                        }
+                    }
+                    Err(payload) => {
+                        failed.store(true, Ordering::Relaxed);
+                        let mut slot = panic_slot.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(payload);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(payload) = panic_slot.into_inner().unwrap() {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some((_, error)) = error_slot.into_inner().unwrap() {
+        return Err(error);
+    }
+    Ok(results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap()
+                .expect("every page without an error was processed")
+        })
+        .collect())
+}
+
+/// Dispatches `pages` across `workers`, choosing the same branch
+/// `OarOcrEngine::recognize` needs: a single worker or a single page runs
+/// pages one at a time through `workers[0].install` — normally on that
+/// worker's own pool thread, or under the nonblocking fallback gate on the
+/// calling thread if its pool failed to start. More than one of each
+/// dispatches across workers with [`map_pages_on_workers`].
+fn dispatch_pages_on_workers<W: PageWorker, P: Sync, R: Send>(
+    workers: &[W],
+    pages: &[P],
+    f: impl Fn(&W, &P) -> Result<R, W::Error> + Sync,
+) -> Result<Vec<R>, W::Error> {
+    debug_assert!(!workers.is_empty(), "at least one worker is required");
+    if workers.len() <= 1 || pages.len() <= 1 {
+        return pages
+            .iter()
+            .map(|page| workers[0].install(|| f(&workers[0], page)))
+            .collect();
+    }
+    map_pages_on_workers(workers, pages, f)
+}
+
 impl OcrEngine for OarOcrEngine {
     type Error = OarOcrError;
 
@@ -550,29 +761,16 @@ impl OcrEngine for OarOcrEngine {
     ) -> Result<Vec<OcrPage>, Self::Error> {
         validate_options(options)?;
 
-        let Some(pool) = self.pool.as_ref().filter(|_| pages.len() > 1) else {
-            return pages
-                .iter()
-                .map(|page| self.recognize_page(page, options, 0))
-                .collect();
-        };
-        pool.install(|| {
-            use rayon::prelude::*;
-            pages
-                .par_iter()
-                .map(|page| {
-                    let worker = rayon::current_thread_index().unwrap_or(0);
-                    self.recognize_page(page, options, worker)
-                })
-                .collect()
+        dispatch_pages_on_workers(&self.workers, pages, |worker, page| {
+            self.recognize_page(page, options, worker)
         })
     }
 
     fn preferred_page_concurrency(&self) -> usize {
-        // Without a pool, recognition runs sequentially regardless of worker
-        // count — report that honestly so the pipeline doesn't render
+        // Recognition dispatches across all workers only when there is more
+        // than one; report that honestly so the pipeline doesn't render
         // oversized page batches for parallelism that isn't there.
-        if self.pool.is_some() {
+        if self.workers.len() > 1 {
             self.workers.len()
         } else {
             1
@@ -721,6 +919,8 @@ fn is_ordered_convex_quad(points: &[ImagePoint]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use oar_ocr::processors::Point;
 
     use super::*;
@@ -852,7 +1052,7 @@ mod tests {
     #[test]
     fn escalation_fires_for_dense_fine_print_pages() {
         // Measured cases (at unclip 2.0) that gain from escalation: dense
-        // tiled ad pages (12.3–14.2px, 158–286 regions) and a dense pricing
+        // tiled ad pages (12.3–14.2px, 158–286 regions), and a dense pricing
         // sheet (12.0px, 144 regions), all downscaled by the standard limit.
         assert!(should_escalate_detection(14.2, 186, 0.55));
         assert!(should_escalate_detection(13.1, 286, 0.55));
@@ -890,5 +1090,469 @@ mod tests {
         assert!((1..=3).contains(&concurrency));
         assert!(intra_threads_per_pipeline(2) == 2);
         assert!((1..=4).contains(&intra_threads_per_pipeline(1)));
+    }
+
+    fn tiny_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn plan_worker_pools_builds_every_pool_when_all_succeed() {
+        let pools = plan_worker_pools(3, |_index| Ok::<_, &str>(tiny_pool()));
+        assert_eq!(pools.len(), 3);
+        assert!(pools
+            .iter()
+            .all(|pool| matches!(pool, WorkerPool::Dedicated(_))));
+    }
+
+    #[test]
+    fn plan_worker_pools_keeps_earlier_pools_when_a_later_one_fails() {
+        let pools = plan_worker_pools(4, |index| {
+            if index == 2 {
+                Err("boom")
+            } else {
+                Ok(tiny_pool())
+            }
+        });
+        assert_eq!(pools.len(), 2);
+        assert!(pools
+            .iter()
+            .all(|pool| matches!(pool, WorkerPool::Dedicated(_))));
+    }
+
+    #[test]
+    fn plan_worker_pools_falls_back_to_one_poolless_worker_when_the_first_fails() {
+        let pools = plan_worker_pools(4, |_index| Err::<rayon::ThreadPool, _>("boom"));
+        assert_eq!(pools.len(), 1);
+        assert!(matches!(&pools[0], WorkerPool::Sequential(_)));
+    }
+
+    #[test]
+    fn worker_pool_without_a_pool_runs_install_on_the_calling_thread() {
+        let pool = WorkerPool::Sequential(Mutex::new(()));
+        let caller_thread = std::thread::current().id();
+        let observed = pool.install(|| Ok(std::thread::current().id())).unwrap();
+        assert_eq!(observed, caller_thread);
+    }
+
+    fn assert_completes_without_blocking(f: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            f();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => handle.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the fallback worker blocked instead of rejecting a contended call");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let payload = handle
+                    .join()
+                    .expect_err("sender was dropped without the worker thread panicking");
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_worker_preserves_page_order_and_releases_after_errors() {
+        let pools = plan_worker_pools(3, |_| Err::<rayon::ThreadPool, _>("boom"));
+        let result =
+            dispatch_pages_on_workers(&pools, &[0, 1, 2], |_worker, page| Ok(page * 2)).unwrap();
+        assert_eq!(result, vec![0, 2, 4]);
+        assert!(matches!(
+            pools[0].install(|| Err::<(), _>(OarOcrError::OcrDisabled)),
+            Err(OarOcrError::OcrDisabled)
+        ));
+        assert_eq!(pools[0].install(|| Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn fallback_worker_rejects_reentry_before_running_the_page() {
+        assert_completes_without_blocking(|| {
+            let pools = plan_worker_pools(3, |_| Err::<rayon::ThreadPool, _>("boom"));
+            let entered = AtomicUsize::new(0);
+            pools[0]
+                .install(|| {
+                    let result = dispatch_pages_on_workers(&pools, &[0], |_worker, _page| {
+                        entered.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    });
+                    assert!(matches!(result, Err(OarOcrError::FallbackWorkerBusy)));
+                    let empty: Vec<usize> = Vec::new();
+                    assert!(
+                        dispatch_pages_on_workers(&pools, &empty, |_worker, _page| Ok(()))
+                            .unwrap()
+                            .is_empty()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(entered.load(Ordering::Relaxed), 0);
+            assert_eq!(pools[0].install(|| Ok(7)).unwrap(), 7);
+        });
+    }
+
+    #[test]
+    fn fallback_worker_rejects_concurrent_threads_without_waiting() {
+        assert_completes_without_blocking(|| {
+            let pools = plan_worker_pools(3, |_| Err::<rayon::ThreadPool, _>("boom"));
+            pools[0]
+                .install(|| {
+                    std::thread::scope(|scope| {
+                        for _ in 0..4 {
+                            scope.spawn(|| {
+                                let result = pools[0].install::<()>(|| {
+                                    panic!("a competing caller entered the active worker");
+                                });
+                                assert!(matches!(result, Err(OarOcrError::FallbackWorkerBusy)));
+                            });
+                        }
+                    });
+                    Ok(())
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn fallback_worker_does_not_block_nested_global_rayon_work() {
+        assert_completes_without_blocking(|| {
+            use rayon::prelude::*;
+            let pools = plan_worker_pools(3, |_| Err::<rayon::ThreadPool, _>("boom"));
+            pools[0]
+                .install(|| {
+                    // The admitted page waits for global Rayon work while
+                    // holding its gate. A blocking lock in any competing
+                    // call would therefore deadlock even on a one-thread pool.
+                    (0..rayon::current_num_threads().max(2))
+                        .into_par_iter()
+                        .for_each(|_| {
+                            let result = dispatch_pages_on_workers(
+                                &pools,
+                                &[0, 1],
+                                |_worker, _page| -> Result<(), OarOcrError> {
+                                    panic!("nested Rayon work reentered the active worker");
+                                },
+                            );
+                            assert!(matches!(result, Err(OarOcrError::FallbackWorkerBusy)));
+                        });
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(pools[0].install(|| Ok(7)).unwrap(), 7);
+        });
+    }
+
+    #[test]
+    fn fallback_worker_preserves_panic_payload_and_rejects_poisoned_sessions() {
+        let pool = WorkerPool::Sequential(Mutex::new(()));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install::<()>(|| std::panic::panic_any(73usize))
+        }));
+        let payload = outcome.expect_err("the original page panic must propagate");
+        assert_eq!(payload.downcast_ref::<usize>(), Some(&73));
+        assert!(matches!(
+            pool.install::<()>(|| panic!("a poisoned worker must not be entered")),
+            Err(OarOcrError::FallbackWorkerPoisoned)
+        ));
+    }
+
+    /// A fake worker whose `install` runs `f` directly on the calling
+    /// thread. Sufficient for tests that only care about
+    /// `map_pages_on_workers`'s own bookkeeping (order, errors, panics),
+    /// not about which thread a page actually runs on.
+    struct DirectWorker;
+
+    impl PageWorker for DirectWorker {
+        type Error = usize;
+
+        fn install<R: Send>(
+            &self,
+            f: impl FnOnce() -> Result<R, Self::Error> + Send,
+        ) -> Result<R, Self::Error> {
+            f()
+        }
+    }
+
+    #[test]
+    fn map_pages_on_workers_preserves_page_order() {
+        let workers = [DirectWorker, DirectWorker, DirectWorker];
+        let pages: Vec<usize> = (0..37).collect();
+        let result = map_pages_on_workers(&workers, &pages, |_worker, page| {
+            Ok::<usize, usize>(page * 2)
+        })
+        .unwrap();
+        let expected: Vec<usize> = pages.iter().map(|page| page * 2).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn map_pages_on_workers_returns_empty_for_empty_input() {
+        let workers = [DirectWorker, DirectWorker];
+        let pages: Vec<usize> = Vec::new();
+        let result = map_pages_on_workers(&workers, &pages, |_worker, page: &usize| {
+            Ok::<usize, usize>(*page)
+        })
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_pages_on_workers_returns_the_lowest_indexed_error() {
+        let workers = [DirectWorker, DirectWorker, DirectWorker, DirectWorker];
+        let pages: Vec<usize> = (0..200).collect();
+        let result = map_pages_on_workers(&workers, &pages, |_worker, page| {
+            // Several pages fail; the lowest page index's error must win,
+            // matching `collect::<Result<Vec<_>, _>>()` semantics.
+            if page % 17 == 0 && *page > 0 {
+                Err(*page)
+            } else {
+                Ok(*page)
+            }
+        });
+        assert_eq!(result, Err(17));
+    }
+
+    #[test]
+    fn map_pages_on_workers_propagates_the_first_panic_payload() {
+        let workers = [DirectWorker, DirectWorker, DirectWorker];
+        let pages: Vec<usize> = (0..40).collect();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map_pages_on_workers(&workers, &pages, |_worker, page| {
+                if *page == 5 {
+                    panic!("page {page} exploded");
+                }
+                Ok::<usize, usize>(*page)
+            })
+        }));
+        let payload = outcome.expect_err("a page panic must unwind past map_pages_on_workers");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("exploded"),
+            "unexpected payload: {message}"
+        );
+    }
+
+    /// A fake worker with its own dedicated single-thread pool, mirroring
+    /// production `OcrWorker`. `name` lets a test assert which pool ran a
+    /// given page, and `session` doubles as a reentrancy probe.
+    struct PoolWorker {
+        name: String,
+        pool: rayon::ThreadPool,
+        session: Mutex<()>,
+    }
+
+    impl PoolWorker {
+        fn new(name: impl Into<String>) -> Self {
+            let name = name.into();
+            let thread_name = name.clone();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .thread_name(move |_| thread_name.clone())
+                .build()
+                .unwrap();
+            Self {
+                name,
+                pool,
+                session: Mutex::new(()),
+            }
+        }
+    }
+
+    impl PageWorker for PoolWorker {
+        type Error = String;
+
+        fn install<R: Send>(
+            &self,
+            f: impl FnOnce() -> Result<R, Self::Error> + Send,
+        ) -> Result<R, Self::Error> {
+            self.pool.install(f)
+        }
+    }
+
+    #[test]
+    fn map_pages_on_workers_runs_every_page_on_its_own_workers_pool() {
+        let workers: Vec<PoolWorker> = (0..3)
+            .map(|index| PoolWorker::new(format!("probe-{index}")))
+            .collect();
+        let pages: Vec<usize> = (0..30).collect();
+
+        let result =
+            map_pages_on_workers(
+                &workers,
+                &pages,
+                |worker, _page| match std::thread::current().name() {
+                    Some(actual) if actual == worker.name => Ok(()),
+                    other => Err(format!("expected {}, saw {other:?}", worker.name)),
+                },
+            );
+
+        assert_eq!(result, Ok(vec![(); 30]));
+    }
+
+    /// Runs `pages` through `dispatch_pages_on_workers`, checking that
+    /// every page executed on its assigned worker's own pool thread rather
+    /// than on the calling thread.
+    fn assert_dispatch_uses_worker_pools(workers: &[PoolWorker], pages: &[usize]) {
+        let caller_thread = std::thread::current().name().map(str::to_owned);
+        let ran_on_own_pool = |worker: &PoolWorker, _page: &usize| -> Result<String, String> {
+            match std::thread::current().name() {
+                Some(actual) if actual == worker.name => Ok(actual.to_owned()),
+                other => Err(format!("expected {}, saw {other:?}", worker.name)),
+            }
+        };
+        let result = dispatch_pages_on_workers(workers, pages, ran_on_own_pool)
+            .expect("every page should run on its worker's own pool");
+        for name in &result {
+            assert_ne!(Some(name.clone()), caller_thread);
+        }
+    }
+
+    #[test]
+    fn dispatch_pages_on_workers_runs_sequentially_with_one_worker() {
+        let workers = [PoolWorker::new("solo")];
+        let pages: Vec<usize> = (0..5).collect();
+        assert_dispatch_uses_worker_pools(&workers, &pages);
+    }
+
+    #[test]
+    fn dispatch_pages_on_workers_runs_sequentially_with_one_page() {
+        let workers: Vec<PoolWorker> = (0..3)
+            .map(|index| PoolWorker::new(format!("probe-{index}")))
+            .collect();
+        let pages: Vec<usize> = vec![0];
+        assert_dispatch_uses_worker_pools(&workers, &pages);
+    }
+
+    #[test]
+    fn dispatch_pages_on_workers_runs_in_parallel_with_multiple_workers_and_pages() {
+        let workers: Vec<PoolWorker> = (0..3)
+            .map(|index| PoolWorker::new(format!("probe-{index}")))
+            .collect();
+        let pages: Vec<usize> = (0..30).collect();
+        assert_dispatch_uses_worker_pools(&workers, &pages);
+    }
+
+    #[test]
+    fn dispatch_pages_on_workers_handles_concurrent_callers_on_shared_workers() {
+        let workers = Arc::new(
+            (0..3)
+                .map(|index| PoolWorker::new(format!("shared-{index}")))
+                .collect::<Vec<_>>(),
+        );
+        let reentries = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        for _ in 0..4 {
+            let workers = Arc::clone(&workers);
+            let reentries = Arc::clone(&reentries);
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let pages: Vec<usize> = (0..10).collect();
+                let result = dispatch_pages_on_workers(&workers, &pages, |worker, _page| {
+                    let guard = worker.session.try_lock();
+                    if guard.is_err() {
+                        reentries.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok::<usize, String>(0)
+                });
+                let _ = done_tx.send(result.is_ok());
+            });
+        }
+        drop(done_tx);
+
+        for _ in 0..4 {
+            let ok = done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("a concurrent dispatch caller did not finish in time");
+            assert!(ok);
+        }
+        assert_eq!(reentries.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn map_pages_on_workers_never_reenters_a_worker_via_inner_rayon_work() {
+        // While a page holds its worker's session lock and runs a
+        // sleep-based inner `par_iter`, no other page's job may observe
+        // that same lock as held.
+        let workers: Vec<PoolWorker> = (0..3).map(|_| PoolWorker::new("worker")).collect();
+        let pages: Vec<usize> = (0..20).collect();
+        let reentries = AtomicUsize::new(0);
+
+        let result = map_pages_on_workers(&workers, &pages, |worker, _page| {
+            let guard = worker.session.try_lock();
+            let held = guard.is_ok();
+            if !held {
+                reentries.fetch_add(1, Ordering::Relaxed);
+            }
+            use rayon::prelude::*;
+            let sum: usize = (0..4)
+                .into_par_iter()
+                .map(|value| {
+                    std::thread::sleep(Duration::from_millis(1));
+                    value + 1
+                })
+                .sum();
+            drop(guard);
+            Ok::<usize, String>(sum)
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            reentries.load(Ordering::Relaxed),
+            0,
+            "a worker's session lock was re-entered by a stolen page job"
+        );
+    }
+
+    #[test]
+    fn map_pages_on_workers_does_not_starve_global_pool_callers() {
+        // Callers that are themselves global-rayon-pool workers (e.g.
+        // `files.par_iter().map(|p| process_pdf_with_ocr(p, opts))`) must
+        // still be able to complete; bounded by a timeout so a real
+        // regression fails this test instead of hanging it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            use rayon::prelude::*;
+            let thread_count = rayon::current_num_threads().clamp(1, 8);
+            (0..thread_count).into_par_iter().for_each(|_| {
+                let workers: Vec<PoolWorker> = (0..3).map(|_| PoolWorker::new("worker")).collect();
+                let pages: Vec<usize> = (0..10).collect();
+                let result = map_pages_on_workers(&workers, &pages, |_worker, _page| {
+                    use rayon::prelude::*;
+                    let sum: usize = (0..4)
+                        .into_par_iter()
+                        .map(|value| {
+                            std::thread::sleep(Duration::from_millis(1));
+                            value + 1
+                        })
+                        .sum();
+                    Ok::<usize, String>(sum)
+                });
+                assert!(result.is_ok());
+            });
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("map_pages_on_workers starved the global rayon pool");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let payload = handle
+                    .join()
+                    .expect_err("sender was dropped without the worker thread panicking");
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 }
