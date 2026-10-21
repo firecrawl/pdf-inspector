@@ -25,6 +25,15 @@ version and date. Earlier releases are described in their
   advances reads as a space. Word justifies lines with Arial's en and em
   spaces, which came out as U+FFFD between every word
   (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+- A simple font's ToUnicode CMap of fewer than ten entries keeps its say
+  for the codes the embedded program does not read. Such a CMap yields to
+  the program's own reading, and its entries were then dropped, so a code
+  whose glyph the program does not name read as its byte value: a
+  heading set by macOS Quartz in a small subset of Times New Roman Bold
+  read `CÔNG TY` as `CÔ!G TY` and `phẩm` as `ph'm`. The CMap's entry is
+  now read before the base encoding, an unreadable `/Differences` name
+  and that guess, and a code it maps to a control character
+  reads as U+FFFD.
 
 ## [1.25.2] - 2026-09-28
 
