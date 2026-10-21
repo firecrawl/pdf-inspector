@@ -2622,17 +2622,34 @@ pub(crate) fn extract_text_from_operand(
                                 return Some(fb);
                             }
                         }
-                        // 4. Differences mapped it? Use Differences result. A
-                        // code the Differences name but could not map is
+                        // 4. Differences mapped it? Use Differences result.
+                        if let Some(NamedReading::Text(text)) = by_name {
+                            return Some(text);
+                        }
+                        // 5. A simple font's sparse ToUnicode CMap that
+                        // yielded the primary role to the program's reading
+                        // (the one alternative such a font has, see
+                        // `cmap_entry`): it says what the code is, so it
+                        // is read before a code the Differences name but
+                        // could not map, and before the base encoding;
+                        // a code it maps to no text is not guessed at below.
+                        if is_simple_font {
+                            match entry.remapped.as_ref().map(|c| c.lookup_code(code)) {
+                                Some(CodeMapping::Text(text)) if !text.contains('\u{FFFD}') => {
+                                    return Some(text);
+                                }
+                                Some(CodeMapping::ControlDestination) => control_destination = true,
+                                _ => {}
+                            }
+                        }
+                        // A code the Differences name but could not map is
                         // that glyph and no other: neither the base encoding
                         // nor the fallback below has a say, and it reads as
                         // nothing.
-                        match by_name {
-                            Some(NamedReading::Text(text)) => return Some(text),
-                            Some(NamedReading::Unread) => return None,
-                            None => {}
+                        if let Some(NamedReading::Unread) = by_name {
+                            return None;
                         }
-                        // 5. The font's base encoding, for printable bytes
+                        // 6. The font's base encoding, for printable bytes
                         // (the predefined tables spell out the control
                         // codes too, and those are dropped like they are
                         // by the fallback below)
@@ -2655,21 +2672,6 @@ pub(crate) fn extract_text_from_operand(
                                 {
                                     return Some(ch.to_string());
                                 }
-                            }
-                        }
-                        // 6. A simple font's sparse ToUnicode CMap that
-                        // yielded the primary role to the program's reading
-                        // (the one alternative such a font has, see
-                        // `cmap_entry`): what it says of a code nothing
-                        // above reads is no guess, and a code it maps to
-                        // no text is not guessed at below either.
-                        if is_simple_font {
-                            match entry.remapped.as_ref().map(|c| c.lookup_code(code)) {
-                                Some(CodeMapping::Text(text)) if !text.contains('\u{FFFD}') => {
-                                    return Some(text);
-                                }
-                                Some(CodeMapping::ControlDestination) => control_destination = true,
-                                _ => {}
                             }
                         }
                         // 7. Printable single-byte fallback — a guess at a
@@ -6086,6 +6088,44 @@ mod tests {
             ),
             "co\u{FFFD}ee"
         );
+    }
+
+    /// The sparse CMap says what a code is, so it is read before a declared
+    /// base encoding and before a `/Differences` name that reads as nothing,
+    /// for the codes it maps: `<21>` is `c` under `/WinAnsiEncoding` (which
+    /// has `!` there) and under a Differences name no table can read. A
+    /// Differences name that does read keeps the code.
+    #[test]
+    fn a_simple_fonts_sparse_cmap_beats_a_base_encoding_and_unreadable_differences() {
+        const SPARSE_BFCHAR: &str = "<21> <0063>\n<22> <006F>";
+        let mut names = vec![None; 0x25];
+        names[0x22] = Some("o");
+        let read = |encoding: Object| {
+            decode_simple_font_string(
+                SPARSE_BFCHAR,
+                Some(sfnt_with_glyph_names(&names)),
+                Some(encoding),
+                &[0x21, 0x22],
+            )
+        };
+        assert_eq!(read(Object::Name(b"WinAnsiEncoding".to_vec())), "co");
+        let base_only = Object::Dictionary(lopdf::dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => "WinAnsiEncoding"
+        });
+        assert_eq!(read(base_only), "co");
+        let differences = |name: &[u8]| {
+            Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Encoding",
+                "BaseEncoding" => "WinAnsiEncoding",
+                "Differences" => Object::Array(vec![
+                    Object::Integer(0x21), Object::Name(name.to_vec()),
+                ])
+            })
+        };
+        assert_eq!(read(differences(b"glyph9999")), "co");
+        // A name that reads stays the code's reading.
+        assert_eq!(read(differences(b"x")), "xo");
     }
 
     /// Codes 0x21..=0x2C are glyph indices; the ligature at 0x23 is mapped
