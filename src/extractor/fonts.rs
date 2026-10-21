@@ -2644,8 +2644,9 @@ pub(crate) fn extract_text_from_operand(
                         }
                         // A code the Differences name but could not map is
                         // that glyph and no other: neither the base encoding
-                        // nor the fallback below has a say, and it reads as
-                        // nothing.
+                        // nor the printable guess below has a say, and it
+                        // reads as nothing unless the sparse CMap, read
+                        // above, names it.
                         if let Some(NamedReading::Unread) = by_name {
                             return None;
                         }
