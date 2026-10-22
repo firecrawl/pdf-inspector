@@ -1573,9 +1573,13 @@ fn split_runs_at_vertical_rules(
     const MIN_SIDE: f32 = 8.0;
 
     let split_one = |item: &TextItem| -> Option<Vec<TextItem>> {
-        // Character positions are estimated along +x, which only holds for
-        // upright runs with a measured advance.
-        if !item.is_upright() || !item.advance_known || item.width <= 0.0 {
+        // Character positions are estimated along +x and the rule is tested
+        // at the baseline, which only holds for level runs with a measured
+        // advance: `is_upright()` admits oblique runs, whose baseline is not
+        // horizontal and whose box edge only approximates it.
+        let rotation = item.rotation.rem_euclid(360.0);
+        let level = rotation <= 0.1 || rotation >= 359.9;
+        if !level || !item.advance_known || item.width <= 0.0 {
             return None;
         }
         let chars: Vec<char> = item.text.chars().collect();
@@ -2619,7 +2623,14 @@ mod tests {
 
         // A rule ending at the run's baseline still crosses it, even though
         // it stops below the middle of the glyph box.
-        assert!(split_runs_at_vertical_rules(&[run], 1, &[(215.0, 150.0, 200.0)]).is_some());
+        assert!(
+            split_runs_at_vertical_rules(&[run.clone()], 1, &[(215.0, 150.0, 200.0)]).is_some()
+        );
+
+        // An oblique run's box edge only approximates its baseline: no cut.
+        let mut oblique = run;
+        oblique.rotation = 20.0;
+        assert!(split_runs_at_vertical_rules(&[oblique], 1, &verticals).is_none());
     }
 
     #[test]
