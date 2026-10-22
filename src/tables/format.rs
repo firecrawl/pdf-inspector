@@ -315,7 +315,12 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         .filter(|row| row.first().is_some_and(|cell| cell.trim().is_empty()))
         .count();
     let data_rows = data_rows.len();
-    let first_column_is_row_group_label = data_rows >= 4 && empty_first_cells * 4 >= data_rows * 3;
+    // A three-row group (label row plus two blank-labelled entries) is the
+    // smallest one; larger tables need three in four blank, since a table
+    // whose label column is merely broken up by wrapped tails sits near 2/3.
+    let first_column_is_row_group_label = (data_rows >= 4
+        && empty_first_cells * 4 >= data_rows * 3)
+        || (data_rows == 3 && empty_first_cells == 2);
 
     for row in cells {
         // Check if this row is empty
@@ -451,7 +456,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             r.iter().skip(1).map(|c| !c.trim().is_empty()).collect()
         };
         let looks_like_row_group_data_row = first_column_is_row_group_label
-            && non_first_cells.len() >= 2
+            && !non_first_cells.is_empty()
             && !starts_with_lowercase_alpha(first_non_empty_cell)
             && cleaned
                 .last()
@@ -712,6 +717,40 @@ mod tests {
             cleaned[2][1],
             "Concentração de hemoglobina corpuscular média"
         );
+    }
+
+    #[test]
+    fn test_clean_table_cells_small_row_group_entries_not_merged() {
+        // A three-row group with two blank first cells is still a group.
+        let cells = vec![
+            row(&["Group", "Name", "Code"]),
+            row(&["Group A", "Contagem total de células brancas", "WBC"]),
+            row(&["", "Concentração de hemoglobina corpuscular", "MCHC"]),
+            row(&["", "Volume corpuscular médio por célula", "MCV"]),
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2][2], "MCHC");
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_row_group_entries_not_merged() {
+        // With one entry column, each entry fills a single cell; only a
+        // lowercase wrapped tail joins the entry above.
+        let cells = vec![
+            row(&["Group", "Name"]),
+            row(&["Group A", "Contagem total de células brancas"]),
+            row(&["", "Concentração de hemoglobina corpuscular"]),
+            row(&["", "média"]),
+            row(&["", "Volume corpuscular médio por célula"]),
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(
+            cleaned[2][1],
+            "Concentração de hemoglobina corpuscular média"
+        );
+        assert_eq!(cleaned[3][1], "Volume corpuscular médio por célula");
     }
 
     #[test]

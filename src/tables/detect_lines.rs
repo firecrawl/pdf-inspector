@@ -1580,7 +1580,7 @@ fn split_runs_at_vertical_rules(
         }
         let chars: Vec<char> = item.text.chars().collect();
         let (left, right) = (item.x, item.x + item.width);
-        let baseline_mid = item.y + item.height / 2.0;
+        let baseline = item.baseline_y();
         // Positions come from the run's average advance, which drifts
         // several glyphs on a long proportional run; the drawn rule through
         // the baseline is the real evidence, so allow that drift.
@@ -1592,8 +1592,8 @@ fn split_runs_at_vertical_rules(
             .filter(|&&(x, y_min, y_max)| {
                 x > left + MIN_SIDE
                     && x < right - MIN_SIDE
-                    && baseline_mid >= y_min
-                    && baseline_mid <= y_max
+                    && baseline >= y_min
+                    && baseline <= y_max
             })
             .map(|&(x, _, _)| x)
             .collect();
@@ -2253,10 +2253,15 @@ fn detect_tables_from_lines_inner(
             .filter(|&y| y >= ruled_bottom - RULE_SPAN_SLACK && y <= ruled_top + RULE_SPAN_SLACK)
             .collect();
         inner_ys.sort_by(f32::total_cmp);
-        let row_pitch = inner_ys
+        // The typical (median) gap between rules, not the largest: one tall
+        // merged row must not widen the span enough to re-admit furniture.
+        let mut gaps: Vec<f32> = inner_ys
             .windows(2)
             .map(|pair| pair[1] - pair[0])
-            .fold(RULE_SPAN_SLACK, f32::max);
+            .filter(|&gap| gap > RULE_SPAN_SLACK)
+            .collect();
+        gaps.sort_by(f32::total_cmp);
+        let row_pitch = gaps.get(gaps.len() / 2).copied().unwrap_or(RULE_SPAN_SLACK);
         let (ruled_bottom, ruled_top) = (ruled_bottom - row_pitch, ruled_top + row_pitch);
         let inside: Vec<(f32, f32, f32)> = horizontals
             .iter()
@@ -2608,7 +2613,13 @@ mod tests {
         assert!(expanded[1].x >= 215.0);
 
         // The same rule stopping short of the run's row leaves it whole.
-        assert!(split_runs_at_vertical_rules(&[run], 1, &[(215.0, 150.0, 190.0)]).is_none());
+        assert!(
+            split_runs_at_vertical_rules(&[run.clone()], 1, &[(215.0, 150.0, 190.0)]).is_none()
+        );
+
+        // A rule ending at the run's baseline still crosses it, even though
+        // it stops below the middle of the glyph box.
+        assert!(split_runs_at_vertical_rules(&[run], 1, &[(215.0, 150.0, 200.0)]).is_some());
     }
 
     #[test]
