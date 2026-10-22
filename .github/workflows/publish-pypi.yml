@@ -109,6 +109,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Bootstrap pip
+        run: python -m pip install --no-cache-dir -r .github/pip-bootstrap.txt
+
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
