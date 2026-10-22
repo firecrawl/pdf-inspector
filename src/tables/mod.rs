@@ -45,6 +45,7 @@ pub(crate) use detect_heuristic::{
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_lines::{
     detect_dense_line_chart_regions, detect_vector_grid_tables_from_lines,
+    synthesize_lines_from_thin_rects,
 };
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_chart_regions, detect_tables_from_rects, RectHintRegion};

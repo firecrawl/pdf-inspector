@@ -1522,6 +1522,57 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+/// A grid whose rules are hairline filled rectangles rather than strokes, with
+/// a rotated row-group label ("Grupo WBC (15)…") drawn once beside the rows it
+/// spans, and label/abbreviation cells painted so close together that
+/// extraction merges them into one run ("…corpuscular MCHC").
+///
+/// The fills must reach line-based detection as rules, each group label must
+/// land in its block's first row, runs a column rule crosses must split into
+/// their cells, and the group's entries must stay separate rows.
+#[test]
+fn test_snapshot_hairline_fill_row_group_table() {
+    let output = assert_snapshot("hairline_fill_row_group_table");
+    assert!(
+        output
+            .contains("|Grupo de parâmetros|Nome|Abreviação|CBC|CBC+ DIFF|\n|---|---|---|---|---|"),
+        "hairline-fill grid must render as a table with its header: {output}"
+    );
+    assert!(
+        output.contains("|Grupo RBC (8)|Contagem de glóbulos vermelhos|RBC|√|√|"),
+        "rotated group label must sit in its block's first row: {output}"
+    );
+    assert!(
+        output.contains("||Concentração de hemoglobina corpuscular média|MCHC|√|√|\n||Largura"),
+        "a run crossing a column rule must split, and group entries stay separate: {output}"
+    );
+}
+
+/// A two-column hairline-fill table on a page that also draws a running-header
+/// rule and a footer rule far outside the table's vertical rules. Those page
+/// rules must not become row edges: the heading and the body paragraph above
+/// the table stay prose, in reading order before it.
+#[test]
+fn test_snapshot_hairline_fill_table_page_rules() {
+    let output = assert_snapshot("hairline_fill_table_page_rules");
+    let body = output
+        .find("Este manual do operador é composto por 11 capítulos e 3 apêndices.")
+        .expect("body paragraph must be extracted as prose");
+    let header = output
+        .find("|Se deseja…|Consulte…|\n|---|---|")
+        .expect("table must be extracted with its header");
+    assert!(
+        body < header,
+        "body paragraph must precede the table: {output}"
+    );
+    assert!(
+        output.contains(
+            "|saber sobre o uso previsto e os parâmetros do BC-5150|Capítulo 2 Como entender seu analisador|"
+        ),
+        "first data row must keep both cells: {output}"
+    );
+}
+
 /// Base-Hebrew text stored in visual (screen left-to-right) order: each show
 /// op's characters are reversed relative to reading order and ops paint
 /// left-to-right across the line. Extraction must reverse each run back to

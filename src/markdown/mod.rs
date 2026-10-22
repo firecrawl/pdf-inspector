@@ -1836,7 +1836,17 @@ fn convert_items_with_rects_lines_and_table_output(
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
             if rect_claimed.is_empty() {
-                let line_tables = detect_tables_from_lines(band_items, band_lines, page);
+                // A table whose rules are hairline *fills* rather than strokes
+                // reaches this point with no lines at all, and its slivers are
+                // far too small for rect clustering. Re-express them as the
+                // segments they draw so the grid becomes visible here instead
+                // of being left to the heuristic pass, which sees only the
+                // columns its gap histogram happens to survive.
+                let mut grid_lines = band_lines.clone();
+                grid_lines.extend(crate::tables::synthesize_lines_from_thin_rects(
+                    band_rects, page,
+                ));
+                let line_tables = detect_tables_from_lines(band_items, &grid_lines, page);
                 for table in &line_tables {
                     for &idx in &table.item_indices {
                         rect_claimed.insert(idx);
