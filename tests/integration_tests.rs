@@ -11060,3 +11060,92 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+/// The result as text with the wall-clock field zeroed, so two runs compare.
+fn result_fingerprint(mut result: pdf_inspector::PdfProcessResult) -> String {
+    result.processing_time_ms = 0;
+    format!("{result:?}")
+}
+
+#[test]
+fn loaded_pdf_matches_one_shot_processing_per_page_filter() {
+    for path in [
+        "tests/fixtures/2013-app2.pdf",
+        "tests/fixtures/greencomp_competence.pdf",
+        "tests/fixtures/thermo-freon12.pdf",
+    ] {
+        let buffer = std::fs::read(path).unwrap();
+        let loaded = pdf_inspector::LoadedPdf::open(&buffer, None).unwrap();
+        let page_count = loaded.page_count();
+        assert_eq!(
+            page_count,
+            process_pdf_mem(&buffer).unwrap().page_count,
+            "{path}"
+        );
+
+        // Every selection against the same handle, then the first again:
+        // nothing a call caches may change a later call's answer.
+        let mut selections: Vec<Option<Vec<u32>>> = vec![None];
+        selections.extend((1..=page_count.min(4)).map(|page| Some(vec![page])));
+        selections.push(Some(vec![1, page_count]));
+        selections.push(None);
+        for pages in selections {
+            let options = || match &pages {
+                Some(pages) => PdfOptions::new().pages(pages.iter().copied()),
+                None => PdfOptions::new(),
+            };
+            let expected = process_pdf_mem_with_options(&buffer, options()).unwrap();
+            let actual = loaded.process_pages(options()).unwrap();
+            assert!(actual.markdown.is_some(), "{path} {pages:?}");
+            assert_eq!(actual.markdown, expected.markdown, "{path} pages {pages:?}");
+            assert_eq!(
+                result_fingerprint(actual),
+                result_fingerprint(expected),
+                "{path} pages {pages:?}"
+            );
+        }
+
+        // Detection is kept per config: another mode and another config on
+        // the same handle still match.
+        let detect_only = PdfOptions::detect_only();
+        assert_eq!(
+            result_fingerprint(loaded.process_pages(detect_only.clone()).unwrap()),
+            result_fingerprint(process_pdf_mem_with_options(&buffer, detect_only).unwrap()),
+            "{path} detect only"
+        );
+        let full_scan = PdfOptions::new().detection(DetectionConfig {
+            strategy: ScanStrategy::Full,
+            ..DetectionConfig::default()
+        });
+        assert_eq!(
+            result_fingerprint(loaded.process_pages(full_scan.clone()).unwrap()),
+            result_fingerprint(process_pdf_mem_with_options(&buffer, full_scan).unwrap()),
+            "{path} full scan"
+        );
+    }
+}
+
+#[test]
+fn loaded_pdf_open_validates_and_decrypts_like_one_shot_processing() {
+    assert!(matches!(
+        pdf_inspector::LoadedPdf::open(b"not a PDF at all", None),
+        Err(PdfError::NotAPdf(_))
+    ));
+
+    let buffer = std::fs::read("tests/fixtures/encrypted-secret123.pdf").unwrap();
+    assert!(matches!(
+        pdf_inspector::LoadedPdf::open(&buffer, None),
+        Err(PdfError::Encrypted)
+    ));
+    assert!(matches!(
+        pdf_inspector::LoadedPdf::open(&buffer, Some("wrong")),
+        Err(PdfError::Encrypted)
+    ));
+    let loaded = pdf_inspector::LoadedPdf::open(&buffer, Some("secret123")).unwrap();
+    let expected =
+        process_pdf_mem_with_options(&buffer, PdfOptions::new().password("secret123")).unwrap();
+    assert_eq!(
+        result_fingerprint(loaded.process_pages(PdfOptions::new()).unwrap()),
+        result_fingerprint(expected)
+    );
+}
