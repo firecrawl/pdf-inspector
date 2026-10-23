@@ -29,7 +29,7 @@ pub enum PdfType {
 }
 
 /// Strategy for which pages to scan during detection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanStrategy {
     /// Scan all pages, stop on first non-text page (current default).
     /// Best for pipelines that route TextBased PDFs to fast extraction.
@@ -46,7 +46,7 @@ pub enum ScanStrategy {
 }
 
 /// Result of PDF type detection
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PdfTypeResult {
     /// Detected PDF type
     pub pdf_type: PdfType,
@@ -99,7 +99,7 @@ pub struct PdfTypeResult {
 }
 
 /// Configuration for PDF type detection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DetectionConfig {
     /// Strategy for which pages to scan
     pub strategy: ScanStrategy,

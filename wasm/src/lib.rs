@@ -102,6 +102,19 @@ export interface PdfClassification {
   confidence: number;
 }
 
+/**
+ * A PDF parsed once and processed repeatedly. Call `free()` when done to
+ * release the parsed document.
+ */
+export class PdfDocument {
+  /** Throws when the bytes are not a readable PDF or the password is missing or wrong. */
+  constructor(data: Uint8Array, password?: string);
+  readonly pageCount: number;
+  /** Like `processPdf`, without parsing again. `options.password` is ignored. */
+  processPages(options?: Omit<ProcessOptions, "password">): PdfProcessResult;
+  free(): void;
+}
+
 export function processPdf(data: Uint8Array, options?: ProcessOptions): PdfProcessResult;
 export function detectPdf(data: Uint8Array, options?: Pick<ProcessOptions, "password">): PdfProcessResult;
 export function classifyPdf(data: Uint8Array): PdfClassification;
@@ -317,6 +330,50 @@ pub fn process_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     serialize(&WasmPdfProcessResult::from(result))
 }
 
+/// A PDF parsed once inside WebAssembly, processed any number of times.
+///
+/// `processPdf` parses the whole file on every call, even for one page. Open a
+/// `PdfDocument` once and call `processPages` for each selection; the parsed
+/// document and the work that depends only on it stay in WebAssembly memory
+/// until `free()` is called.
+#[wasm_bindgen(js_name = PdfDocument, skip_typescript)]
+pub struct WasmPdfDocument {
+    inner: pdf_inspector::LoadedPdf,
+}
+
+#[wasm_bindgen(js_class = PdfDocument)]
+impl WasmPdfDocument {
+    /// Parse PDF bytes. Throws when the bytes are not a readable PDF or are
+    /// encrypted and `password` is missing or wrong.
+    #[wasm_bindgen(constructor)]
+    pub fn new(data: &[u8], password: Option<String>) -> Result<WasmPdfDocument, JsValue> {
+        initialize();
+        let inner = pdf_inspector::LoadedPdf::open(data, password.as_deref())
+            .map_err(|error| js_error("open PDF", error))?;
+        Ok(Self { inner })
+    }
+
+    /// Number of pages in the document.
+    #[wasm_bindgen(getter, js_name = pageCount)]
+    pub fn page_count(&self) -> u32 {
+        self.inner.page_count()
+    }
+
+    /// Process the document like `processPdf`, without parsing it again.
+    /// `options.password` is ignored: the document is already open.
+    #[wasm_bindgen(js_name = processPages)]
+    pub fn process_pages(&self, options: JsValue) -> Result<JsValue, JsValue> {
+        let options = build_options(options, ProcessMode::Full)?;
+        let started = js_sys::Date::now();
+        let mut result = self
+            .inner
+            .process_pages(options)
+            .map_err(|error| js_error("process PDF", error))?;
+        result.processing_time_ms = (js_sys::Date::now() - started).max(0.0) as u64;
+        serialize(&WasmPdfProcessResult::from(result))
+    }
+}
+
 /// Classify PDF bytes without extracting text or producing Markdown.
 #[wasm_bindgen(js_name = detectPdf, skip_typescript)]
 pub fn detect_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
@@ -484,6 +541,35 @@ mod tests {
                 .expect(absent)
                 .is_undefined());
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn document_handle_processes_pages_repeatedly() {
+        let document = WasmPdfDocument::new(TEXT_PDF, None).expect("open PDF");
+        assert!(document.page_count() > 0);
+
+        let options = js_sys::Object::new();
+        Reflect::set(
+            &options,
+            &JsValue::from_str("pages"),
+            &js_sys::Array::of1(&JsValue::from_f64(1.0)),
+        )
+        .expect("set pages");
+        let markdown = |result: &JsValue| {
+            Reflect::get(result, &JsValue::from_str("markdown"))
+                .expect("markdown")
+                .as_string()
+                .expect("markdown string")
+        };
+        let expected = markdown(&process_pdf(TEXT_PDF, options.clone().into()).expect("process"));
+        for _ in 0..2 {
+            let result = document
+                .process_pages(options.clone().into())
+                .expect("process pages");
+            assert_eq!(markdown(&result), expected);
+        }
+        assert!(WasmPdfDocument::new(ENCRYPTED_PDF, None).is_err());
+        assert!(WasmPdfDocument::new(ENCRYPTED_PDF, Some("secret123".to_string())).is_ok());
     }
 
     #[wasm_bindgen_test]

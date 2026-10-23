@@ -368,7 +368,7 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
     let (doc, page_count) =
         load_document_from_path_with_password(&path, options.password.as_deref())?;
 
-    process_document(doc, page_count, options, start)
+    LoadedPdf::from_loaded(doc, page_count).run(options, start)
 }
 
 /// Process a PDF from a memory buffer with full extraction.
@@ -394,7 +394,7 @@ pub fn process_pdf_mem_with_options(
     let (doc, page_count) =
         load_document_from_mem_with_password(buffer, options.password.as_deref())?;
 
-    process_document(doc, page_count, options, start)
+    LoadedPdf::from_loaded(doc, page_count).run(options, start)
 }
 
 // =========================================================================
@@ -4573,431 +4573,529 @@ fn contains_recent_eof_marker(buf: &[u8]) -> bool {
     buf[start..].windows(b"%%EOF".len()).any(|w| w == b"%%EOF")
 }
 
-/// Core processing pipeline operating on a pre-loaded document.
-fn process_document(
+/// A PDF opened once, to be processed any number of times.
+///
+/// [`process_pdf_mem_with_options`] parses the whole file on every call, even
+/// when `page_filter` selects one page. A `LoadedPdf` parses it (and applies
+/// the load-time repairs) once in [`LoadedPdf::open`]; each
+/// [`LoadedPdf::process_pages`] then runs the same pipeline on the document
+/// in memory, with the same result as the one-shot function for the same
+/// options. Work that depends only on the document (detection, the font
+/// CMaps, the structure tree) is done by the first call that needs it and
+/// kept: detection for the [`DetectionConfig`] it was run with, so a call with
+/// another config runs it again.
+///
+/// Still whole-document on every call: `page_count`, the document type and
+/// OCR page list from detection, and the context pages a selected folio may
+/// need (see `page_filter`). The type is not `Sync`.
+pub struct LoadedPdf {
     doc: Document,
     page_count: u32,
-    options: PdfOptions,
-    start: ProcessingTimer,
-) -> Result<PdfProcessResult, PdfError> {
-    // Step 1 — Detection (cheap: scans content streams for text operators)
-    let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
-    let pdf_type = detection.pdf_type;
-    let pages_needing_ocr = detection.pages_needing_ocr;
-    let title = detection.title;
-    let author = detection.author;
-    let subject = detection.subject;
-    let keywords = detection.keywords;
-    let creator = detection.creator;
-    let producer = detection.producer;
-    let creation_date = detection.creation_date;
-    let mod_date = detection.mod_date;
-    let confidence = detection.confidence;
-    let detection_ocr_reasons = detection.ocr_reasons_by_page;
+    detection: std::cell::RefCell<Option<(DetectionConfig, PdfTypeResult)>>,
+    font_cmaps: std::cell::OnceCell<FontCMaps>,
+    struct_tree: std::cell::OnceCell<StructTreeData>,
+}
 
-    // DetectOnly → return immediately
-    if options.mode == ProcessMode::DetectOnly {
-        return Ok(PdfProcessResult {
-            pdf_type,
-            markdown: None,
-            page_count,
-            processing_time_ms: start.elapsed_ms(),
-            pages_needing_ocr,
-            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
-            title,
-            author,
-            subject,
-            keywords,
-            creator,
-            producer,
-            creation_date,
-            mod_date,
-            confidence,
-            layout: LayoutComplexity::default(),
-            has_encoding_issues: false,
-            cmap_gaps: Vec::new(),
-        });
+/// What a document's structure tree yields for Markdown generation: MCID
+/// roles per page (`None` when there are none) and the tagged tables.
+type StructTreeData = (
+    Option<HashMap<u32, HashMap<i64, structure_tree::StructRole>>>,
+    Vec<structure_tree::StructTable>,
+);
+
+impl std::fmt::Debug for LoadedPdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedPdf")
+            .field("page_count", &self.page_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoadedPdf {
+    /// Parse `buffer`, decrypting with `password` if it is encrypted.
+    ///
+    /// Validates and loads exactly as [`process_pdf_mem_with_options`] does,
+    /// container repairs included, and fails with the same errors.
+    pub fn open(buffer: &[u8], password: Option<&str>) -> Result<Self, PdfError> {
+        validate_pdf_bytes(buffer)?;
+        let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
+        Ok(Self::from_loaded(doc, page_count))
     }
 
-    // Scanned / ImageBased → nothing to extract
-    if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
-        return Ok(PdfProcessResult {
-            pdf_type,
-            markdown: None,
-            page_count,
-            processing_time_ms: start.elapsed_ms(),
-            pages_needing_ocr,
-            ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
-            title,
-            author,
-            subject,
-            keywords,
-            creator,
-            producer,
-            creation_date,
-            mod_date,
-            confidence,
-            layout: LayoutComplexity::default(),
-            has_encoding_issues: false,
-            cmap_gaps: Vec::new(),
-        });
+    /// Number of pages in the document.
+    pub fn page_count(&self) -> u32 {
+        self.page_count
     }
 
-    // Step 2 — Extraction (reuses the already-loaded document)
-    let extracted = {
-        let font_cmaps = FontCMaps::from_doc(&doc);
-        // Most page-filtered requests extract only the selected pages. Gather
-        // other pages only when a selected contextual folio needs cross-page
-        // evidence; failures on those context-only pages are non-fatal.
-        let result = extractor::extract_positioned_text_with_folio_context(
-            &doc,
-            &font_cmaps,
-            options.page_filter.as_ref(),
-        );
+    /// Process the document with `options`, as
+    /// [`process_pdf_mem_with_options`] would process the bytes it was opened
+    /// from. `options.password` is ignored: the document is already open.
+    pub fn process_pages(&self, options: PdfOptions) -> Result<PdfProcessResult, PdfError> {
+        self.run(options, ProcessingTimer::start())
+    }
 
-        // For Mixed/template PDFs: if normal extraction produces garbage text
-        // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
-        // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
-                let sample: String = items
-                    .iter()
-                    .filter(|item| {
-                        options
-                            .page_filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.contains(&item.page))
-                    })
-                    .take(200)
-                    .map(|item| item.text.as_str())
-                    .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
-                    extractor::extract_positioned_text_include_invisible_with_folio_context(
-                        &doc,
-                        &font_cmaps,
-                        options.page_filter.as_ref(),
-                    )
-                } else {
-                    result
-                }
-            } else {
-                // Normal extraction failed — try invisible as fallback
-                extractor::extract_positioned_text_include_invisible_with_folio_context(
-                    &doc,
-                    &font_cmaps,
-                    options.page_filter.as_ref(),
-                )
-            }
-        } else {
-            result
+    fn from_loaded(doc: Document, page_count: u32) -> Self {
+        Self {
+            doc,
+            page_count,
+            detection: std::cell::RefCell::new(None),
+            font_cmaps: std::cell::OnceCell::new(),
+            struct_tree: std::cell::OnceCell::new(),
         }
-    };
+    }
 
-    // For Mixed PDFs, extraction failure is non-fatal
-    let extracted = if pdf_type == PdfType::Mixed {
-        extracted.ok()
-    } else {
-        Some(extracted?)
-    };
-
-    // Parse structure tree for tagged PDFs (reuses the loaded document)
-    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
-        .map(|tree| {
-            let page_ids = doc.get_pages();
-            let roles = tree.mcid_to_roles(&page_ids);
-            let tables = tree.extract_tables(&page_ids);
-            if !roles.is_empty() {
-                log::debug!(
-                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
-                    roles.len(),
-                    tree.mcid_count(),
-                    tables.len()
-                );
+    /// Detection for `config`, run once per config.
+    fn detect(&self, config: &DetectionConfig) -> Result<PdfTypeResult, PdfError> {
+        if let Some((cached, result)) = self.detection.borrow().as_ref() {
+            if cached == config {
+                return Ok(result.clone());
             }
-            let roles = if roles.is_empty() { None } else { Some(roles) };
-            (roles, tables)
-        })
-        .unwrap_or((None, Vec::new()));
+        }
+        let result = detector::detect_from_document(&self.doc, self.page_count, config)?;
+        *self.detection.borrow_mut() = Some((config.clone(), result.clone()));
+        Ok(result)
+    }
 
-    let (
-        markdown,
-        layout,
-        has_encoding_issues,
-        gid_pages,
-        text_quality_pages,
-        text_quality_reasons_by_page,
-        cmap_gaps,
-    ) = match extracted {
-        Some((
-            (items, rects, lines),
-            page_thresholds,
-            gid_encoded_pages,
-            _page_rotations,
-            cmap_coverage,
-        )) => {
-            let mut ocr_reasons_by_page = BTreeMap::new();
+    fn font_cmaps(&self) -> &FontCMaps {
+        self.font_cmaps
+            .get_or_init(|| FontCMaps::from_doc(&self.doc))
+    }
 
-            // For TextBased PDFs with pages flagged for OCR (Identity-H or
-            // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
-            // passthrough actually produced readable text.  If a page's text
-            // is garbage, strip its items so we don't emit mojibake.
-            // Only applies to TextBased — for Mixed PDFs, OCR flags come from
-            // template images rather than font encoding issues.
-            let (items, rects, lines) =
-                if pages_needing_ocr.is_empty() || pdf_type != PdfType::TextBased {
-                    (items, rects, lines)
-                } else {
-                    let ocr_set: std::collections::HashSet<u32> =
-                        pages_needing_ocr.iter().copied().collect();
-                    // Collect text per OCR-flagged page and check quality
-                    let mut garbage_pages: std::collections::HashSet<u32> =
-                        std::collections::HashSet::new();
-                    for &pg in &ocr_set {
-                        if options
-                            .page_filter
-                            .as_ref()
-                            .is_some_and(|filter| !filter.contains(&pg))
-                        {
-                            continue;
-                        }
-                        let page_text: String = items
-                            .iter()
-                            .filter(|i| i.page == pg)
-                            .map(|i| i.text.as_str())
-                            .collect();
-                        if is_cid_garbage(&page_text) {
-                            garbage_pages.insert(pg);
-                        }
-                    }
-                    if garbage_pages.is_empty() {
-                        (items, rects, lines)
-                    } else {
+    /// The structure tree of a tagged PDF (reuses the loaded document).
+    fn struct_tree(&self) -> &StructTreeData {
+        self.struct_tree.get_or_init(|| {
+            let doc = &self.doc;
+            structure_tree::StructTree::from_doc(doc)
+                .map(|tree| {
+                    let page_ids = doc.get_pages();
+                    let roles = tree.mcid_to_roles(&page_ids);
+                    let tables = tree.extract_tables(&page_ids);
+                    if !roles.is_empty() {
                         log::debug!(
-                            "suppressing garbage text from OCR-flagged pages: {:?}",
-                            garbage_pages
+                            "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
+                            roles.len(),
+                            tree.mcid_count(),
+                            tables.len()
                         );
-                        for page in &garbage_pages {
-                            add_ocr_reason(
-                                &mut ocr_reasons_by_page,
-                                *page,
-                                OCR_REASON_SUSPECTED_GARBLED_TEXT,
-                            );
-                        }
-                        let items: Vec<_> = items
-                            .into_iter()
-                            .filter(|i| !garbage_pages.contains(&i.page))
-                            .collect();
-                        let rects: Vec<_> = rects
-                            .into_iter()
-                            .filter(|r| !garbage_pages.contains(&r.page))
-                            .collect();
-                        let lines: Vec<_> = lines
-                            .into_iter()
-                            .filter(|l| !garbage_pages.contains(&l.page))
-                            .collect();
-                        (items, rects, lines)
                     }
-                };
+                    let roles = if roles.is_empty() { None } else { Some(roles) };
+                    (roles, tables)
+                })
+                .unwrap_or((None, Vec::new()))
+        })
+    }
 
-            let selected_page = |page: u32| {
-                options
-                    .page_filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.contains(&page))
-            };
-            let rects: Vec<_> = rects
-                .into_iter()
-                .filter(|rect| selected_page(rect.page))
-                .collect();
-            let lines: Vec<_> = lines
-                .into_iter()
-                .filter(|line| selected_page(line.page))
-                .collect();
-            let gid_encoded_pages: HashSet<_> = gid_encoded_pages
-                .into_iter()
-                .filter(|page| selected_page(*page))
-                .collect();
-            let FolioFilteredItems {
-                items,
-                layout_items,
-                removal_mask,
-                removed_pages,
-            } = select_items_with_document_folio_context(
-                items,
+    /// Core processing pipeline.
+    fn run(
+        &self,
+        options: PdfOptions,
+        start: ProcessingTimer,
+    ) -> Result<PdfProcessResult, PdfError> {
+        let doc = &self.doc;
+        let page_count = self.page_count;
+        // Step 1 — Detection (cheap: scans content streams for text operators)
+        let detection = self.detect(&options.detection)?;
+        let pdf_type = detection.pdf_type;
+        let pages_needing_ocr = detection.pages_needing_ocr;
+        let title = detection.title;
+        let author = detection.author;
+        let subject = detection.subject;
+        let keywords = detection.keywords;
+        let creator = detection.creator;
+        let producer = detection.producer;
+        let creation_date = detection.creation_date;
+        let mod_date = detection.mod_date;
+        let confidence = detection.confidence;
+        let detection_ocr_reasons = detection.ocr_reasons_by_page;
+
+        // DetectOnly → return immediately
+        if options.mode == ProcessMode::DetectOnly {
+            return Ok(PdfProcessResult {
+                pdf_type,
+                markdown: None,
                 page_count,
+                processing_time_ms: start.elapsed_ms(),
+                pages_needing_ocr,
+                ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+                title,
+                author,
+                subject,
+                keywords,
+                creator,
+                producer,
+                creation_date,
+                mod_date,
+                confidence,
+                layout: LayoutComplexity::default(),
+                has_encoding_issues: false,
+                cmap_gaps: Vec::new(),
+            });
+        }
+
+        // Scanned / ImageBased → nothing to extract
+        if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
+            return Ok(PdfProcessResult {
+                pdf_type,
+                markdown: None,
+                page_count,
+                processing_time_ms: start.elapsed_ms(),
+                pages_needing_ocr,
+                ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
+                title,
+                author,
+                subject,
+                keywords,
+                creator,
+                producer,
+                creation_date,
+                mod_date,
+                confidence,
+                layout: LayoutComplexity::default(),
+                has_encoding_issues: false,
+                cmap_gaps: Vec::new(),
+            });
+        }
+
+        // Step 2 — Extraction (reuses the already-loaded document)
+        let extracted = {
+            let font_cmaps = self.font_cmaps();
+            // Most page-filtered requests extract only the selected pages. Gather
+            // other pages only when a selected contextual folio needs cross-page
+            // evidence; failures on those context-only pages are non-fatal.
+            let result = extractor::extract_positioned_text_with_folio_context(
+                doc,
+                font_cmaps,
                 options.page_filter.as_ref(),
             );
 
-            let text_quality = analyze_text_quality(&items);
-            merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
-            let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
-            let layout = compute_layout_complexity_with_chart_regions(
-                &items,
-                &layout_items,
-                &rects,
-                &lines,
-                &chart_regions,
-            );
-
-            let md = if options.mode == ProcessMode::Analyze {
-                None
+            // For Mixed/template PDFs: if normal extraction produces garbage text
+            // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
+            // This unlocks OCR text layers behind scanned images.
+            if pdf_type == PdfType::Mixed {
+                if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
+                    let sample: String = items
+                        .iter()
+                        .filter(|item| {
+                            options
+                                .page_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(&item.page))
+                        })
+                        .take(200)
+                        .map(|item| item.text.as_str())
+                        .collect();
+                    if is_garbage_text(&sample) || sample.trim().is_empty() {
+                        extractor::extract_positioned_text_include_invisible_with_folio_context(
+                            doc,
+                            font_cmaps,
+                            options.page_filter.as_ref(),
+                        )
+                    } else {
+                        result
+                    }
+                } else {
+                    // Normal extraction failed — try invisible as fallback
+                    extractor::extract_positioned_text_include_invisible_with_folio_context(
+                        doc,
+                        font_cmaps,
+                        options.page_filter.as_ref(),
+                    )
+                }
             } else {
-                Some(markdown::to_markdown_from_items_with_rects_and_lines(
+                result
+            }
+        };
+
+        // For Mixed PDFs, extraction failure is non-fatal
+        let extracted = if pdf_type == PdfType::Mixed {
+            extracted.ok()
+        } else {
+            Some(extracted?)
+        };
+
+        let (struct_roles, struct_tables) = self.struct_tree();
+
+        let (
+            markdown,
+            layout,
+            has_encoding_issues,
+            gid_pages,
+            text_quality_pages,
+            text_quality_reasons_by_page,
+            cmap_gaps,
+        ) = match extracted {
+            Some((
+                (items, rects, lines),
+                page_thresholds,
+                gid_encoded_pages,
+                _page_rotations,
+                cmap_coverage,
+            )) => {
+                let mut ocr_reasons_by_page = BTreeMap::new();
+
+                // For TextBased PDFs with pages flagged for OCR (Identity-H or
+                // Type3 fonts without ToUnicode), check whether the CID-as-Unicode
+                // passthrough actually produced readable text.  If a page's text
+                // is garbage, strip its items so we don't emit mojibake.
+                // Only applies to TextBased — for Mixed PDFs, OCR flags come from
+                // template images rather than font encoding issues.
+                let (items, rects, lines) =
+                    if pages_needing_ocr.is_empty() || pdf_type != PdfType::TextBased {
+                        (items, rects, lines)
+                    } else {
+                        let ocr_set: std::collections::HashSet<u32> =
+                            pages_needing_ocr.iter().copied().collect();
+                        // Collect text per OCR-flagged page and check quality
+                        let mut garbage_pages: std::collections::HashSet<u32> =
+                            std::collections::HashSet::new();
+                        for &pg in &ocr_set {
+                            if options
+                                .page_filter
+                                .as_ref()
+                                .is_some_and(|filter| !filter.contains(&pg))
+                            {
+                                continue;
+                            }
+                            let page_text: String = items
+                                .iter()
+                                .filter(|i| i.page == pg)
+                                .map(|i| i.text.as_str())
+                                .collect();
+                            if is_cid_garbage(&page_text) {
+                                garbage_pages.insert(pg);
+                            }
+                        }
+                        if garbage_pages.is_empty() {
+                            (items, rects, lines)
+                        } else {
+                            log::debug!(
+                                "suppressing garbage text from OCR-flagged pages: {:?}",
+                                garbage_pages
+                            );
+                            for page in &garbage_pages {
+                                add_ocr_reason(
+                                    &mut ocr_reasons_by_page,
+                                    *page,
+                                    OCR_REASON_SUSPECTED_GARBLED_TEXT,
+                                );
+                            }
+                            let items: Vec<_> = items
+                                .into_iter()
+                                .filter(|i| !garbage_pages.contains(&i.page))
+                                .collect();
+                            let rects: Vec<_> = rects
+                                .into_iter()
+                                .filter(|r| !garbage_pages.contains(&r.page))
+                                .collect();
+                            let lines: Vec<_> = lines
+                                .into_iter()
+                                .filter(|l| !garbage_pages.contains(&l.page))
+                                .collect();
+                            (items, rects, lines)
+                        }
+                    };
+
+                let selected_page = |page: u32| {
+                    options
+                        .page_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(&page))
+                };
+                let rects: Vec<_> = rects
+                    .into_iter()
+                    .filter(|rect| selected_page(rect.page))
+                    .collect();
+                let lines: Vec<_> = lines
+                    .into_iter()
+                    .filter(|line| selected_page(line.page))
+                    .collect();
+                let gid_encoded_pages: HashSet<_> = gid_encoded_pages
+                    .into_iter()
+                    .filter(|page| selected_page(*page))
+                    .collect();
+                let FolioFilteredItems {
                     items,
-                    options.markdown,
+                    layout_items,
+                    removal_mask,
+                    removed_pages,
+                } = select_items_with_document_folio_context(
+                    items,
+                    page_count,
+                    options.page_filter.as_ref(),
+                );
+
+                let text_quality = analyze_text_quality(&items);
+                merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
+                let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
+                let layout = compute_layout_complexity_with_chart_regions(
+                    &items,
+                    &layout_items,
                     &rects,
                     &lines,
-                    markdown::MarkdownDocumentContext {
-                        page_thresholds: &page_thresholds,
-                        struct_roles: struct_roles.as_ref(),
-                        struct_tables: &struct_tables,
-                        page_count,
-                        prefiltered_page_number_pages: Some(&removed_pages),
-                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
-                        precomputed_chart_regions: Some(&chart_regions),
-                    },
-                ))
-            };
+                    &chart_regions,
+                );
 
-            // A code no CMap could read is an encoding issue whether or not
-            // the Markdown that would show its U+FFFD is generated in this
-            // mode; a gap read from its neighbours is not one.
-            let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
-            let enc = !ocr_reasons_by_page.is_empty()
-                || text_quality.has_encoding_issues
-                || cmap_unmapped
-                || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
-            (
-                md,
-                layout,
-                enc,
-                gid_encoded_pages,
-                text_quality.pages_needing_ocr,
-                ocr_reasons_by_page,
-                font_cmap_gaps(cmap_coverage),
-            )
-        }
-        None => (
-            None,
-            LayoutComplexity::default(),
-            false,
-            std::collections::HashSet::new(),
-            Vec::new(),
-            BTreeMap::new(),
-            Vec::new(),
-        ),
-    };
+                let md = if options.mode == ProcessMode::Analyze {
+                    None
+                } else {
+                    Some(markdown::to_markdown_from_items_with_rects_and_lines(
+                        items,
+                        options.markdown,
+                        &rects,
+                        &lines,
+                        markdown::MarkdownDocumentContext {
+                            page_thresholds: &page_thresholds,
+                            struct_roles: struct_roles.as_ref(),
+                            struct_tables,
+                            page_count,
+                            prefiltered_page_number_pages: Some(&removed_pages),
+                            prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                            precomputed_chart_regions: Some(&chart_regions),
+                        },
+                    ))
+                };
 
-    // If the extracted text is predominantly garbage (non-alphanumeric) and
-    // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
-    // layer comes from a bad OCR pass, and callers should use proper OCR.
-    let (pdf_type, markdown, confidence) =
-        if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
+                // A code no CMap could read is an encoding issue whether or not
+                // the Markdown that would show its U+FFFD is generated in this
+                // mode; a gap read from its neighbours is not one.
+                let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
+                let enc = !ocr_reasons_by_page.is_empty()
+                    || text_quality.has_encoding_issues
+                    || cmap_unmapped
+                    || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
+                (
+                    md,
+                    layout,
+                    enc,
+                    gid_encoded_pages,
+                    text_quality.pages_needing_ocr,
+                    ocr_reasons_by_page,
+                    font_cmap_gaps(cmap_coverage),
+                )
+            }
+            None => (
+                None,
+                LayoutComplexity::default(),
+                false,
+                std::collections::HashSet::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                Vec::new(),
+            ),
+        };
+
+        // If the extracted text is predominantly garbage (non-alphanumeric) and
+        // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
+        // layer comes from a bad OCR pass, and callers should use proper OCR.
+        let (pdf_type, markdown, confidence) = if pdf_type == PdfType::Mixed
+            && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
+        {
             (PdfType::Scanned, None, 0.95)
         } else {
             (pdf_type, markdown, confidence)
         };
 
-    // If a TextBased PDF produces garbage text, the fonts are undecodable
-    // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
-    // Drop the useless markdown and flag all pages for OCR.
-    let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
-        && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
-    {
-        log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
-        (None, true, true)
-    } else {
-        (markdown, has_encoding_issues, false)
-    };
+        // If a TextBased PDF produces garbage text, the fonts are undecodable
+        // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
+        // Drop the useless markdown and flag all pages for OCR.
+        let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
+            && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
+        {
+            log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
+            (None, true, true)
+        } else {
+            (markdown, has_encoding_issues, false)
+        };
 
-    // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list.
-    // When ALL pages have gid-encoded fonts, suppress unreliable markdown.
-    let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
-    let mut pages_needing_ocr = pages_needing_ocr;
-    if force_ocr_all {
-        pages_needing_ocr = (1..=page_count).collect();
-    }
-    if !gid_pages.is_empty() {
-        log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
-        for page in gid_pages {
-            if !pages_needing_ocr.contains(&page) {
-                pages_needing_ocr.push(page);
-            }
-        }
-        pages_needing_ocr.sort_unstable();
-    }
-    if !text_quality_pages.is_empty() {
-        log::debug!(
-            "pages with OCR reason {} (need OCR): {:?}",
-            OCR_REASON_SUSPECTED_GARBLED_TEXT,
-            text_quality_pages
-        );
-        for page in text_quality_pages {
-            if !pages_needing_ocr.contains(&page) {
-                pages_needing_ocr.push(page);
-            }
-        }
-        pages_needing_ocr.sort_unstable();
-    }
-
-    // Detect sparse extraction: when a TEXT-BASED PDF produces very few
-    // characters per page, the text is likely embedded in images/forms
-    // that need OCR.  Flag all pages for OCR in this case.
-    // Only check when markdown was actually generated (not in Analyze mode).
-    if pdf_type == PdfType::TextBased
-        && page_count > 0
-        && pages_needing_ocr.is_empty()
-        && markdown.is_some()
-    {
-        let md_len = markdown.as_ref().map_or(0, |m| m.len());
-        let chars_per_page = md_len as f32 / page_count as f32;
-        if chars_per_page < 50.0 && md_len < 500 {
-            log::debug!(
-                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
-                chars_per_page,
-                page_count
-            );
+        // Add pages with gid-encoded fonts (unresolvable encoding) to OCR list.
+        // When ALL pages have gid-encoded fonts, suppress unreliable markdown.
+        let all_gid = !gid_pages.is_empty() && gid_pages.len() as u32 >= page_count;
+        let mut pages_needing_ocr = pages_needing_ocr;
+        if force_ocr_all {
             pages_needing_ocr = (1..=page_count).collect();
         }
+        if !gid_pages.is_empty() {
+            log::debug!("pages with gid-encoded fonts (need OCR): {:?}", gid_pages);
+            for page in gid_pages {
+                if !pages_needing_ocr.contains(&page) {
+                    pages_needing_ocr.push(page);
+                }
+            }
+            pages_needing_ocr.sort_unstable();
+        }
+        if !text_quality_pages.is_empty() {
+            log::debug!(
+                "pages with OCR reason {} (need OCR): {:?}",
+                OCR_REASON_SUSPECTED_GARBLED_TEXT,
+                text_quality_pages
+            );
+            for page in text_quality_pages {
+                if !pages_needing_ocr.contains(&page) {
+                    pages_needing_ocr.push(page);
+                }
+            }
+            pages_needing_ocr.sort_unstable();
+        }
+
+        // Detect sparse extraction: when a TEXT-BASED PDF produces very few
+        // characters per page, the text is likely embedded in images/forms
+        // that need OCR.  Flag all pages for OCR in this case.
+        // Only check when markdown was actually generated (not in Analyze mode).
+        if pdf_type == PdfType::TextBased
+            && page_count > 0
+            && pages_needing_ocr.is_empty()
+            && markdown.is_some()
+        {
+            let md_len = markdown.as_ref().map_or(0, |m| m.len());
+            let chars_per_page = md_len as f32 / page_count as f32;
+            if chars_per_page < 50.0 && md_len < 500 {
+                log::debug!(
+                    "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
+                    chars_per_page,
+                    page_count
+                );
+                pages_needing_ocr = (1..=page_count).collect();
+            }
+        }
+
+        let markdown = if all_gid {
+            log::debug!(
+                "all {} pages have gid-encoded fonts — suppressing markdown output",
+                page_count
+            );
+            None
+        } else {
+            markdown
+        };
+
+        Ok(PdfProcessResult {
+            pdf_type,
+            markdown,
+            page_count,
+            processing_time_ms: start.elapsed_ms(),
+            pages_needing_ocr,
+            ocr_reasons_by_page: {
+                // Detector reasons (scanned / no_text / vector_text /
+                // invisible_text_layer / garbled) merged with the
+                // markdown-stage garbled detection, deduped per page.
+                let mut merged = detection_ocr_reasons;
+                merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
+                page_ocr_reasons_vec(merged)
+            },
+            title,
+            author,
+            subject,
+            keywords,
+            creator,
+            producer,
+            creation_date,
+            mod_date,
+            confidence,
+            layout,
+            has_encoding_issues,
+            cmap_gaps,
+        })
     }
-
-    let markdown = if all_gid {
-        log::debug!(
-            "all {} pages have gid-encoded fonts — suppressing markdown output",
-            page_count
-        );
-        None
-    } else {
-        markdown
-    };
-
-    Ok(PdfProcessResult {
-        pdf_type,
-        markdown,
-        page_count,
-        processing_time_ms: start.elapsed_ms(),
-        pages_needing_ocr,
-        ocr_reasons_by_page: {
-            // Detector reasons (scanned / no_text / vector_text /
-            // invisible_text_layer / garbled) merged with the
-            // markdown-stage garbled detection, deduped per page.
-            let mut merged = detection_ocr_reasons;
-            merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
-            page_ocr_reasons_vec(merged)
-        },
-        title,
-        author,
-        subject,
-        keywords,
-        creator,
-        producer,
-        creation_date,
-        mod_date,
-        confidence,
-        layout,
-        has_encoding_issues,
-        cmap_gaps,
-    })
 }
 
 /// The fonts whose CMap lacked an entry for a code shown through it, with
