@@ -9,6 +9,15 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `LoadedPdf` (Rust) and `PdfDocument` (WebAssembly) open a PDF once and
+  process it any number of times: `LoadedPdf::process_pages(options)` and
+  `new PdfDocument(data, password?).processPages(options)` give the result
+  `process_pdf_mem_with_options` and `processPdf` give for the same options,
+  without parsing the file again. Detection, the font CMaps and the structure
+  tree are computed by the first call that needs them and kept.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that

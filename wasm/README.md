@@ -33,6 +33,22 @@ const result = processPdf(pdf, {
 });
 ```
 
+`processPdf` parses the whole file on every call. To process pages of one PDF repeatedly, open it once with `PdfDocument`:
+
+```ts
+import init, { PdfDocument } from "@firecrawl/pdf-inspector-wasm";
+
+await init();
+
+const doc = new PdfDocument(pdf, password); // password is optional
+for (let page = 1; page <= doc.pageCount; page++) {
+  console.log(doc.processPages({ pages: [page] }).markdown);
+}
+doc.free(); // release the parsed document
+```
+
+`processPages` takes the same options as `processPdf` (`password` is ignored: the document is already open). `pageCount`, the document type and the OCR page list still describe the whole document in every result.
+
 The package also exports:
 
 - `detectPdf(pdf, options?)` for detection without extraction.
