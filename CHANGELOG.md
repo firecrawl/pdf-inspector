@@ -13,9 +13,10 @@ version and date. Earlier releases are described in their
 
 - `LoadedPdf` (Rust) and `PdfDocument` (WebAssembly) open a PDF once and
   process it any number of times: `LoadedPdf::process_pages(options)` and
-  `new PdfDocument(data, password?).processPages(options)` give the result
-  `process_pdf_mem_with_options` and `processPdf` give for the same options,
-  without parsing the file again. Detection, the font CMaps and the structure
+  `new PdfDocument(data, password?).processPages(options)` give the same
+  result as `process_pdf_mem_with_options` and `processPdf` for the same
+  options, without parsing the file again. Detection is reused only when a
+  later call uses the same `DetectionConfig`; the font CMaps and structure
   tree are computed by the first call that needs them and kept.
 
 ### Fixed

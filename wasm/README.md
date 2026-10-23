@@ -40,7 +40,7 @@ import init, { PdfDocument } from "@firecrawl/pdf-inspector-wasm";
 
 await init();
 
-const doc = new PdfDocument(pdf, password); // password is optional
+const doc = new PdfDocument(pdf); // pass a password as the second argument for encrypted PDFs
 for (let page = 1; page <= doc.pageCount; page++) {
   console.log(doc.processPages({ pages: [page] }).markdown);
 }
