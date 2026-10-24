@@ -30,7 +30,8 @@ pub struct StructuredCell {
     pub is_header: bool,
     /// Cell text (filled in by the caller after overlap-testing PDF items).
     pub text: String,
-    /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left origin.
+    /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left
+    /// origin, relative to the visible page box (the crop's own frame).
     pub page_pt_bbox: [f32; 4],
 }
 

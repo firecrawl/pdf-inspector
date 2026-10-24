@@ -9,11 +9,14 @@ import {
   classifyPdfAsync,
   extractText,
   extractTextWithPositions,
+  extractTextWithPositionsAndRotations,
   extractStructureElements,
   extractTextInRegions,
+  extractTablesInRegions,
   detectVectorGridInRegion,
   extractPagesMarkdown,
   extractPagesMarkdownAsync,
+  extractTextWithPositionsAsync,
 } from './index.js';
 
 const fixture = readFileSync('../tests/fixtures/thermo-freon12.pdf');
@@ -71,13 +74,33 @@ assert.equal(typeof item.x, 'number');
 assert.equal(typeof item.y, 'number');
 assert.equal(typeof item.width, 'number');
 assert.equal(typeof item.height, 'number');
+assert.equal(typeof item.rotation, 'number');
+assert.equal(typeof item.advanceKnown, 'boolean');
 assert.equal(typeof item.font, 'string');
 assert.equal(typeof item.fontSize, 'number');
 assert.equal(typeof item.page, 'number');
 assert.equal(typeof item.isBold, 'boolean');
 assert.equal(typeof item.isItalic, 'boolean');
+assert.ok(item.fontWeight === undefined || typeof item.fontWeight === 'number');
 assert.equal(typeof item.itemType, 'string');
 console.log('  extractTextWithPositions: OK');
+
+// boldFromWeight: off by default and when passed as false. The fixture's
+// faces name their weight ("Verdana,Bold" and "Arial,Bold" read 700, the
+// regular faces nothing) and its runs of different weight already differ in
+// isBold, so the option leaves every item as it was here; the synthetic
+// three-weight page further down shows what it changes.
+const styleOf = i => [i.text, i.isBold, i.fontWeight];
+const plainStyles = items.map(styleOf);
+assert.deepEqual(
+  extractTextWithPositions(fixture, undefined, { boldFromWeight: false }).map(styleOf),
+  plainStyles,
+);
+const weightedItems = extractTextWithPositions(fixture, undefined, { boldFromWeight: true });
+assert.deepEqual(weightedItems.map(styleOf), plainStyles);
+assert.ok(weightedItems.some(i => i.fontWeight === 700 && i.isBold));
+assert.ok(weightedItems.every(i => i.fontWeight === undefined || (i.fontWeight >= 100 && i.fontWeight <= 900)));
+console.log('  extractTextWithPositions boldFromWeight defaults: OK');
 
 // with pages filter
 const page1Items = extractTextWithPositions(fixture, [1]);
@@ -93,6 +116,46 @@ assert.ok(
   'tagged PDF text items should carry Marked Content IDs',
 );
 console.log('  extractTextWithPositions mcid: OK');
+
+// rotation: a 90° margin stamp keeps a tall, thin axis-aligned box instead of
+// collapsing to width 0, and reports its baseline angle
+const rotatedFixture = readFileSync('../tests/fixtures/rotated_margin_stamp.pdf');
+const rotatedItems = extractTextWithPositions(rotatedFixture);
+const stamp = rotatedItems.find(i => i.text.startsWith('arXiv:'));
+assert.ok(stamp, 'rotated stamp item should be extracted');
+assert.ok(Math.abs(stamp.rotation - 90) < 1e-3, `stamp rotation ${stamp.rotation}`);
+assert.ok(
+  stamp.height > 10 * stamp.width,
+  `stamp box should be tall and thin, got ${stamp.width}x${stamp.height}`,
+);
+assert.ok(
+  rotatedItems.every(i => i.text.trim() === '' || i.width > 0),
+  'no run with glyphs may be zero-width',
+);
+assert.ok(rotatedItems.filter(i => !i.text.startsWith('arXiv:')).every(i => i.rotation === 0));
+assert.ok(rotatedItems.every(i => i.advanceKnown === true), 'Helvetica carries metrics for every run');
+console.log('  extractTextWithPositions rotation: OK');
+
+// the stamp belongs to the margin box only, never to the body paragraph
+const stampRegions = extractTextInRegions(rotatedFixture, [
+  { page: 0, regions: [[0, 0, 50, 792], [60, 0, 612, 792]] },
+]);
+assert.equal(stampRegions[0].regions[0].text.trim(), 'arXiv:2301.00001v1 [cs.CL] 1 Jan 2023');
+assert.ok(!stampRegions[0].regions[1].text.includes('arXiv'), 'stamp leaked into body region');
+assert.ok(stampRegions[0].regions[1].text.includes('The quick brown fox'));
+console.log('  extractTextInRegions rotated margin run: OK');
+
+// page frames: an upright page reports none; a page whose text is rotated
+// 90° counter-clockwise is re-based and reported as 'ccw'
+const upright = extractTextWithPositionsAndRotations(fixture);
+assert.ok(upright.items.length > 0);
+assert.deepEqual(upright.pageRotations, []);
+const rotatedPageFixture = readFileSync('../tests/fixtures/tnagriculture_06_12.pdf');
+const turned = extractTextWithPositionsAndRotations(rotatedPageFixture);
+assert.ok(turned.items.length > 0);
+assert.deepEqual(turned.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+assert.ok(turned.items.every(i => i.page !== 1 || i.rotation === 0 || i.rotation === 270));
+console.log('  extractTextWithPositionsAndRotations: OK');
 
 // --- extractStructureElements ---
 console.log('Testing extractStructureElements...');
@@ -136,6 +199,143 @@ assert.equal(regionResults[0].regions.length, 1);
 assert.equal(typeof regionResults[0].regions[0].text, 'string');
 assert.equal(typeof regionResults[0].regions[0].needsOcr, 'boolean');
 console.log('  extractTextInRegions: OK');
+
+// --- coordinate frame: positions and regions share the visible page box ---
+console.log('Testing visible page box coordinate frame...');
+// MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is written at
+// raw (120, 300), so a CropBox render puts it at (70, 240) from the box's
+// lower-left corner.
+const cropFixture = readFileSync('../tests/fixtures/cropbox_offset_origin.pdf');
+const cropItems = extractTextWithPositions(cropFixture);
+const glyph = cropItems.find(i => i.text.trim() === 'Visible glyph');
+assert.ok(glyph, 'fixture glyph should be extracted');
+assert.ok(Math.abs(glyph.x - 70) < 0.01, `glyph.x should be 70, got ${glyph.x}`);
+assert.ok(Math.abs(glyph.y - 240) < 0.01, `glyph.y should be 240, got ${glyph.y}`);
+// The region API reads the same frame: the glyph's own box in the visible
+// box's top-left space (300 x 400) yields exactly that line.
+const visibleHeight = 400;
+const glyphRegion = extractTextInRegions(cropFixture, [
+  {
+    page: 0,
+    regions: [[
+      glyph.x,
+      visibleHeight - glyph.y - glyph.height,
+      glyph.x + glyph.width,
+      visibleHeight - glyph.y,
+    ]],
+  },
+]);
+const glyphText = glyphRegion[0].regions[0].text;
+assert.ok(glyphText.includes('Visible glyph'), `region should hold the glyph, got ${glyphText}`);
+assert.ok(!glyphText.includes('Second line'), `region should not spill, got ${glyphText}`);
+console.log('  visible page box frame: OK');
+
+// --- display frame: positions and regions on the rendered page ---
+console.log('Testing display frame...');
+
+// One-page PDF with Helvetica text; `rotate` becomes the page's /Rotate.
+function syntheticPdf(content, rotate) {
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]${rotate === undefined ? '' : ` /Rotate ${rotate}`} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>`,
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+const close = (actual, expected, what) =>
+  assert.ok(Math.abs(actual - expected) < 0.75, `${what}: expected ${actual} to be close to ${expected}`);
+
+// Without a /Rotate both frames agree, and the default is the sheet frame.
+const uprightPdf = syntheticPdf('BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET');
+const uprightSheet = extractTextWithPositions(uprightPdf);
+const uprightExplicit = extractTextWithPositions(uprightPdf, undefined, { frame: 'sheet' });
+const uprightDisplay = extractTextWithPositions(uprightPdf, undefined, { frame: 'display' });
+assert.deepEqual(uprightExplicit, uprightSheet);
+assert.deepEqual(uprightDisplay, uprightSheet);
+const uprightAnchor = uprightSheet.find(i => i.text.trim() === 'Anchor');
+close(uprightAnchor.x, 72, 'anchor.x');
+close(uprightAnchor.y, 700, 'anchor.y');
+assert.throws(
+  () => extractTextWithPositions(uprightPdf, undefined, { frame: 'rendered' }),
+  /unknown frame "rendered"/,
+);
+assert.throws(() => extractTextInRegions(uprightPdf, [], { frame: 'page' }), /unknown frame "page"/);
+console.log('  display frame defaults and validation: OK');
+
+// Two lines reading bottom-to-top on a page whose /Rotate 90 displays them
+// upright: the sheet frame turns the page (reported as 'ccw'), the display
+// frame puts each line where a renderer draws it on the 792 x 612 page.
+const sidewaysPdf = syntheticPdf(
+  'BT /F1 12 Tf 0 1 -1 0 40 420 Tm (HELLO) Tj ET\nBT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET',
+  90,
+);
+const sidewaysSheet = extractTextWithPositionsAndRotations(sidewaysPdf);
+assert.deepEqual(sidewaysSheet.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+const sidewaysDisplay = extractTextWithPositionsAndRotations(sidewaysPdf, [1], { frame: 'display' });
+assert.deepEqual(sidewaysDisplay.pageRotations, [{ page: 1, rotation: 'ccw' }]);
+const hello = sidewaysDisplay.items.find(i => i.text.trim() === 'HELLO');
+const world = sidewaysDisplay.items.find(i => i.text.trim() === 'WORLD');
+assert.ok(hello && world, 'both lines should be extracted');
+close(hello.x, 420, 'hello.x');
+close(hello.y, 612 - 40, 'hello.y');
+close(hello.height, 12, 'hello.height');
+assert.equal(hello.rotation, 0);
+close(world.x, 420, 'world.x');
+close(world.y, 612 - 70, 'world.y');
+assert.ok(hello.y > world.y, 'HELLO renders above WORLD');
+assert.deepEqual(
+  extractTextWithPositionsAndRotations(sidewaysPdf, [2], { frame: 'display' }),
+  { items: [], pageRotations: [] },
+);
+
+// Region bboxes on the rendered page (top-left origin) pick exactly the line
+// they cover: HELLO occupies y ∈ [28, 40], WORLD y ∈ [58, 70].
+const sidewaysRegions = extractTextInRegions(
+  sidewaysPdf,
+  [{ page: 0, regions: [[400, 20, 700, 45], [400, 55, 700, 75]] }],
+  { frame: 'display' },
+);
+assert.equal(sidewaysRegions[0].regions[0].text.trim(), 'HELLO');
+assert.equal(sidewaysRegions[0].regions[1].text.trim(), 'WORLD');
+// The same bboxes read in the default sheet frame land on empty paper.
+const sidewaysSheetRegions = extractTextInRegions(sidewaysPdf, [
+  { page: 0, regions: [[400, 20, 700, 45]] },
+]);
+assert.equal(sidewaysSheetRegions[0].regions[0].text.trim(), '');
+
+// Tables take the same option: a grid on a sideways page reads identically
+// through a sheet-frame bbox and through the matching display-frame bbox.
+const gridPdf = syntheticPdf(
+  [
+    ['Name', 'Qty', 'Price'],
+    ['Apple', '3', '1.50'],
+    ['Pear', '5', '2.25'],
+  ]
+    .flatMap((row, r) => row.map((cell, c) => `BT /F1 12 Tf ${[72, 200, 330][c]} ${700 - 20 * r} Td (${cell}) Tj ET`))
+    .join('\n'),
+  90,
+);
+const gridFromSheet = extractTablesInRegions(gridPdf, [{ page: 0, regions: [[60, 80, 400, 137]] }]);
+const gridFromDisplay = extractTablesInRegions(
+  gridPdf,
+  [{ page: 0, regions: [[792 - 137, 60, 792 - 80, 400]] }],
+  { frame: 'display' },
+);
+assert.equal(gridFromSheet[0].regions[0].text, '|Name|Qty|Price|\n|---|---|---|\n|Apple|3|1.50|\n|Pear|5|2.25|\n');
+assert.deepEqual(gridFromDisplay, gridFromSheet);
+console.log('  display frame positions and regions: OK');
 
 // --- detectVectorGridInRegion ---
 console.log('Testing detectVectorGridInRegion...');
@@ -212,6 +412,23 @@ assert.equal(asyncPicked.pages[0].page, 2);
 assert.equal(asyncPicked.pages[1].page, 0);
 console.log('  extractPagesMarkdownAsync with pages: OK');
 
+// extractTextWithPositionsAsync matches the sync result, with and without
+// a page filter and position options
+for (const [pages, options] of [
+  [undefined, undefined],
+  [[1], { frame: 'display' }],
+  [undefined, { frame: 'display', boldFromWeight: true }],
+]) {
+  const asyncItems = await extractTextWithPositionsAsync(fixture, pages, options);
+  assert.deepEqual(asyncItems, extractTextWithPositions(fixture, pages, options));
+}
+// invalid options are rejected when the call is made, as in the sync call
+assert.throws(
+  () => extractTextWithPositionsAsync(fixture, undefined, { frame: 'bogus' }),
+  /unknown frame/,
+);
+console.log('  extractTextWithPositionsAsync: OK');
+
 // input buffer is copied at call time: mutating it immediately after the
 // call must not affect the in-flight parse
 const scratch = Buffer.from(fixture);
@@ -262,6 +479,288 @@ assert.equal(c1.pdfType, 'TextBased');
 assert.equal(c2.pdfType, 'TextBased');
 assert.equal(c3.pages.length, 3);
 console.log('  concurrent async calls: OK');
+
+// --- font weight: fontWeight and boldFromWeight on runs that differ only in weight ---
+console.log('Testing boldFromWeight...');
+
+// One page whose first line is set in three non-embedded faces that differ
+// only in weight: `Face-Lt` and `Face-Md` name theirs, the third has an opaque
+// name and `/FontWeight 700` in its descriptor. None of them is bold by the
+// flags or name words the default extraction reads. A second line uses the
+// light face twice.
+function threeWeightsPdf() {
+  const widths = `[${Array(256).fill('600').join(' ')}]`;
+  const font = (baseFont, descriptor) =>
+    `<< /Type /Font /Subtype /TrueType /BaseFont /${baseFont} /FirstChar 0 /LastChar 255 /Widths ${widths} /FontDescriptor ${descriptor} 0 R >>`;
+  const descriptor = (baseFont, fontWeight) =>
+    `<< /Type /FontDescriptor /FontName /${baseFont} /Flags 32 /ItalicAngle 0${fontWeight ? ` /FontWeight ${fontWeight}` : ''} >>`;
+  const content =
+    'BT /F1 12 Tf 72 700 Td (Light ) Tj /F2 12 Tf (Medium ) Tj /F3 12 Tf (Heavy) Tj ET\n' +
+    'BT /F1 12 Tf 72 680 Td (Same ) Tj (weight) Tj ET';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> /Contents 4 0 R >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+    font('ABCDEF+Face-Lt', 8),
+    font('ABCDEF+Face-Md', 9),
+    font('ABCDEF+Opaque', 10),
+    descriptor('ABCDEF+Face-Lt'),
+    descriptor('ABCDEF+Face-Md'),
+    descriptor('ABCDEF+Opaque', 700),
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+const weightsPdf = threeWeightsPdf();
+
+// Default: the three runs merge into one item as they always did, none is
+// bold, and the item carries its first run's weight class.
+assert.deepEqual(extractTextWithPositions(weightsPdf).map(styleOf), [
+  ['Light Medium Heavy', false, 300],
+  ['Same weight', false, 300],
+]);
+// Option on: the 700 face is bold on the weight class's account, the 300 and
+// 500 faces are not and, agreeing, still merge; the bold run is its own item.
+const weightsOn = extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true });
+assert.deepEqual(weightsOn.map(styleOf), [
+  ['Light Medium ', false, 300],
+  ['Heavy', true, 700],
+  ['Same weight', false, 300],
+]);
+assert.equal(weightsOn.find(i => i.text === 'Heavy').boldSource, 'WeightClass');
+assert.equal(weightsOn.find(i => i.text === 'Light Medium ').boldSource, undefined);
+// A threshold of 500 reads the medium face as bold too; the runs merge by
+// the verdict. Outside 100..900 the threshold is an argument error, on
+// every function that takes the options.
+assert.deepEqual(
+  extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 500 }).map(styleOf),
+  [
+    ['Light ', false, 300],
+    ['Medium Heavy', true, 500],
+    ['Same weight', false, 300],
+  ],
+);
+for (const bad of [0, 99, 901, 1000]) {
+  assert.throws(
+    () => extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: bad }),
+    /boldWeightThreshold/,
+  );
+}
+// Both ends of the scale are valid: at 100 every weight class is bold, at
+// 900 none of this page's.
+assert.deepEqual(
+  extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 100 }).map(styleOf),
+  [
+    ['Light Medium Heavy', true, 300],
+    ['Same weight', true, 300],
+  ],
+);
+assert.deepEqual(
+  extractTextWithPositions(weightsPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 900 }).map(styleOf),
+  extractTextWithPositions(weightsPdf).map(styleOf),
+);
+assert.throws(
+  () => extractTextWithPositionsAndRotations(weightsPdf, undefined, { boldWeightThreshold: 1000 }),
+  /boldWeightThreshold/,
+);
+const weightsRotations = extractTextWithPositionsAndRotations(weightsPdf, [1], { boldFromWeight: true });
+assert.deepEqual(weightsRotations.items.map(styleOf), weightsOn.map(styleOf));
+assert.deepEqual(weightsRotations.pageRotations, []);
+// A region's text is the words on the page and reads the same either way.
+const weightsRegion = [{ page: 0, regions: [[60, 80, 400, 116]] }];
+const weightsRegionPlain = extractTextInRegions(weightsPdf, weightsRegion)[0].regions[0].text;
+const weightsRegionOn = extractTextInRegions(weightsPdf, weightsRegion, { boldFromWeight: true })[0].regions[0].text;
+assert.equal(weightsRegionPlain.split('\n')[0].trim(), 'Light Medium Heavy');
+assert.equal(weightsRegionOn, weightsRegionPlain);
+assert.throws(
+  () => extractTextInRegions(weightsPdf, weightsRegion, { boldFromWeight: true, boldWeightThreshold: 50 }),
+  /boldWeightThreshold/,
+);
+assert.throws(
+  () => extractTablesInRegions(weightsPdf, weightsRegion, { boldWeightThreshold: 901 }),
+  /boldWeightThreshold/,
+);
+console.log('  boldFromWeight: OK');
+
+// --- font metadata: boldSource, fixedPitch and boldWeightThreshold on embedded faces ---
+console.log('Testing font metadata...');
+
+// tests/fixtures/font_metadata_faces.pdf: embedded subsets whose names, OS/2
+// tables, descriptor flags and width tables each make one point (see
+// scripts/make_font_metadata_fixtures.py).
+const facesPdf = readFileSync('../tests/fixtures/font_metadata_faces.pdf');
+const faceStyle = (items, text) => {
+  const item = items.find(i => i.text === text);
+  assert.ok(item, `no item reads ${JSON.stringify(text)}`);
+  return [item.isBold, item.boldSource, item.fontWeight, item.fixedPitch];
+};
+const mixedLine = items =>
+  items.filter(i => i.page === 1 && Math.abs(i.y - 580) < 0.5).map(i => [i.text, i.isBold, i.boldSource, i.fontWeight]);
+
+const faces = extractTextWithPositions(facesPdf);
+// Bold by the name (a Demi face, and a Bold name over a regular program,
+// where fontWeight shows the conflict), by the program's bold selection
+// behind an opaque name, and by filling and stroking; a heavy weight class
+// alone is not bold by default.
+assert.deepEqual(faceStyle(faces, 'Demi name, weight class 600'), [true, 'FontName', 600, false]);
+assert.deepEqual(faceStyle(faces, 'Bold name, weight class 400'), [true, 'FontName', 400, false]);
+assert.deepEqual(faceStyle(faces, 'Plain name, weight class 600'), [false, undefined, 600, false]);
+assert.deepEqual(faceStyle(faces, 'Opaque name, bold selection, weight class 700'), [true, 'FontFlags', 700, false]);
+assert.deepEqual(faceStyle(faces, 'Extra light, weight class 200'), [false, undefined, 200, false]);
+assert.deepEqual(faceStyle(faces, 'Painted heavier'), [true, 'Painted', 400, false]);
+assert.deepEqual(mixedLine(faces), [
+  ['Light regular heavier ', false, undefined, 200],
+  ['bold', true, 'FontName', 400],
+]);
+// Fixed pitch: declared by the program's post table or the descriptor's
+// flag, else measured from the advances of the glyphs in use; ten tabular
+// digits are too few to say.
+assert.equal(faceStyle(faces, 'Mono declared by the program')[3], true);
+assert.equal(faceStyle(faces, 'Mono measured from advances')[3], true);
+assert.equal(faceStyle(faces, 'Mo')[3], true);
+assert.equal(faceStyle(faces, 'Proportional by advances')[3], false);
+assert.equal(faceStyle(faces, '0123456789')[3], undefined);
+assert.ok(
+  [...faces, ...items].every(
+    i => i.boldSource === undefined || ['FontName', 'FontFlags', 'WeightClass', 'Painted'].includes(i.boldSource),
+  ),
+);
+assert.ok([...faces, ...items].every(i => i.fixedPitch === undefined || typeof i.fixedPitch === 'boolean'));
+assert.ok(items.every(i => i.isBold === (i.boldSource !== undefined)));
+
+// With boldFromWeight the plain 600 face is bold on the weight class's
+// account, the name and flags keep theirs, and the mixed line merges by the
+// verdict: the 600 run joins its bold-named neighbour.
+const facesOn = extractTextWithPositions(facesPdf, undefined, { boldFromWeight: true });
+assert.deepEqual(faceStyle(facesOn, 'Plain name, weight class 600'), [true, 'WeightClass', 600, false]);
+assert.equal(faceStyle(facesOn, 'Demi name, weight class 600')[1], 'FontName');
+assert.equal(faceStyle(facesOn, 'Bold name, weight class 400')[1], 'FontName');
+assert.equal(faceStyle(facesOn, 'Opaque name, bold selection, weight class 700')[1], 'FontFlags');
+assert.equal(faceStyle(facesOn, 'Painted heavier')[1], 'Painted');
+assert.deepEqual(mixedLine(facesOn), [
+  ['Light regular ', false, undefined, 200],
+  ['heavier bold', true, 'WeightClass', 600],
+]);
+// A threshold of 700 puts the plain 600 face back with the regular ones.
+const facesAt700 = extractTextWithPositions(facesPdf, undefined, { boldFromWeight: true, boldWeightThreshold: 700 });
+assert.deepEqual(faceStyle(facesAt700, 'Plain name, weight class 600'), [false, undefined, 600, false]);
+assert.equal(faceStyle(facesAt700, 'Demi name, weight class 600')[1], 'FontName');
+assert.deepEqual(mixedLine(facesAt700), mixedLine(faces));
+assert.deepEqual(facesOn.map(i => i.fixedPitch), faces.map(i => i.fixedPitch));
+console.log('  font metadata: OK');
+
+// --- text paint: fillColor, strokeColor and renderMode; document information ---
+console.log('Testing text paint and document information...');
+
+// One page with a red run, a stroked blue run, a run shown under a `3 Tr` set
+// before its text object, a line shown with `"`, a Form XObject's text under
+// the page's green fill, an image, a link annotation, a filled-in form field
+// and a few body lines; the information dictionary holds every text entry,
+// the title in UTF-16BE and the author in PDFDocEncoding.
+function paintPdf() {
+  const widths = `[${Array(256).fill('600').join(' ')}]`;
+  const content =
+    '1 0 0 rg BT /F1 12 Tf 72 700 Td (Red run) Tj ET\n' +
+    '0 0 1 RG 1 Tr BT /F1 12 Tf 72 680 Td (Outlined run) Tj ET\n' +
+    '0 g 3 Tr BT /F1 12 Tf 72 660 Td (Invisible run) Tj ET\n' +
+    '0 Tr BT /F1 12 Tf 14 TL 72 654 Td 2 0.5 (Quoted run) " ET\n' +
+    '0 1 0 rg q /X1 Do Q\n' +
+    'q 20 0 0 20 400 700 cm /Im1 Do Q\n' +
+    // Body lines: a page that draws an image needs ten text operators or
+    // more to be read as a text page.
+    '0 g BT /F1 12 Tf 12 TL 72 430 Td (Body line one) Tj (Body line two) \' (Body line three) \'\n' +
+    '(Body line four) \' (Body line five) \' (Body line six) \' (Body line seven) \' ET';
+  const form = 'BT /F1 12 Tf 72 600 Td (Form run) Tj ET';
+  const utf16 = text => `<FEFF${Buffer.from(text, 'utf16le').swap16().toString('hex').toUpperCase()}>`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [10 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /X1 6 0 R /Im1 8 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R] >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+    `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0 /LastChar 255 /Widths ${widths} >>`,
+    `<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Length ${Buffer.byteLength(form)} >>\nstream\n${form}\nendstream`,
+    `<< /Title ${utf16('Quarterly – Q3')} /Author (José) /Subject (Paint and render modes) /Keywords (colour, visibility) /Creator (Test Writer) /Producer (Test Library) /CreationDate (D:20240115103000Z) /ModDate (D:20240116090000Z) >>`,
+    '<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\u0080\nendstream',
+    '<< /Type /Annot /Subtype /Link /Rect [72 500 200 520] /Border [0 0 0] /A << /S /URI /URI (https://example.com/report) >> >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (Jane Doe) /Rect [72 450 272 470] /P 3 0 R >>',
+  ];
+  let pdf = '%PDF-1.7\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf, 'latin1'));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf, 'latin1');
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R /Info 7 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+const paintItems = extractTextWithPositions(paintPdf());
+const paintOf = text => {
+  const found = paintItems.find(i => i.text === text);
+  assert.ok(found, `${text} missing: ${JSON.stringify(paintItems.map(i => i.text))}`);
+  return [found.fillColor, found.strokeColor, found.renderMode];
+};
+assert.deepEqual(paintOf('Red run'), [[255, 0, 0], [0, 0, 0], 0]);
+assert.deepEqual(paintOf('Outlined run'), [[255, 0, 0], [0, 0, 255], 1]);
+// Extracted as it always was, and reported as painting nothing.
+assert.deepEqual(paintOf('Invisible run'), [[0, 0, 0], [0, 0, 255], 3]);
+assert.deepEqual(paintOf('Quoted run'), [[0, 0, 0], [0, 0, 255], 0]);
+assert.deepEqual(paintOf('Form run'), [[0, 255, 0], [0, 0, 255], 0]);
+// Image, link and form-field items carry none of the three.
+const nonText = paintItems.filter(i => i.itemType !== 'Text');
+for (const type of ['Image', 'Link', 'FormField']) {
+  assert.ok(nonText.some(i => i.itemType === type), `no ${type} item in ${JSON.stringify(nonText)}`);
+}
+for (const item of nonText) {
+  assert.equal(item.fillColor, undefined, item.itemType);
+  assert.equal(item.strokeColor, undefined, item.itemType);
+  assert.equal(item.renderMode, undefined, item.itemType);
+}
+// Text from the fixture reports all three.
+const fixtureText = items.filter(i => i.itemType === 'Text');
+assert.ok(fixtureText.length > 0);
+for (const item of fixtureText) {
+  for (const color of [item.fillColor, item.strokeColor]) {
+    assert.ok(Array.isArray(color) && color.length === 3, JSON.stringify(item));
+    assert.ok(color.every(c => Number.isInteger(c) && c >= 0 && c <= 255), JSON.stringify(item));
+  }
+  assert.ok(Number.isInteger(item.renderMode) && item.renderMode >= 0 && item.renderMode <= 7);
+}
+
+const infoResult = processPdf(paintPdf());
+assert.equal(infoResult.title, 'Quarterly – Q3');
+assert.equal(infoResult.author, 'José');
+assert.equal(infoResult.subject, 'Paint and render modes');
+assert.equal(infoResult.keywords, 'colour, visibility');
+assert.equal(infoResult.creator, 'Test Writer');
+assert.equal(infoResult.producer, 'Test Library');
+assert.equal(infoResult.creationDate, 'D:20240115103000Z');
+assert.equal(infoResult.modDate, 'D:20240116090000Z');
+assert.ok(infoResult.markdown.includes('Quoted run'));
+const taggedInfo = detectPdf(taggedFixture);
+assert.equal(taggedInfo.title, 'Firecrawl Documentation - API Reference');
+assert.equal(taggedInfo.author, 'Firecrawl');
+assert.equal(taggedInfo.creationDate, 'D:20260318031744Z');
+// Entries the document does not have are omitted: the fixture's
+// information dictionary holds only a producer.
+const producerOnly = detectPdf(fixture);
+assert.equal(producerOnly.producer, 'pypdf');
+for (const key of ['title', 'author', 'subject', 'keywords', 'creator', 'creationDate', 'modDate']) {
+  assert.equal(producerOnly[key], undefined, key);
+}
+console.log('  text paint and document information: OK');
 
 // --- Error handling ---
 console.log('Testing error handling...');

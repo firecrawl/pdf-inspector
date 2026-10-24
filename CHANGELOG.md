@@ -1,0 +1,932 @@
+# Changelog
+
+Notable changes to pdf-inspector. Every distribution (Rust crate, Python
+package, Node package and platform packages, WebAssembly package) shares one
+version. A separate release pull request bumps the manifests with
+`scripts/version.py` and renames the `Unreleased` section below to that
+version and date. Earlier releases are described in their
+[GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
+
+## [Unreleased]
+
+### Fixed
+
+- A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
+  comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
+  read through the Windows variant of the standard glyph order. That
+  variant leaves out the Macintosh no-break space (172) and `apple` (210)
+  and has the euro sign in the place of the currency sign, so the two
+  orders diverge from glyph 172 on, and the Macintosh order read those
+  glyphs as their neighbours: `“N/A”` as `—N/A“`, `company’s` as
+  `company‘s` and en dashes as `œ`. The font's
+  own advances choose the variant, since an accented letter advances like
+  its base letter.
+- A glyph in such a subset past the standard order that paints nothing but
+  advances reads as a space. Word justifies lines with Arial's en and em
+  spaces, which came out as U+FFFD between every word
+  (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+
+## [1.25.2] - 2026-09-28
+
+Changes since 1.25.1.
+
+### Fixed
+
+- A super- or subscript run is sized by its letters and digits. A sign
+  set from a symbol font a design size above them, as TeX sets the minus
+  of an exponent, took the run past the size a script may have, so an
+  exponent that reads its minus sign lost its `<sup>` markup. A run of
+  signs alone, and one whose signs are more than a quarter larger than
+  its letters and digits, are still sized by their largest glyph.
+  ([#603](https://github.com/firecrawl/pdf-inspector/pull/603))
+- The ToUnicode CMap of a subset font is no longer repaired where the font
+  shows it right as written. The repair through a `/CIDToGIDMap`, which
+  takes the CMap to be keyed by glyph index, is skipped when the CMap has
+  entries for more of the codes the map sends to other glyphs than for
+  those glyphs' indexes. A CMap keyed by code, as the specification has
+  it, was read through the map wherever the repair read a string better,
+  so a quoted word shown as one string read as other letters (`“me”` as
+  `yaYz`) and table cells lost their `%` and `$` signs. The renumbering of
+  a subset whose width array looks renumbered is skipped when the embedded
+  program, where it says what its glyphs are, reads more of the codes as
+  the CMap has them than as renumbered: a subset that kept its glyph
+  indexes read `(2)(4)` as `041061`.
+  ([#605](https://github.com/firecrawl/pdf-inspector/pull/605))
+
+## [1.25.1] - 2026-09-27
+
+Changes since 1.25.0.
+
+### Fixed
+
+- Simple fonts (Type1, TrueType, Type3) read one byte per code when their
+  ToUnicode CMap declares a two-byte codespace. A CMap written with
+  `<0000> <FFFF>` over one-byte entries, one of them spelled in four hex
+  digits (which kept the CMap two bytes wide), paired the bytes of each
+  even-length string into codes it has no entry for, so text shown as a
+  kerned run of short strings lost every two-byte string: `Income
+  Statement` read as `Iometatent`. The check for a stale ToUnicode CMap on
+  a Type1 font now judges a CMap declared this way too, and the page
+  detector counts such a font's text byte by byte as well. Composite
+  (Type0) fonts keep reading their codes as their CMap says.
+  ([#595](https://github.com/firecrawl/pdf-inspector/pull/595))
+- A Type1 font whose `/Encoding` names no base encoding (none at all, or
+  an encoding dictionary without `/BaseEncoding`) reads through the
+  built-in encoding of its embedded program, which PDF 32000-1:2008
+  (Table 114) makes the base of such a font. TeX's fonts carry their layout
+  in the program and have no `/Encoding`, so their ligatures (`efficiency`
+  read as `eciency`), curly quotes and dashes (`{` read for an en dash)
+  and math symbols (`2` read for `∈`, `f` and `g` for braces, nothing for a
+  minus sign) now read as the glyphs the program names. A ToUnicode CMap,
+  the `/Differences` and a base encoding the font names still come first.
+  A program whose encoding cannot be read, and a glyph name that does not
+  read or reads as a private code point or a lone combining mark, leave
+  their codes as they were read; a code the program leaves at `.notdef`,
+  other than the word space (code 32), has no glyph and reads as nothing,
+  except in a font where nothing else reads (no name that reads, no base
+  encoding, no blank glyphs), which reads as before.
+  ([#596](https://github.com/firecrawl/pdf-inspector/pull/596))
+- The base-14 width fallback (a standard font without `/Widths`) measures
+  the codes of a font the decoder reads without an encoding, one whose
+  `/Differences` or embedded program give only glyph names that do not
+  read (`/=`, `/;`) and that has neither a base encoding nor blank glyphs,
+  as the single-byte characters those codes read as, rather than giving
+  them no width.
+  ([#596](https://github.com/firecrawl/pdf-inspector/pull/596))
+- A string of one or two glyphs shown in a subset font whose ToUnicode
+  CMap has a repaired counterpart (rebuilt through the font's
+  `/CIDToGIDMap`, or renumbered for a renumbered subset) reads through the
+  repair, before the font's choice between the two, only when the repair
+  reads it better without counting short common words. Such a string is
+  too short for them to be evidence, and a wrong repair spells them by
+  chance: a glyph read as `a` where the CMap reads `m`, `-` or `—`, or a
+  pair read as `aT` where it reads `re`, took the repair (`engagement` read
+  as `engageaent`, `AND` as `ANa`, `Three` as `ThaTe`). Longer strings, and
+  the font's choice over its first strings, weigh every common word as
+  before.
+  ([#597](https://github.com/firecrawl/pdf-inspector/pull/597))
+
+## [1.25.0] - 2026-09-25
+
+Changes since 1.24.0.
+
+### Added
+
+- Node: `extractTextWithPositionsAsync`, the async variant of
+  `extractTextWithPositions`. It takes the same arguments and returns the
+  same items, but the extraction runs on the libuv thread pool instead of
+  the event loop, so a slow page no longer blocks the caller's process.
+  Invalid options throw when the call is made, as in the sync call, and the
+  buffer is copied before the call returns.
+  ([#592](https://github.com/firecrawl/pdf-inspector/pull/592))
+
+### Fixed
+
+- Underline and strikeout detection no longer takes quadratic time on pages
+  drawn from many thin filled rects or short strokes. Every such shape is a
+  rule candidate, and each candidate was compared with every other one
+  before anything looked at the text; a page of vector art made of about
+  200,000 thin rects and 25 text items took about 40 s. Only rules that fall
+  in the underline window or strike band of a text item are classified now,
+  with every rule still counted in the repetition checks, so the marks are
+  unchanged and that page takes under 0.5 s. `extractTextWithPositions` and
+  the Markdown extraction paths both run this pass.
+  ([#592](https://github.com/firecrawl/pdf-inspector/pull/592))
+- The `@firecrawl/pdf-inspector-linux-x64-gnu` Node binary loads on glibc
+  2.17 and later again. Since 1.13.0 it was built on the release runner's own
+  glibc and required GLIBC_2.35, so it failed with `ERR_DLOPEN_FAILED` on
+  Amazon Linux 2023 (the managed AWS Lambda Node runtimes), RHEL 9 and
+  Debian 11. It is now cross-built like the arm64 gnu binary, and the
+  release checks every gnu binary's glibc floor before publishing.
+  ([#586](https://github.com/firecrawl/pdf-inspector/pull/586))
+
+## [1.24.0] - 2026-09-22
+
+Changes since 1.23.0.
+
+### Added
+
+- `TextItem::fill_color`, `TextItem::stroke_color` and
+  `TextItem::render_mode`: the paint each run was shown with, so a caller can
+  read the colour of a run and tell visible text from invisible text. The
+  colours are the graphics state's non-stroking and stroking colours as 8-bit
+  sRGB `[red, green, blue]`: DeviceRGB read as sRGB, DeviceGray as three
+  equal components, DeviceCMYK converted the way the PDF specification
+  converts it to DeviceRGB (each channel `1 - min(1, ink + black)`), an
+  ICCBased space read as the device space of its component count (1, 3 or 4)
+  without applying the profile, and an Indexed space (`/Indexed`, or its
+  abbreviation `/I`) through its palette's base space, which another colour
+  space resource may name; components outside their range are clamped, and
+  `cs`/`CS` start a space at the initial colour the specification gives it
+  (black, but white for a four-component ICCBased space, whose components
+  all start at 0). A colour is `None`
+  for Separation, DeviceN, Pattern and the CIE-based spaces, after a colour
+  operator whose operands do not fit its space, and for image, link,
+  form-field and OCR items. `render_mode` is the `Tr` mode, `0..=7` — 3
+  (invisible, the mode of OCR text layers) and 7 (clipping only) put no
+  glyphs on the page — and a `Tr` whose operand is not an integer in that
+  range is ignored. The paint is graphics state: it holds across text
+  objects, `q`/`Q` save and restore it, a Form XObject starts with the paint
+  it was invoked under, and an ActualText span reports the paint of its first
+  painted glyph (see below for its weight). Reporting it leaves extraction as
+  it was: no run is dropped
+  or kept on its account, markdown is unchanged, and an item merged from
+  several runs keeps its first run's values. Node `fillColor` and
+  `strokeColor` (`[number, number, number]`) and `renderMode`, Python
+  `fill_color` and `stroke_color` (`tuple[int, int, int]`) and `render_mode`,
+  and the `pdf2md --items-json` fields `fill_color`, `stroke_color` (`[r,g,b]`
+  or `null`) and `render_mode` report the same values.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- The document information dictionary's `/Author`, `/Subject`, `/Keywords`,
+  `/Creator`, `/Producer`, `/CreationDate` and `/ModDate`, beside its
+  `/Title`: `PdfProcessResult` and `PdfTypeResult` fields `author`,
+  `subject`, `keywords`, `creator`, `producer`, `creation_date` and
+  `mod_date`, the dates as written (`D:20240115103000+01'00'`), each `None`
+  when the entry is missing or not a string. Node and WebAssembly `author`,
+  `subject`, `keywords`, `creator`, `producer`, `creationDate` and `modDate`,
+  Python attributes named like the Rust fields, and the members `title`
+  through `mod_date` (`null` when absent) of the JSON `pdf2md --json` prints
+  in every mode and `detect-pdf --json` prints with and without `--analyze`
+  report the same values. Every entry, the title included, is decoded as a
+  PDF text string: UTF-16BE after its byte order mark, UTF-8 after its mark
+  (PDF 2.0) and PDFDocEncoding otherwise, with UTF-16LE after `FF FE` and
+  valid UTF-8 written without a mark read as such, and language escapes and
+  trailing NULs dropped. XMP metadata is not read.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `fill_color`,
+  `stroke_color` and `render_mode` fields (`None` for items that don't come
+  from a content-stream show operator), and `PdfProcessResult` and
+  `PdfTypeResult` literals the new document information fields.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+
+### Fixed
+
+- Text a page's content stream shows with the `"` operator (`aw ac string
+  "`: set the word spacing to `aw` and the character spacing to `ac`, move to
+  the next line and show `string`) inside a text object is extracted, as it
+  already was inside Form XObjects; outside a text object the operator is
+  ignored, as `Tj` and `TJ` are there. The page parser skipped the operator
+  altogether, so the string was missing from the output and the spacing and
+  the line move it makes were lost for the text shown after it.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- An ActualText span is bold on its paint's account (text filled and
+  stroked to look heavier) when its first painted glyph was painted that
+  way, the paint its colours and render mode are reported from. The paint in
+  force at the span's end decided, so a render mode, line width or colour
+  set after the span's glyphs and before its end made the replacement text
+  bold, or plain, whatever painted the glyphs.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- The document's `/Title` is decoded as a PDF text string, like the entries
+  added above. A title in PDFDocEncoding read with U+FFFD in place of its
+  accented letters and of the encoding's typographic punctuation, euro sign
+  and ligatures whenever its bytes were not valid UTF-8, and one in UTF-16LE
+  after `FF FE` read as mojibake; a title given by reference to a string
+  object, or in an information dictionary written in place of a reference,
+  was not read at all. Titles in UTF-16BE or valid UTF-8 read as before,
+  without a UTF-8 byte order mark, language escapes or the NULs some
+  producers pad a string's end with.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- Two lines of small type whose baselines lay less than 5 pt apart — a
+  stacked table header at 4.7 pt on a 4.5 pt pitch — fell into one line,
+  and shown glyph by glyph, as kerned small type is, their glyphs
+  interleaved along the baseline into words zipped from both lines.
+  A fragment now joins a line when it lies within that 5 pt window of the
+  line's first fragment, as before, and within 0.6 em of the larger of its
+  own type size and that of a fragment already on the line — no farther
+  than the smaller of the two — so two fragments of 8⅓ pt and
+  above group exactly as they did, a raised or lowered mark, displaced by
+  less than its own em, stays with its line, type of any size pulls a
+  fragment of smaller type no farther than that fragment's em, and the two
+  lines above stay apart. A fragment without a type size, and an image,
+  keeps the 5 pt window.
+  ([#580](https://github.com/firecrawl/pdf-inspector/pull/580))
+
+## [1.23.0] - 2026-09-21
+
+Changes since 1.22.1.
+
+### Added
+
+- `PdfProcessResult::cmap_gaps`: the fonts whose ToUnicode CMap (or, for a
+  font without one, the embedded program's cmap table) had no entry for
+  some of the codes the document shows through it, each a
+  `FontCMapGaps` with the font's `/BaseFont` name (or its resource name
+  when it has none) and the counts of `codes` shown, `interpolated` (read
+  from the mapped codes around them, see below) and `unmapped` (left as
+  U+FFFD). The list is always empty in `ProcessMode::DetectOnly`
+  (`detect_pdf`, `detectPdf`, `detect-pdf` without `--analyze`), which
+  decodes no text, and otherwise empty when every such code had an entry.
+  Node `cmapGaps` (`FontCmapGaps[]`), Python `cmap_gaps`
+  (`list[FontCMapGaps]`), the WebAssembly result's `cmapGaps` and the
+  `pdf2md --json` and `detect-pdf --analyze --json` field `cmap_gaps` report
+  the same list.
+  ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
+
+### Fixed
+
+- A Form XObject whose `/BBox` holds numerals too large for any parser —
+  a re-save that wraps a page's content in a form writes the box as
+  ±(DBL_MAX / 2) in full, 308-digit integers meaning "unbounded" — no
+  longer drops out of the document: such numerals are saturated, in the
+  file's bytes and in place, to the extent a zero-area box is widened to,
+  before the document is read, so the page's text is extracted and the OCR
+  pipeline renders it. The page came out empty and was routed to OCR, and
+  its render was blank. A box the form refers to (`/BBox n 0 R`) that sits
+  in an object stream is repaired in the stream's decoded bytes and read
+  back into the document. The Rust-only `widen_degenerate_form_bboxes_mem`
+  (the Python, Node and WebAssembly bindings do not expose it) hands the
+  repaired bytes to callers that render elsewhere, as for a zero-area box.
+  ([#560](https://github.com/firecrawl/pdf-inspector/pull/560))
+- Right-to-left text whose runs are shown in reading order — right to left
+  across the line, one text object per run — while each run's glyphs are
+  stored in visual order with forward advances now reads forwards; every
+  word of such a page came out backwards. The page's storage vote counts
+  each visible run of two or more right-to-left letters painted forwards as
+  visual storage, since a run meant to be read can only display correctly
+  when stored that way, so the order of the runs across the line no longer
+  reads as logical storage on its own. A text layer that stores its words in
+  logical order keeps that reading when it is invisible (text render mode
+  3), the convention of OCR layers; the same words shown visibly would
+  display backwards, and such a page now reads as visual storage like any
+  other visible page.
+  ([#561](https://github.com/firecrawl/pdf-inspector/pull/561))
+- A simple font whose glyphs were re-encoded — a re-distilled file gives
+  the glyphs of its Type1C subsets new codes from 33 upwards, named in
+  `/Differences` (`uni0628.i`, `uni064A.m`, `five.tnum`) — but which kept
+  the original font's ToUnicode CMap reads those codes by their names. The
+  old CMap won wherever a new code landed on a slot it maps, so a letter at
+  a bracket slot read as the bracket (mirrored, as a CMap written for a
+  right-to-left line describes it), a five at the apostrophe slot as `’`, a
+  letter the old CMap never mapped at all as its ASCII slot, and a mark
+  glyph whose name spells no character (`arHamzaAboveCCMP`) as a stray `i`.
+  The existing repair of such fonts now takes a mirrored bracket or the
+  StandardEncoding character of a slot as the slot's own entry; accepts as
+  proof that the CMap is stale, besides the three corroborated letters it
+  required, a CMap most of whose codes lie outside the font's
+  `FirstChar`..`LastChar` range whose entries the names contradict at the
+  named slots it does describe — at every one of them when it shares few
+  slots with the font, at a majority and three at least when it shares
+  many; and once the CMap is proven stale repairs every such slot whose
+  name reads as a letter outside ASCII, a no-break space, a ligature, or
+  an ASCII letter or digit other than the slot's — or as nothing, for a
+  name that spells no character. A font whose CMap agrees with its
+  Differences is untouched.
+  ([#562](https://github.com/firecrawl/pdf-inspector/pull/562))
+- A code that reads as several characters of a right-to-left script — a
+  ligature glyph named `uni06440627` (lam-alef), or mapped to two code
+  points by the ToUnicode CMap — came out with those characters reversed on
+  a page whose text is stored in visual order: the read-back into logical
+  order turned every character round on its own. The characters one glyph
+  reads as are now turned round together and keep the order they were
+  named in.
+  ([#562](https://github.com/firecrawl/pdf-inspector/pull/562))
+- A spacing accent shown as a text object of its own over a letter — the
+  way some producers set an accented letter: the run up to the letter, one
+  glyph of `macron`, `acute`, `caron` or another accent the standard Latin
+  encodings carry with an advance of its own, placed by its own text matrix
+  over the letter, and the run from the letter on — is composed with that
+  letter (`o` and a macron read `ō`) and dropped as a fragment. Its origin
+  lies a fraction of a point right of the run it decorates, so the line's
+  fragments sorted along the baseline put it after that whole run: the text
+  read with a stray accent a word on and the letter bare. The accent is
+  matched only against the fragments shown just before and just after it,
+  over the last glyph of the one or the first glyph of the other, when both
+  are level, measured runs without right-to-left letters, neither carries
+  an ActualText replacement, their baselines lie within 0.3 em and the
+  accent's centre falls within that glyph's advance (estimated from the
+  run's width, whitespace counted at 0.28 em — at the run's uniform advance
+  for a fixed-pitch face — and the glyph at no less than 0.6 em, with a
+  quarter of the accent's own width of play beyond the run's edge for an
+  accent overhanging a narrow letter), and only when Unicode has one
+  character for the pair (a dotless
+  i or j under the accent composes as the dotted letter). A circumflex or
+  grave standing beside its neighbours rather than over them, as in code or
+  mathematics, is left as shown.
+  ([#563](https://github.com/firecrawl/pdf-inspector/pull/563))
+- A dependent sign — a vowel sign, a subscript letter, an accent — that its
+  font gives no advance and that the producer places over the glyph before
+  it with a backward `TJ` offset, returning the pen with a forward one
+  before the next glyph, no longer reads as a word gap: a forward offset
+  counts only for its travel beyond the farthest the pen has been in the
+  array, and only while the pen has shown nothing but zero-advance glyphs
+  since it fell behind that mark. A tracked run keeps its tracking across
+  such a sign. Such a sign shown as a run of its own (`Tm` and `Tj` per
+  glyph) no longer opens a word gap either: the fragment after it is
+  measured from where the glyph under it left the pen, and a sign whose
+  origin lies within that glyph's advance stays after it when the line's
+  fragments are sorted, where a base kerned in ahead of the pen displaced
+  it. A word set in such a script came out with a space before most of its
+  signs, and now and then with a sign shuffled past its neighbour. Arrays
+  without zero-advance glyphs, and producers that position right-to-left
+  text with real backtracks past painted letters, read as before.
+  ([#564](https://github.com/firecrawl/pdf-inspector/pull/564))
+- A scanned page whose producer added a text layer nobody sees — an image
+  drawn over at least half of the page, then hundreds of text-showing
+  operators under text render mode 3 (invisible) or 7 (clip only) — was
+  classified as a text page, because the operator count never consulted
+  the render mode; its raster went unread and the layer, which need not
+  say what the page shows, was served as the page. Classification now
+  follows `Tr` and `cm` through `q`/`Q`, and through the Form XObjects
+  the content invokes with `Do` (at each invocation, clipped to the
+  form's `/BBox`), and flags a page whose every executed text-showing
+  operator leaves nothing to see, while the images it draws — tallied on
+  a grid over the page, so a scan tiled into strips counts — cover at
+  least half of it (each draw clipped to the page and to the rectangular
+  clipping path in force, a clip of any other shape by its box; an inline
+  image the content draws counts as an image — for whether the page has
+  any at all as well — and so does a path filled or stroked with a tiling
+  pattern whose cell draws one; images bound but never drawn, and
+  forms never invoked, do not count; a page whose forms outrun the scan's
+  budget of invocations or of bytes executed, or whose graphics state
+  nests deeper than the scan follows, is not flagged), for OCR
+  with the new reason `invisible_text_layer`
+  (`OCR_REASON_INVISIBLE_TEXT_LAYER`): the reason appears in
+  `pages_needing_ocr`/`ocr_reasons_by_page` and in the per-page
+  `needs_ocr`/`ocr_reason`, for the pages a sample left out as well, and
+  first among a page's reasons on both surfaces; the classification
+  (`pdf_type`) changes in response. Mode-7 text that an
+  image, a shading, a painted path or visible text is later drawn through
+  — a title filled with a picture — is visible and not counted, its
+  glyphs placed by the text-positioning operators and the font size
+  (text placed by neither is shown by any paint within the clip); paint
+  that misses the glyphs shows nothing through them, nor does a form that
+  paints nothing, or a draw off the page or clipped away. Operators are
+  read past
+  strings, comments and inline image data, and whether or not whitespace
+  follows them, so text saying `3 Tr` sets no render mode and `(a)Tj(b)Tj`
+  shows twice; text shown with the `'` and `"` operators counts as text,
+  here and in the text-operator tallies, which had always missed it,
+  while a show operator with nothing to show does not count in either;
+  a name written with `#xx` escapes (`/Im#30 Do`) finds the resource it
+  names, NUL separates operands as the other whitespace bytes do, and
+  unfiltered inline image data is skipped by the length its header gives,
+  so that an `EI` among its bytes ends nothing.
+  A page whose layer is painted, a page with a visible
+  caption over its image, invisible text with no image under it and an
+  image with no text keep their classification and reasons; what is
+  extracted is unchanged.
+  ([#566](https://github.com/firecrawl/pdf-inspector/pull/566))
+- A two-byte code of a CID-keyed font whose ToUnicode CMap has no entry for
+  it is read from the mapped codes around it when they spell it out: a CMap
+  mapping code 36 to `A` and code 38 to `C` says code 37 is `B`, for a gap
+  inside a run of digits, of upper-case or of lower-case letters of one
+  script whose code points lie exactly as far apart as the codes and whose
+  entries rise with their codes, as the glyph order of most fonts does. Such
+  codes came out as nothing, so a word set with one lost its letters while
+  the document still read as clean text. A gap next to punctuation, across
+  a change of case or of script, at the edge of the mapped codes, beside an
+  entry of several characters or in a CMap whose entries do not follow the
+  alphabet is not read; such a code is now a U+FFFD in the text instead of
+  nothing, as a code of a CID font whose CMap cannot be read at all already
+  was, so the loss stays visible and `has_encoding_issues` reports it.
+  ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
+- A ToUnicode entry whose destination is a control character — U+0001–U+001F
+  other than TAB, LF and CR, or DEL — maps its code to no text, and the code
+  counts as unmapped. Some producers write a glyph's own index in place of
+  its character (a ligature glyph at index 18 gets `<0012> <0012>`, a space
+  glyph at index 1 `<0001> <0001>`); the control character it decoded to
+  was stripped later without a trace, so a word set with such a ligature
+  lost its letters, words set around such a space ran together, and the
+  document read as clean text. The code now reads through what the font
+  itself says of it — the embedded program's glyph name (`f_f`, `ff`) or
+  cmap entry, its `/Differences` name, the encoding a simple font declares
+  by name, or a space for a CIDFont glyph with no outline but an advance —
+  and as U+FFFD otherwise, so the loss is marked where it happens and
+  `has_encoding_issues` reports it; a single-byte code so mapped is no
+  longer guessed from its byte value. Entries that map to TAB, LF or CR, and
+  CMaps without such entries, read as before.
+  ([#567](https://github.com/firecrawl/pdf-inspector/pull/567))
+- `pdf2md` and `detect-pdf` read the PDF path as the first argument that
+  is not an option, so flags may come before or after it (`--` ends option
+  parsing), and a missing input names the path that could not be opened —
+  `detect-pdf --json document.pdf` used to open `--json` as the file. The
+  built-in CMaps are compiled into the binary instead of being read from
+  the crate checkout at run time, which `cargo install` binaries and
+  published wheels do not have; `PDF_INSPECTOR_BCMAPS_DIR` still overrides
+  them.
+  ([#570](https://github.com/firecrawl/pdf-inspector/pull/570))
+
+## [1.22.1] - 2026-09-20
+
+Changes since 1.22.0.
+
+### Fixed
+
+- Glyph names that spell a ligature by its components (`f_t`, `f_f_i`,
+  `T_h`), as a `uni` sequence of several code points (`uni00660069`) or
+  with a suffix (`a.sc`, `f_i.liga`) decode to the letters they stand for,
+  per the Adobe Glyph List Specification, in a font's `/Differences` and in
+  an embedded program's own glyph names; they came out as nothing, so a word
+  set with such a ligature lost its letters. A name that still cannot be
+  read keeps reading as nothing, and a code named more than once keeps its
+  last name, whatever kind of name it is. The width fallback for the
+  standard 14 fonts gives such a code the width of the letters it spells.
+  ([#558](https://github.com/firecrawl/pdf-inspector/pull/558))
+
+## [1.22.0] - 2026-09-20
+
+Changes since 1.21.0.
+
+### Added
+
+- `TextItem::bold_source`: where `is_bold` came from, so a caller can weigh
+  the verdict against `font_weight` — `BoldSource::FontName` (a bold word or
+  foundry style abbreviation in the font name), `FontFlags` (the
+  FontDescriptor's ForceBold flag or the embedded program's bold selection),
+  `WeightClass` (the weight class, with `bold_from_weight`) or `Painted`
+  (text filled and stroked to look heavier), the first of them in that order
+  when more than one says bold; `None` when `is_bold` is `false`. A face
+  whose name says Bold over a weight class of 400 reports `FontName`, a
+  600 face that is bold only by the option `WeightClass`. Node `boldSource`
+  (`"FontName"`, `"FontFlags"`, `"WeightClass"`, `"Painted"`, omitted when
+  there is none), Python `bold_source` (`"font_name"`, `"font_flags"`,
+  `"weight_class"`, `"painted"` or `None`) and the `pdf2md --items-json`
+  field `bold_source` report the same value.
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+- `TextItem::fixed_pitch`: whether the font is monospaced. `Some(true)` when
+  the FontDescriptor's FixedPitch flag or the embedded program's `post`
+  table says so; else measured from the font's width table, `Some(true)`
+  when a dozen or more of its glyphs share one advance and `Some(false)`
+  when two differ; `None` when the font declares nothing and no two
+  advances differ but fewer than a dozen share one (ten tabular digits are
+  too few), and for image, link and form-field items. Many producers write `/Flags 4` whatever the
+  face, so the flag is only ever read as a yes. Node `fixedPitch` (omitted
+  when unknown), Python `fixed_pitch` and the items JSON field
+  `fixed_pitch` report the same value.
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+- `PositionOptions::bold_weight_threshold`: the weight class from which
+  `bold_from_weight` reads bold, on the 100..=900 scale, 600 by default —
+  what the option always did. Rust `PositionOptions::bold_weight_threshold(700)`,
+  Node `{ boldFromWeight: true, boldWeightThreshold: 700 }` and Python
+  `bold_weight_threshold=700` on the same functions that take
+  `bold_from_weight`. Read only when the option is on; Node and Python
+  reject a value outside 100..900, Rust clamps it into the scale.
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+- `tests/fixtures/font_metadata_faces.pdf`, generated by
+  `scripts/make_font_metadata_fixtures.py` from renamed subsets of the
+  DejaVu fonts (their licence is reproduced in
+  `tests/fixtures/FONT_LICENSES.md`): faces whose names, OS/2 weight
+  classes, bold selections, descriptor flags and width tables each make one
+  point about the metadata above, exercised by the Rust, Node and Python
+  tests.
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+- Rust `widen_degenerate_form_bboxes_mem(bytes)`: the document re-serialized
+  with the zero-area `/BBox` of its Form XObjects widened, or `None` when no
+  form needs it and for an encrypted document, for callers that render the
+  document with their own renderer. The Python, Node and WebAssembly
+  bindings do not expose it.
+  ([#550](https://github.com/firecrawl/pdf-inspector/pull/550))
+
+### Fixed
+
+- Right-to-left text stored in visual order now reads back through the
+  Unicode Bidirectional Algorithm, line by line. A Hebrew or Arabic word
+  came out with its letters mirrored when the line also held a number, a
+  Latin phrase or punctuation. A colon, a period or a percent sign next to
+  a number landed on the wrong side of it. Embedded Latin phrases and
+  numbers keep their own order, mirrored brackets turn back into the
+  characters that were written (by the Unicode mirroring data), and a line
+  of a Latin paragraph that quotes a right-to-left word keeps reading left
+  to right.
+  ([#552](https://github.com/firecrawl/pdf-inspector/pull/552))
+- Hebrew and Arabic text positioned one glyph per show operator merges into
+  words by the line's own gaps instead of taking a word space after every
+  glyph whose declared width falls short of its advance, so a word no
+  longer comes out as scattered letters.
+  ([#552](https://github.com/firecrawl/pdf-inspector/pull/552))
+- Arabic (and Hebrew) presentation forms — the positional and ligature
+  code points that a font subsetted by glyph maps its glyphs to — are
+  normalized to the letters they stand for once the text is in reading
+  order, so a ligature's letters come out in order too.
+  ([#552](https://github.com/firecrawl/pdf-inspector/pull/552))
+- Tracked display text set as a `TJ` array with one glyph per string and
+  the letter spacing as the offset between them (`[(V) -250 (A) -250 (L) …]
+  TJ`) came out with a space between every letter. The offsets of such a
+  run are now judged over the run's own tracking, so letter gaps stay
+  inside the word and only a gap wider by a word space ends it. Words
+  positioned by offsets and kerned glyph runs read as before, on the page
+  and inside Form XObjects; so do one-letter words half a space width apart
+  or more, except a run of single capitals or digits set that wide, which
+  display tracking produces and which now reads as one word, as the merge
+  of separately shown glyphs already had it.
+  ([#548](https://github.com/firecrawl/pdf-inspector/pull/548))
+- A Form XObject whose `/BBox` has no area — `/BBox [0 0 0 0]` on a form
+  holding a page's content, a re-save pattern — is repaired when the
+  document is loaded: the box is widened to one that clips nothing, since
+  taken as written it hides the form entirely and a page drawn through it
+  comes out blank. The OCR pipeline renders the repaired document — a
+  decrypted copy, in memory, when the document is encrypted — so such a
+  page is no longer a blank render. A box with an area is left as written.
+  ([#550](https://github.com/firecrawl/pdf-inspector/pull/550))
+- A page of vector drawings whose text is shown through a CID-keyed font
+  with a ToUnicode CMap was reported as vector-outlined text (`vector_text`)
+  and routed to OCR: the rule counted the distinct letters and digits among
+  the bytes of the string operands, and the two-byte codes of such a font
+  are glyph indices. On those pages the text is now judged decoded: it is
+  the page's text when it shows as many distinct letters and digits as the
+  byte count asks of a simple font and the drawing stays under a hundred
+  path operators per character, so a paragraph beside a chart or a title
+  over an illustration is a text page, while a page of paths with a
+  caption's worth of text, a title and address line over outlined body
+  text, or a CMap that maps every code alike, still goes to OCR.
+  ([#551](https://github.com/firecrawl/pdf-inspector/pull/551))
+- A Form XObject whose content inflates past the page-content bound is now
+  skipped, as a page over it already was, instead of being decompressed in
+  full before the operator cap could apply; a ToUnicode CMap the detector
+  reads is bounded the same way as the loader's own streams.
+  ([#551](https://github.com/firecrawl/pdf-inspector/pull/551))
+
+- Simple fonts decode through their base encoding where their
+  `/Differences` say nothing: an encoding dictionary's `/BaseEncoding` now
+  applies whether or not the dictionary also carries `/Differences` (a
+  `/WinAnsiEncoding` or `/MacRomanEncoding` base without them decoded as
+  StandardEncoding, dropping or mistranslating accented letters), and the
+  standard Symbol and ZapfDingbats fonts read through their built-in
+  encodings instead of as the Latin letters at the same codes.
+  ([#553](https://github.com/firecrawl/pdf-inspector/pull/553))
+- Embedded fonts without a ToUnicode CMap decode through their glyph names
+  where a symbol cmap only offers private-use code points, so a glyph named
+  `uni03B1` or `alpha` reads as α rather than as the byte it was shown
+  with; `/Differences` names that are glyph indexes (`g12`, `glyph12`,
+  `index12`) resolve through the embedded font program.
+  ([#553](https://github.com/firecrawl/pdf-inspector/pull/553))
+
+### Changed
+
+- With `bold_from_weight`, adjacent runs are merged by the bold verdict
+  rather than by their weight classes: a run the weight makes bold stays
+  apart from its plain neighbours as before, while runs whose weights differ
+  but agree on bold — a 300 face beside a 400 one, or a 600 face beside a
+  bold-named 400 one — merge as they do without the option. Splitting on any
+  weight difference (unknown against 400 included) fragmented glued runs
+  and broke line recovery for callers.
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+- `is_bold_font`, and with it the default `is_bold`, recognises every name
+  the weight-class parser puts at 600 or heavier: "Demi", "Ultra", "Heavy"
+  and "Black" as whole words, the foundry style abbreviations "-Sb", "-Dm",
+  "-Hv", "-Blk", "-XBd" and "-Ult", and the weight digits "W6" to "W9". The
+  abbreviations are matched as whole tokens after the family name, in the
+  mixed case foundries write them, so "Bookman" is still not Book and "LT"
+  not Light. Faces such as a Franklin Gothic Demi or a Helvetica Neue Heavy
+  are bold by default, in the positioned items and in the Markdown output,
+  so every face the weight option calls bold the default flag calls bold
+  too; the flag's older reading of a Medium face as bold (weight class 500)
+  stays.
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+- Rust `TextItem` literals must include the new `bold_source` and
+  `fixed_pitch` fields (`None` when unknown).
+  ([#547](https://github.com/firecrawl/pdf-inspector/pull/547))
+
+## [1.21.0] - 2026-09-18
+
+Changes since 1.20.0.
+
+### Added
+
+- `TextItem::font_weight`: the font's weight class on the 100..=900 scale
+  (400 regular, 700 bold), read from the embedded font program's OS/2
+  `usWeightClass`, else the FontDescriptor's `/FontWeight`, else a weight word
+  in the font name, foundry abbreviations included ("Light", "Medium", "-Md",
+  "-Lt", "-Blk", "W6"); `None` when none of them says. Node `fontWeight`
+  (omitted when unknown), Python `font_weight` and the `pdf2md --items-json`
+  field `font_weight` report the same value. `is_bold` is unchanged.
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
+- An opt-in `bold_from_weight` on the positioned-text and region APIs, next
+  to the frame option: Rust `PositionOptions` with the `_with_options`
+  variants (`extract_text_with_positions_mem_with_options`,
+  `extract_text_with_positions_and_rotations_mem_with_options`,
+  `extract_text_in_regions_mem_with_options`,
+  `extract_tables_in_regions_mem_with_options`), Node `{ boldFromWeight: true }`
+  in the options of the same four functions, Python `bold_from_weight=True`
+  on `extract_text_with_positions`, `extract_text_with_positions_and_rotations`,
+  `extract_text_in_regions` and their `_bytes` variants. When on, `is_bold` is
+  also `true` for a weight class of 600 or more, and adjacent runs whose
+  weight class differs stay separate items instead of merging, so a heavier
+  run inside a lighter paragraph keeps its own item. Off by default, where
+  `is_bold` and item merging are unchanged.
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
+
+### Fixed
+
+- Text painted wholly outside the rectangular clip in force when it was
+  shown is no longer extracted. Such runs are invisible on the rendered page
+  — labels a charting library parks off its plot area, content the producer
+  cropped away — yet used to come back as ordinary text and leak into the
+  words around the figure, on every API. Only a single finite, axis-aligned
+  rectangle clip counts (nested `q`/`Q` and intersections of rectangles
+  included); text under a path, text-mode or turned clip is kept as before,
+  as are runs inside Form XObjects, rotated runs and runs whose advance is
+  unknown. A run has to lie a quarter of its height clear of the clip on
+  every side, so glyphs straddling an edge stay. Unlike render-mode-3 text,
+  the left-out runs are not an invisible layer that transcribes the page:
+  `include_invisible` does not bring them back, and a page whose every run
+  is clipped away reports no text, like an image-only page.
+  ([#539](https://github.com/firecrawl/pdf-inspector/pull/539))
+- A file whose `%PDF-` header is preceded by other bytes — an echoed
+  multipart envelope, a line of text — is no longer rejected as not a PDF,
+  on every API. The header is located within the first 1024 bytes, as
+  mupdf, pdfium and poppler do, and the file is read from there so its
+  cross-reference offsets stay exact; a canonical `%PDF-M.N` header line
+  outranks a version-like mention in the leading bytes. A byte order mark
+  or whitespace before the header was already tolerated, and a bare `%PDF`
+  without the dash is still not a header.
+  ([#538](https://github.com/firecrawl/pdf-inspector/pull/538))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `font_weight` field (`None`
+  for items whose weight class is unknown).
+  ([#536](https://github.com/firecrawl/pdf-inspector/pull/536))
+
+## [1.20.0] - 2026-09-14
+
+Changes since 1.19.0.
+
+### Added
+
+- An optional display frame for the positioned-text and region APIs. Rust
+  `extract_text_with_positions_mem_in_frame`,
+  `extract_text_with_positions_and_rotations_mem_in_frame`,
+  `extract_text_in_regions_mem_in_frame` and
+  `extract_tables_in_regions_mem_in_frame` take a `PositionFrame`; Node
+  `extractTextWithPositions`, `extractTextWithPositionsAndRotations`,
+  `extractTextInRegions` and `extractTablesInRegions` take an optional
+  `{ frame: "sheet" | "display" }`. `"display"` reports items in, and reads
+  region rects from, the rendered page — the visible page box turned clockwise
+  by the page's inheritable `/Rotate`, with the turn of a predominantly rotated
+  page undone — so boxes line up with a rendered page image. `"sheet"`, the
+  default, is unchanged. `extractTextWithPositionsAndRotations` also accepts
+  the same 1-indexed `pages` filter as `extractTextWithPositions`.
+  ([#533](https://github.com/firecrawl/pdf-inspector/pull/533))
+
+### Fixed
+
+- Preserve word spaces painted as separate whitespace runs squeezed by
+  negative character spacing, so adjacent words no longer merge.
+  ([#517](https://github.com/firecrawl/pdf-inspector/pull/517))
+- Read blank, advancing glyphs in symbolic TrueType fonts as word spaces
+  while preserving invisible text layers and formatting characters.
+  ([#521](https://github.com/firecrawl/pdf-inspector/pull/521))
+- Recover text from cmap-less TrueType subsets using standard Macintosh
+  glyph ordering when the embedded font's metrics corroborate the mapping.
+  ([#522](https://github.com/firecrawl/pdf-inspector/pull/522))
+- Decode painted glyphs when `ActualText` contains replacement characters,
+  and keep spaced or separately painted dot leaders with their text line.
+  ([#523](https://github.com/firecrawl/pdf-inspector/pull/523))
+- Start `TJ` sub-runs at their first painted glyph after leading positioning
+  offsets, correcting their bounds and the order of split words.
+  ([#527](https://github.com/firecrawl/pdf-inspector/pull/527))
+- Word spaces carried by character spacing instead of space glyphs — the two
+  glyphs around a word boundary shown as one string with a `Tc` as wide as a
+  word space, the spacing taken back with a positive `TJ` offset or by
+  positioning the next run — no longer glue their words together
+  ("sendtoMars"). Such a string reads with its spaces once the spacing after
+  it is seen to be taken back; tracked display text, whose spacing never is,
+  keeps its letters together.
+  ([#530](https://github.com/firecrawl/pdf-inspector/pull/530))
+- A contents page whose entries end in right-aligned page numbers without dot
+  leaders — an edited volume's table of contents with the chapter authors on
+  their own lines — is rendered as a contents list, one entry per line with
+  its page number tab-separated, instead of being read as a two-column page
+  whose titles and numbers interleave into a paragraph.
+  ([#493](https://github.com/firecrawl/pdf-inspector/pull/493))
+
+### Changed
+
+- Upgrade `lopdf` to 0.45.0 for improved recovery of malformed cross-reference
+  entries and `startxref` / `/Prev` offsets.
+  ([#534](https://github.com/firecrawl/pdf-inspector/pull/534))
+
+## [1.19.0] - 2026-09-09
+
+Changes since 1.18.0.
+
+### Added
+
+- Rust `TextItem::legacy_symbol_rewrite` and optional Node `legacySymbolRewrite`
+  identify text changed by legacy symbol cleanup. Merged and split items retain
+  this evidence; a false or absent marker does not guarantee decoding accuracy.
+  ([#519](https://github.com/firecrawl/pdf-inspector/pull/519))
+
+### Fixed
+
+- Preserve bold emphasis simulated by filling and stroking text, including
+  nested forms, and retain inline styling in long quoted prose.
+  ([#511](https://github.com/firecrawl/pdf-inspector/pull/511))
+- Apply horizontal text scaling (`Tz`) to bounds and advances, including
+  reflected text and nested forms, so scaled text lands in the correct region.
+  ([#510](https://github.com/firecrawl/pdf-inspector/pull/510))
+- Recover narrowly verified stale Unicode mappings in embedded subset fonts
+  while preserving valid semantic mappings and ligatures.
+  ([#516](https://github.com/firecrawl/pdf-inspector/pull/516))
+- Keep independently positioned text runs separate when their measured advances
+  lie inside distinct rectangular clipping regions, including visual-order RTL.
+  ([#518](https://github.com/firecrawl/pdf-inspector/pull/518))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `legacy_symbol_rewrite` field
+  (`false` for items without legacy symbol cleanup). The Node field is optional
+  and emitted only when cleanup changed a character.
+
+## [1.18.0] - 2026-09-07
+
+Changes since 1.17.0.
+
+### Added
+
+- `TextItem::baseline_shift`: signed offset, in points, of a superscript or
+  subscript glyph run from the baseline of the body text it is attached to
+  (positive = raised, negative = lowered, `0` for normal text). Exposed as
+  `baseline_shift` in the Python bindings and `pdf2md --items-json`, and as
+  `baselineShift` in the Node bindings, so consumers can emit `<sup>`/`<sub>`
+  themselves. `TextItem::line_y()` returns the body baseline a run belongs to
+  and `TextItem::is_script()` tells flagged runs apart.
+- `TextLine::text()` and `text_with_formatting()` wrap flagged runs in
+  `<sup>…</sup>` / `<sub>…</sub>` (`Yibo Yan<sup>1,2,3</sup>`,
+  `V<sub>f</sub>`, `10<sup>–15</sup>`), with word spacing decided by the
+  measured gap at the run's edges. Table cells render runs the same way
+  through one shared cell-text module, and items are assigned to cells by the
+  body baseline they belong to, so `V<sub>f</sub>` and `$1,234<sup>1</sup>`
+  survive inside tables too.
+- `tests/fixtures/cropbox_offset_origin.pdf`, a page whose CropBox origin is
+  not `(0, 0)`, with Rust, Node and Python tests pinning the shared coordinate
+  frame described under Changed.
+- `TextItem::rotation`: the run's baseline angle in degrees counter-clockwise,
+  in `[0, 360)` (`0` horizontal, `90` reading bottom-to-top, `270`
+  top-to-bottom, `180` upside-down), and `TextItem::advance_known`, which is
+  `false` only when the box's extent along the baseline is an estimate
+  because the font carries no width metrics. Both are exposed as `rotation` /
+  `advance_known` in the Python bindings and `pdf2md --items-json`, and as
+  `rotation` / `advanceKnown` in the Node bindings. Consumers that detected
+  rotated runs through `width == 0` should key off `rotation` instead.
+- `extract_text_with_positions_and_rotations_mem` (Node
+  `extractTextWithPositionsAndRotations`, Python
+  `extract_text_with_positions_and_rotations[_bytes]`) returns the items
+  together with the frame of every page whose text was predominantly rotated
+  and therefore turned (`PageRotation::Ccw` / `Cw`, now public).
+  `collect_text_in_region_in_frame` takes that frame explicitly, and
+  `RegionCoordSpace::Rotated90Cw` completes the region API for clockwise
+  pages.
+
+### Fixed
+
+- Object-stream decompression is bounded during loading with lopdf 0.44,
+  preventing excessive memory use. Oversized streams are skipped, and
+  documents with no readable pages fail cleanly.
+- Embedded TrueType fonts recover bold styling from `head.macStyle` when
+  OS/2 metadata is unavailable, while explicit OS/2 styling remains
+  authoritative. Word spacing and numeric continuity survive bold boundaries.
+- PDFs with 19-byte classic cross-reference entries ending in a bare LF or
+  CR now load through a repair pass instead of failing with `invalid file
+  trailer`.
+- Raised and lowered marker glyphs no longer form their own line. Line
+  grouping — the Markdown pipeline and `extract_text_in_regions`
+  (`extractTextInRegions`) alike — compares baselines through `line_y()`, so
+  affiliation markers 4–7pt above an author line, footnote references after
+  a sentence, and unit exponents (`kg/m³`) stay on the line they annotate.
+  Previously the whole marker run of an author block came out as an orphan
+  `,2,3,2,4,*` line above the names.
+- Script detection is geometric: a run is a sub/superscript when it is
+  0.4–0.75× the size of a tightly adjacent neighbor and sits at a real
+  baseline offset from it. Multi-glyph runs (`1` `,` `2` `,` `3`, `2,*`,
+  `1)`, `th`, `max`) are recognised as one run; markers that LEAD their word
+  (`¹Hong Kong University`, `<sup>3,4</sup>Some Institute`) attach to the
+  following word; markers after closing punctuation (`sentence.²`) and after
+  digits (`$1,234<sup>1</sup>`) are no longer glued on as body text.
+- Digit-only runs beside a word keep fusing as Unicode super/subscript
+  characters (`H₂O`, `word²`, `See note¹²`); level small runs (small caps,
+  same-baseline size changes) are no longer mistaken for subscripts.
+
+- Text shown with a rotated text matrix (a vertical arXiv-style margin stamp,
+  a rotated table header) reported `width == 0` and the font size as
+  `height`; downstream code then substituted a character-count width, turning
+  the stamp into a phantom horizontal line that `extract_text_in_regions`
+  assigned to the body paragraph it crossed. Every run now gets the
+  axis-aligned box of its glyph run — a vertical run is tall and thin — from
+  one geometry helper shared by the page and Form XObject parsers, and upright
+  text keeps its historical box exactly.
+- Pages whose text reads top-to-bottom (clockwise) are turned against their
+  own direction instead of the fixed counter-clockwise turn that mirrored
+  word and line order; link and AcroForm widget boxes, page-box clipping, and
+  region matching follow the turned frame. Only runs within about 20° of an
+  axis vote on the turn, so a page of diagonal text keeps its frame, and so
+  does a page whose vertical runs split evenly between the two directions.
+- A run whose font carries no width metrics gets a half-em-per-painted-glyph
+  estimate laid along its baseline (character and word spacing included),
+  and the text cursor moves by the same estimate, so the runs that follow it
+  no longer pile up on one origin.
+- A reflected text matrix has no rotation — its reading direction and its
+  glyphs' orientation differ by a half turn — so such a run reports how its glyphs
+  stand: `0` for the mirrored-x matrix some producers paint right-to-left
+  text with, which then merges, groups into lines, and carries
+  decorations like the upright run it looks like. A negative `Tf` size turns
+  a run around and reads as `180`; upside-down runs group into lines by the
+  baseline they hang from (`TextItem::baseline_y()`).
+- ActualText runs shown under a scaled text matrix reported widths multiplied
+  by the scale twice.
+- Form XObjects inherit the invoking stream's text rise and rendering mode
+  (text state is graphics state), so `3 Tr` hidden text inside a form stays
+  hidden on the visible pass and a form drawn under a raised baseline keeps
+  it.
+- Upside-down (180°) runs are never merged or split in reverse, their lines
+  sort in reading order, and their underlines and strikeouts are recognised
+  from their own baseline; RTL lines drawn with mirrored-x matrices keep the
+  classic right-to-left order.
+
+### Changed
+
+- **Coordinate frame of positioned output — consumer action may be required.**
+  `extract_text_with_positions*` (Rust), `extractTextWithPositions` (Node),
+  `extract_text_with_positions[_bytes]` (Python) and `pdf2md --items-json` now
+  report `x`/`y` relative to the page's visible page box — `CropBox ∩ MediaBox`,
+  else the MediaBox — with the box's lower-left corner as the origin. Image,
+  link and form-field items shift the same way. Previously the values were raw
+  content-stream coordinates, so on pages whose CropBox (or MediaBox) origin is
+  not `(0, 0)` every item was displaced from anything rendered from the CropBox,
+  and consumers intersecting items with rendered regions silently selected the
+  wrong text.
+- The region APIs interpret their inputs relative to the same box:
+  `extract_text_in_regions*`, `extract_tables_in_regions*`,
+  `detect_vector_grid_in_region*` and the TSR crop bboxes
+  (`TsrTableInput.crop_pdf_pt_bbox`) are top-left-origin PDF points relative to
+  the visible page box, and `StructuredCell.page_pt_bbox` is returned in it.
+  These previously flipped `y` with the MediaBox height and ignored the box
+  origin.
+- Pages whose CropBox equals the MediaBox and whose MediaBox origin is `(0, 0)`
+  — the vast majority — produce identical output. Consumers that compensated
+  for the CropBox origin themselves must drop that adjustment. `/Rotate` is
+  still not applied.
+- Rust: `TextItem` gained the required public field `baseline_shift`, so code
+  that builds a `TextItem` with a struct literal must add it (`0.0` for normal
+  text). This follows the precedent of `font_tag` in 1.17.0; the Python and
+  Node bindings are unaffected.
+- Snapshot fixtures `thermo-freon12` and `shannon-entropy-p1-2` updated for
+  the corrected script handling (`Freon<sup>®</sup>`, `V<sub>f</sub>`,
+  `2<sup>N</sup>`, `¹Nyquist`, `log<sub>b</sub> a`).
+- Rust: `TextItem` gained the required public fields `rotation` and
+  `advance_known`, so struct literals must add them (`0.0` and `true` for
+  ordinary upright text). Items that do not come from a text matrix (images,
+  links, form fields, OCR) report `0.0` / `true`.
+- Rust: the legacy `collect_text_in_region` still infers only the
+  counter-clockwise frame from a page's item coordinates; callers with
+  clockwise pages should pass the frame reported by
+  `extract_text_with_positions_and_rotations_mem` to
+  `collect_text_in_region_in_frame`, or use `extract_text_in_regions_mem`,
+  which handles both turns itself.
+
+### Included pull requests
+
+- [#452](https://github.com/firecrawl/pdf-inspector/pull/452): Faster cross-platform CI.
+- [#453](https://github.com/firecrawl/pdf-inspector/pull/453): Faster release publishing.
+- [#478](https://github.com/firecrawl/pdf-inspector/pull/478): Bounded object-stream decompression.
+- [#488](https://github.com/firecrawl/pdf-inspector/pull/488): Superscript/subscript handling and baseline metadata.
+- [#489](https://github.com/firecrawl/pdf-inspector/pull/489): Password-aware Python fixture tests.
+- [#490](https://github.com/firecrawl/pdf-inspector/pull/490): Python binding tests in CI.
+- [#487](https://github.com/firecrawl/pdf-inspector/pull/487): Positions and regions relative to the visible page box.
+- [#486](https://github.com/firecrawl/pdf-inspector/pull/486): Rotated-text bounds and rotation metadata.
+- [#507](https://github.com/firecrawl/pdf-inspector/pull/507): Embedded bold-font metadata recovery.
+- [#508](https://github.com/firecrawl/pdf-inspector/pull/508): Repair classic cross-reference tables with short entries.

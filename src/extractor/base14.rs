@@ -34,21 +34,26 @@ pub(crate) fn is_base14_font(base_font: &str) -> bool {
     base14_table(base_font).is_some()
 }
 
-/// Code → Unicode through the font's BUILT-IN encoding, for the base-14
-/// fonts whose repertoire is not Latin (Symbol, ZapfDingbats). Their glyphs
-/// live at byte positions that have nothing to do with cp1252 (Symbol 0x61
-/// renders α, Zapf 0x21 renders ✁), so advance widths must be resolved
-/// through this mapping — the renderer draws these glyphs regardless of how
-/// the text decoder transliterates them. Returns `None` for the Latin text
-/// fonts, which follow standard single-byte encodings.
-pub(crate) fn builtin_encoding_char(base_font: &str, code: u8) -> Option<char> {
+/// The built-in encoding of a standard-14 font whose repertoire is not
+/// Latin: Symbol or ZapfDingbats, by (aliased) name. `None` for the Latin
+/// text fonts and for anything that is not one of the standard 14.
+pub(crate) fn builtin_symbol_encoding(base_font: &str) -> Option<crate::types::BaseEncoding> {
     let table = base14_table(base_font)?;
-    let enc: &[(u8, char)] = if std::ptr::eq(table, SYMBOL) {
-        SYMBOL_ENCODING
+    if std::ptr::eq(table, SYMBOL) {
+        Some(crate::types::BaseEncoding::Symbol)
     } else if std::ptr::eq(table, ZAPFDINGBATS) {
-        ZAPFDINGBATS_ENCODING
+        Some(crate::types::BaseEncoding::ZapfDingbats)
     } else {
-        return None;
+        None
+    }
+}
+
+/// Code → Unicode through the built-in encoding of Symbol or ZapfDingbats.
+pub(crate) fn symbol_encoding_char(encoding: crate::types::BaseEncoding, code: u8) -> Option<char> {
+    let enc: &[(u8, char)] = match encoding {
+        crate::types::BaseEncoding::Symbol => SYMBOL_ENCODING,
+        crate::types::BaseEncoding::ZapfDingbats => ZAPFDINGBATS_ENCODING,
+        _ => return None,
     };
     enc.binary_search_by_key(&code, |&(b, _)| b)
         .ok()
@@ -614,15 +619,31 @@ mod tests {
 
     #[test]
     fn builtin_encoding_resolves_symbol_and_zapf_codes() {
+        use crate::types::BaseEncoding;
         // Symbol 0x61 renders alpha; Zapf 0x21 renders U+2701.
-        assert_eq!(builtin_encoding_char("Symbol", 0x61), Some('\u{03B1}'));
-        assert_eq!(builtin_encoding_char("Symbol", 0xA5), Some('\u{221E}'));
         assert_eq!(
-            builtin_encoding_char("ZapfDingbats", 0x21),
+            builtin_symbol_encoding("Symbol"),
+            Some(BaseEncoding::Symbol)
+        );
+        assert_eq!(
+            builtin_symbol_encoding("ABCDEF+ZapfDingbats"),
+            Some(BaseEncoding::ZapfDingbats)
+        );
+        assert_eq!(
+            symbol_encoding_char(BaseEncoding::Symbol, 0x61),
+            Some('\u{03B1}')
+        );
+        assert_eq!(
+            symbol_encoding_char(BaseEncoding::Symbol, 0xA5),
+            Some('\u{221E}')
+        );
+        assert_eq!(
+            symbol_encoding_char(BaseEncoding::ZapfDingbats, 0x21),
             Some('\u{2701}')
         );
         // Latin text fonts follow standard encodings — no builtin override.
-        assert_eq!(builtin_encoding_char("Times-Roman", 0x61), None);
+        assert_eq!(builtin_symbol_encoding("Times-Roman"), None);
+        assert_eq!(symbol_encoding_char(BaseEncoding::WinAnsi, 0x61), None);
         // The resolved chars have real AFM widths.
         let alpha_w = base14_char_width("Symbol", '\u{03B1}');
         assert!(alpha_w.is_some() && alpha_w != Some(500));
