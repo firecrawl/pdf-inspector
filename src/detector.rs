@@ -6,7 +6,7 @@
 
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 mod content_geometry;
@@ -54,6 +54,13 @@ pub struct PdfTypeResult {
     pub page_count: u32,
     /// Number of pages sampled for detection
     pub pages_sampled: u32,
+    /// Estimated raster coverage for pages whose content was analyzed.
+    /// Keys are 1-indexed page numbers. A missing key means the page was not
+    /// analyzed under the configured scan strategy; `None` means traversal
+    /// was incomplete. Values are approximate fractions from 0.0 to 1.0,
+    /// estimated from the deduplicated union of drawn image bounds on a 64×64
+    /// grid over the visible page box.
+    pub raster_coverage_by_page: BTreeMap<u32, Option<f32>>,
     /// Number of pages with text operators found
     pub pages_with_text: u32,
     /// Confidence score (0.0 - 1.0)
@@ -335,6 +342,14 @@ pub(crate) fn detect_from_document(
         }
     }
 
+    // Snapshot only pages analyzed by the configured strategy. Later phases
+    // may inspect additional pages to build OCR reasons, but those pages are
+    // not part of the caller's selected coverage sample.
+    let raster_coverage_by_page: BTreeMap<u32, Option<f32>> = analysis_cache
+        .iter()
+        .map(|(&page, analysis)| (page, analysis.raster_coverage))
+        .collect();
+
     let pages_sampled = pages_actually_sampled;
     let text_ratio = if pages_sampled > 0 {
         pages_with_text as f32 / pages_sampled as f32
@@ -562,6 +577,7 @@ pub(crate) fn detect_from_document(
         pdf_type,
         page_count,
         pages_sampled,
+        raster_coverage_by_page,
         pages_with_text,
         confidence,
         title,
@@ -634,6 +650,9 @@ struct PageAnalysis {
     /// their pixel size. Images bound in resources but never drawn do not
     /// count.
     has_covering_image: bool,
+    /// Approximate fraction of the visible page covered by drawn images.
+    /// `None` when content traversal was incomplete.
+    raster_coverage: Option<f32>,
     /// Whether every text-showing operator the page executes is invisible
     /// while images cover the page: a scan carrying a text layer nobody
     /// sees. What the layer says is not what the page shows, so the page
@@ -951,6 +970,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // invoked, are not content: `has_template_image` judges the pixels of
     // whatever is bound and has no say here.
     let has_covering_image = executed.covers_page;
+    let raster_coverage = executed.raster_coverage;
 
     // A page whose every executed text-showing operator left nothing to
     // see while images cover it shows the raster alone; the text layer
@@ -1014,6 +1034,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_images,
         has_template_image,
         has_covering_image,
+        raster_coverage,
         has_invisible_text_layer,
         executed_form_bytes,
         form_bytes_exceeded,
@@ -3023,7 +3044,6 @@ mod tests {
 
         // Normal doc: low text ops — doesn't qualify at all
         let text_ops = 300u32;
-        let font_changes = 50u32;
         assert!(text_ops < 1500);
     }
 

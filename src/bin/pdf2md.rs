@@ -395,6 +395,7 @@ mod tests {
             markdown: None,
             page_count: 1,
             processing_time_ms: 0,
+            raster_coverage_by_page: std::collections::BTreeMap::new(),
             pages_needing_ocr: Vec::new(),
             ocr_reasons_by_page: Vec::new(),
             title: Some("A \"quoted\" title".to_string()),

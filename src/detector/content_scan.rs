@@ -32,7 +32,7 @@ use std::rc::Rc;
 const COVERING_IMAGE_MIN_PAGE_FRACTION: f64 = 0.5;
 
 /// What a page's content executed, for the classification rule.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct ExecutedContent {
     /// Text-showing operators executed: in the page's own content and in
     /// the Form XObjects that content invokes.
@@ -48,6 +48,9 @@ pub(super) struct ExecutedContent {
     /// Whether the images drawn cover at least
     /// `COVERING_IMAGE_MIN_PAGE_FRACTION` of the visible page box.
     pub(super) covers_page: bool,
+    /// Estimated fraction of the visible page box covered by drawn images.
+    /// `None` when traversal was incomplete or the page box was invalid.
+    pub(super) raster_coverage: Option<f32>,
     /// Whether every text-showing operator executed left nothing to see
     /// while the images drawn cover the page — and nothing went unread
     /// that could say otherwise.
@@ -975,6 +978,17 @@ impl<'a> ContentScanState<'a> {
         (f64::from(cells) * cell_area).min(self.own_image_area)
     }
 
+    /// Estimated fraction of the visible page box covered by images drawn.
+    /// The grid union deduplicates overlap; incomplete walks return no value
+    /// rather than presenting a partial estimate as complete.
+    fn raster_coverage(&self) -> Option<f32> {
+        let page_area = self.page.area();
+        if self.incomplete || !page_area.is_finite() || page_area <= 0.0 {
+            return None;
+        }
+        Some((self.covered_image_area() / page_area).clamp(0.0, 1.0) as f32)
+    }
+
     /// Whether the images drawn cover the page: at least
     /// `COVERING_IMAGE_MIN_PAGE_FRACTION` of its area.
     fn covers_page(&self) -> bool {
@@ -999,6 +1013,7 @@ impl<'a> ContentScanState<'a> {
             hidden_text_ops: self.executed_hidden_text_ops,
             draws_image: self.drew_image_on_page,
             covers_page: self.covers_page(),
+            raster_coverage: self.raster_coverage(),
             shows_only_a_hidden_text_layer: self.shows_only_a_hidden_text_layer(),
             form_bytes: self.executed_form_bytes,
             form_bytes_exceeded: self.form_bytes_exceeded,

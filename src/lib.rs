@@ -187,6 +187,12 @@ pub struct PdfProcessResult {
     pub markdown: Option<String>,
     /// Page count.
     pub page_count: u32,
+    /// Estimated raster coverage for pages whose content was analyzed.
+    /// Keys are 1-indexed page numbers. Missing pages were not analyzed under
+    /// the detection scan strategy; `None` means traversal was incomplete.
+    /// Values are approximate fractions from 0.0 to 1.0, estimated from the
+    /// deduplicated union of drawn image bounds on a 64×64 visible-page grid.
+    pub raster_coverage_by_page: std::collections::BTreeMap<u32, Option<f32>>,
     /// Processing time in milliseconds.
     pub processing_time_ms: u64,
     /// 1-indexed page numbers that need OCR.
@@ -4584,6 +4590,7 @@ fn process_document(
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
     let pages_needing_ocr = detection.pages_needing_ocr;
+    let raster_coverage_by_page = detection.raster_coverage_by_page;
     let title = detection.title;
     let author = detection.author;
     let subject = detection.subject;
@@ -4601,6 +4608,7 @@ fn process_document(
             pdf_type,
             markdown: None,
             page_count,
+            raster_coverage_by_page,
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
@@ -4625,6 +4633,7 @@ fn process_document(
             pdf_type,
             markdown: None,
             page_count,
+            raster_coverage_by_page,
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
@@ -4975,6 +4984,7 @@ fn process_document(
         pdf_type,
         markdown,
         page_count,
+        raster_coverage_by_page,
         processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {

@@ -157,6 +157,7 @@ class PdfResult:                     # process_pdf / detect_pdf
     pdf_type: str                    # "text_based" | "scanned" | "image_based" | "mixed"
     markdown: str | None             # extracted Markdown (None for detect_pdf)
     page_count: int
+    raster_coverage_by_page: dict[int, float | None]  # analyzed pages only; 1-indexed; missing=not analyzed, None=incomplete
     processing_time_ms: int
     pages_needing_ocr: list[int]     # 1-indexed
     ocr_reasons_by_page: list[PageOcrReasons]

@@ -9,6 +9,12 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `raster_coverage_by_page` in Rust and Python results: approximate drawn-image
+  coverage for pages analyzed by the selected scan strategy, independent of
+  page classification and OCR recommendations.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
