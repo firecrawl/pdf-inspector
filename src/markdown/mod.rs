@@ -7,6 +7,7 @@
 //! - Paragraphs
 
 pub(crate) mod analysis;
+pub(crate) mod blocks;
 mod classify;
 mod convert;
 mod furniture;
@@ -21,10 +22,11 @@ use std::collections::{HashMap, HashSet};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
+use blocks::BlockRecorder;
 use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
 use convert::{
-    merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
-    PositionedMarkdown,
+    merge_continuation_tables, to_markdown_from_lines_with_tables_and_images_recorded,
+    ChartProseOrder, PositionedMarkdown,
 };
 
 const CHART_REGION_PAD: f32 = 20.0;
@@ -874,20 +876,21 @@ impl TableDetectionOutput {
         page: u32,
         table: &crate::tables::Table,
         chart_order: Option<ChartProseOrder>,
+        items: &[TextItem],
     ) {
         self.pages_with_detected_tables.insert(page);
         match self.mode {
             TableOutputMode::Markdown => {
                 self.pages_with_tables.insert(page);
-                self.markdown_by_page
-                    .entry(page)
-                    .or_default()
-                    .push(PositionedMarkdown::new(
+                self.markdown_by_page.entry(page).or_default().push(
+                    PositionedMarkdown::new(
                         table.rows.first().copied().unwrap_or(0.0),
                         table.columns.first().copied().unwrap_or(0.0),
                         crate::tables::table_to_markdown(table),
                         chart_order,
-                    ));
+                    )
+                    .with_bbox(blocks::items_bbox(items, &table.item_indices)),
+                );
             }
             #[cfg(feature = "ocr")]
             TableOutputMode::CompleteTables => {
@@ -1468,8 +1471,36 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         pdf_lines,
         context,
         TableOutputMode::Markdown,
+        None,
     )
     .markdown
+}
+
+/// Run the ordinary Markdown pipeline while recording layout blocks.
+///
+/// Returns the standard document-level Markdown (byte-identical to
+/// [`to_markdown_from_items_with_rects_and_lines`]) plus a
+/// [`blocks::LayoutBlocksOutput`] whose `markdown` is reassembled from the
+/// same emitted fragments with exact `[start, end)` spans per block.
+pub(crate) fn to_markdown_with_layout_blocks_from_items_with_rects_and_lines(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+) -> (String, blocks::LayoutBlocksOutput) {
+    let mut recorder = BlockRecorder::new();
+    let markdown = convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+        Some(&mut recorder),
+    )
+    .markdown;
+    (markdown, recorder.take_output())
 }
 
 /// Run the ordinary Markdown table pipeline but return only structurally
@@ -1496,6 +1527,7 @@ pub(crate) fn complete_table_markdown_from_items(
             precomputed_chart_regions: None,
         },
         TableOutputMode::CompleteTables,
+        None,
     );
     let mut output = String::new();
     for (_, table) in conversion.detected_tables {
@@ -1518,6 +1550,7 @@ fn convert_items_with_rects_lines_and_table_output(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
     table_output_mode: TableOutputMode,
+    recorder: Option<&mut BlockRecorder>,
 ) -> MarkdownConversionOutput {
     use crate::tables::{
         content_width, detect_tables_from_lines, detect_tables_from_rects,
@@ -1807,7 +1840,7 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                     }
-                    table_output.record(page, table, chart_prose_order);
+                    table_output.record(page, table, chart_prose_order, band_items);
                 }
             }
 
@@ -1831,7 +1864,7 @@ fn convert_items_with_rects_lines_and_table_output(
                         }
                     }
                 }
-                table_output.record(page, table, chart_prose_order);
+                table_output.record(page, table, chart_prose_order, band_items);
             }
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
@@ -1846,7 +1879,7 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                     }
-                    table_output.record(page, table, chart_prose_order);
+                    table_output.record(page, table, chart_prose_order, band_items);
                 }
             }
 
@@ -1882,7 +1915,7 @@ fn convert_items_with_rects_lines_and_table_output(
                                 }
                             }
                         }
-                        table_output.record(page, &table, chart_prose_order);
+                        table_output.record(page, &table, chart_prose_order, &inside_items);
                         for &band_idx in &inside_map {
                             rect_claimed.insert(band_idx);
                         }
@@ -1940,7 +1973,7 @@ fn convert_items_with_rects_lines_and_table_output(
                                 }
                             }
                         }
-                        table_output.record(page, &table, chart_prose_order);
+                        table_output.record(page, &table, chart_prose_order, subset_items);
                     }
                 };
 
@@ -2002,7 +2035,7 @@ fn convert_items_with_rects_lines_and_table_output(
                             }
                         }
                     }
-                    table_output.record(page, &table, chart_prose_order);
+                    table_output.record(page, &table, chart_prose_order, band_items);
                 }
             }
         }
@@ -2061,7 +2094,7 @@ fn convert_items_with_rects_lines_and_table_output(
                             table_items.insert(global_idx);
                         }
                     }
-                    table_output.record(page, table, chart_prose_order);
+                    table_output.record(page, table, chart_prose_order, &page_text);
                 }
             }
         }
@@ -2127,7 +2160,7 @@ fn convert_items_with_rects_lines_and_table_output(
                         }
                     }
                 }
-                table_output.record(page, table, chart_prose_order);
+                table_output.record(page, table, chart_prose_order, &chart_free);
             }
         }
     }
@@ -2148,15 +2181,15 @@ fn convert_items_with_rects_lines_and_table_output(
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(&img.text);
         let img_md = format!("![Image: {}](image)\n", img_name);
-        page_images
-            .entry(img.page)
-            .or_default()
-            .push(PositionedMarkdown::new(
+        page_images.entry(img.page).or_default().push(
+            PositionedMarkdown::new(
                 img.y,
                 img.x,
                 img_md,
                 page_chart_prose_orders.get(&img.page).copied(),
-            ));
+            )
+            .with_bbox(blocks::single_item_bbox(img)),
+        );
     }
 
     // Check structure tree coverage on ALL text items (before table filtering)
@@ -2395,7 +2428,7 @@ fn convert_items_with_rects_lines_and_table_output(
     // Convert to markdown, inserting tables and images at appropriate positions
     let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
     band_split_page_set.extend(page_chart_prose_splits.keys().copied());
-    let markdown = to_markdown_from_lines_with_tables_and_images(
+    let markdown = to_markdown_from_lines_with_tables_and_images_recorded(
         lines,
         options,
         page_tables,
@@ -2403,6 +2436,7 @@ fn convert_items_with_rects_lines_and_table_output(
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
+        recorder,
     );
     MarkdownConversionOutput {
         markdown,
@@ -2427,7 +2461,7 @@ mod tests {
             vec![vec!["header a".into(), "header b".into()]],
             vec![0, 1],
         );
-        output.record(1, &incomplete, None);
+        output.record(1, &incomplete, None, &[]);
         assert!(output.has_detected_tables_on_page(1));
         assert!(!output.has_tables_on_page(1));
         assert!(output.complete_tables.is_empty());
@@ -2441,7 +2475,7 @@ mod tests {
             ],
             vec![0, 1, 2, 3],
         );
-        output.record(1, &complete, None);
+        output.record(1, &complete, None, &[]);
         assert!(output.has_tables_on_page(1));
         assert_eq!(output.complete_tables.len(), 1);
     }

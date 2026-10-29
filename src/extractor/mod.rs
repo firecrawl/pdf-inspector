@@ -2507,6 +2507,46 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
     }
 }
 
+/// Visible page box: CropBox if present, else MediaBox, walking page-tree
+/// inheritance (both attributes are inheritable). Returns normalized
+/// (x0, y0, x1, y1) in PDF space.
+pub(crate) fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
+    fn find_box(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
+        let mut id = page_id;
+        for _ in 0..32 {
+            let dict = doc.get_dictionary(id).ok()?;
+            if let Ok(obj) = dict.get(key) {
+                let arr = match obj {
+                    Object::Array(a) => Some(a.clone()),
+                    Object::Reference(r) => match doc.get_object(*r) {
+                        Ok(Object::Array(a)) => Some(a.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(arr) = arr {
+                    let vals: Vec<f32> = arr.iter().filter_map(get_number).collect();
+                    if vals.len() >= 4 {
+                        return Some(vals);
+                    }
+                }
+            }
+            match dict.get(b"Parent") {
+                Ok(Object::Reference(p)) => id = *p,
+                _ => return None,
+            }
+        }
+        None
+    }
+    let v = find_box(doc, page_id, b"CropBox").or_else(|| find_box(doc, page_id, b"MediaBox"))?;
+    Some((
+        v[0].min(v[2]),
+        v[1].min(v[3]),
+        v[0].max(v[2]),
+        v[1].max(v[3]),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
