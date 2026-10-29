@@ -56,6 +56,51 @@ fn format_ocr_reasons_by_page(reasons: &[pdf_inspector::PageOcrReasons]) -> Stri
         .join(",")
 }
 
+fn format_cmap_gaps(gaps: &[pdf_inspector::FontCMapGaps]) -> String {
+    gaps.iter()
+        .map(|gap| {
+            format!(
+                r#"{{"font":"{}","codes":{},"interpolated":{},"unmapped":{}}}"#,
+                json_escape(&gap.font),
+                gap.codes,
+                gap.interpolated,
+                gap.unmapped
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A JSON string, or `null` for `None`.
+fn json_string_or_null(value: Option<&str>) -> String {
+    value
+        .map(|value| format!(r#""{}""#, json_escape(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// The document information entries as JSON members, from `"title"` to
+/// `"mod_date"`, each `null` when the document has none.
+fn format_document_info(result: &pdf_inspector::PdfProcessResult) -> String {
+    format!(
+        r#""title":{},"author":{},"subject":{},"keywords":{},"creator":{},"producer":{},"creation_date":{},"mod_date":{}"#,
+        json_string_or_null(result.title.as_deref()),
+        json_string_or_null(result.author.as_deref()),
+        json_string_or_null(result.subject.as_deref()),
+        json_string_or_null(result.keywords.as_deref()),
+        json_string_or_null(result.creator.as_deref()),
+        json_string_or_null(result.producer.as_deref()),
+        json_string_or_null(result.creation_date.as_deref()),
+        json_string_or_null(result.mod_date.as_deref()),
+    )
+}
+
+/// An sRGB colour as a JSON array `[r,g,b]`, or `null` when unknown.
+fn format_color(color: Option<[u8; 3]>) -> String {
+    color
+        .map(|[r, g, b]| format!("[{r},{g},{b}]"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn item_type_label(item_type: &ItemType) -> &'static str {
     match item_type {
         ItemType::Text => "text",
@@ -74,25 +119,50 @@ fn format_items_json(items: &[TextItem]) -> String {
                 .mcid
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string());
+            let font_weight = item
+                .font_weight
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let bold_source = item
+                .bold_source
+                .map(|source| format!(r#""{}""#, source.as_str()))
+                .unwrap_or_else(|| "null".to_string());
+            let fixed_pitch = item
+                .fixed_pitch
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let render_mode = item
+                .render_mode
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string());
             let link_url = match &item.item_type {
                 ItemType::Link(url) => format!(r#","url":"{}""#, json_escape(url)),
                 _ => String::new(),
             };
             format!(
-                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"is_underline":{},"is_strikeout":{},"item_type":"{}","mcid":{}{}}}"#,
+                r#"{{"text":"{}","page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2},"rotation":{:.2},"advance_known":{},"font":"{}","font_tag":"{}","font_size":{:.2},"is_bold":{},"is_italic":{},"font_weight":{},"bold_source":{},"fixed_pitch":{},"fill_color":{},"stroke_color":{},"render_mode":{},"is_underline":{},"is_strikeout":{},"baseline_shift":{:.2},"item_type":"{}","mcid":{}{}}}"#,
                 json_escape(&item.text),
                 item.page,
                 item.x,
                 item.y,
                 item.width,
                 item.height,
+                item.rotation,
+                item.advance_known,
                 json_escape(&item.font),
                 json_escape(&item.font_tag),
                 item.font_size,
                 item.is_bold,
                 item.is_italic,
+                font_weight,
+                bold_source,
+                fixed_pitch,
+                format_color(item.fill_color),
+                format_color(item.stroke_color),
+                render_mode,
                 item.is_underline,
                 item.is_strikeout,
+                item.baseline_shift,
                 item_type_label(&item.item_type),
                 mcid,
                 link_url,
@@ -313,11 +383,14 @@ fn format_layout_blocks_json(result: &pdf_inspector::LayoutBlocksResult) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_items_json, format_items_json, format_ocr_error_json};
+    use super::{
+        extract_items_json, format_document_info, format_items_json, format_ocr_error_json,
+        positional_args,
+    };
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     use super::{format_ocr_json, process_pdf_with_ocr, OcrPdfOptions};
     use pdf_inspector::extractor::ItemType;
-    use pdf_inspector::TextItem;
+    use pdf_inspector::{BoldSource, TextItem};
 
     #[test]
     fn items_json_includes_position_and_underline_metadata() {
@@ -329,14 +402,24 @@ mod tests {
             height: 9.876,
             font: "F1".to_string(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page: 2,
             is_bold: false,
             is_italic: true,
+            font_weight: Some(300),
+            bold_source: Some(BoldSource::FontName),
+            fixed_pitch: Some(true),
+            fill_color: Some([255, 128, 0]),
+            stroke_color: None,
+            render_mode: Some(3),
             is_underline: true,
             is_strikeout: true,
+            rotation: 90.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: Some(7),
+            baseline_shift: 3.5,
         }];
 
         let json = format_items_json(&items);
@@ -344,9 +427,46 @@ mod tests {
         assert!(json.contains(r#""text":"A \"quoted\" item""#));
         assert!(json.contains(r#""page":2"#));
         assert!(json.contains(r#""x":12.35"#));
+        assert!(json.contains(r#""rotation":90.00"#));
+        assert!(json.contains(r#""advance_known":true"#));
         assert!(json.contains(r#""is_underline":true"#));
+        assert!(json.contains(r#""font_weight":300"#));
+        assert!(json.contains(r#""bold_source":"font_name""#));
+        assert!(json.contains(r#""fixed_pitch":true"#));
+        assert!(json.contains(r#""fill_color":[255,128,0]"#));
+        assert!(json.contains(r#""stroke_color":null"#));
+        assert!(json.contains(r#""render_mode":3"#));
+        assert!(json.contains(r#""baseline_shift":3.50"#));
         assert!(json.contains(r#""item_type":"text""#));
         assert!(json.contains(r#""mcid":7"#));
+    }
+
+    #[test]
+    fn document_info_json_names_every_entry_and_escapes_it() {
+        let result = pdf_inspector::PdfProcessResult {
+            pdf_type: pdf_inspector::PdfType::TextBased,
+            markdown: None,
+            page_count: 1,
+            processing_time_ms: 0,
+            pages_needing_ocr: Vec::new(),
+            ocr_reasons_by_page: Vec::new(),
+            title: Some("A \"quoted\" title".to_string()),
+            author: None,
+            subject: Some("Line\nbreak".to_string()),
+            keywords: None,
+            creator: Some("Writer".to_string()),
+            producer: Some("Library".to_string()),
+            creation_date: Some("D:20240115103000+01'00'".to_string()),
+            mod_date: None,
+            confidence: 1.0,
+            layout: pdf_inspector::LayoutComplexity::default(),
+            has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
+        };
+        assert_eq!(
+            format_document_info(&result),
+            r#""title":"A \"quoted\" title","author":null,"subject":"Line\nbreak","keywords":null,"creator":"Writer","producer":"Library","creation_date":"D:20240115103000+01'00'","mod_date":null"#
+        );
     }
 
     #[test]
@@ -378,6 +498,33 @@ mod tests {
         assert!(json.starts_with(r#"{"schema_version":1,"page_count":3,"#));
         assert!(json.contains(r#""page":1,"source":"native""#));
         assert!(!json.contains("layout_ms"));
+    }
+
+    #[test]
+    fn options_may_precede_the_pdf_path() {
+        let args = |list: &[&str]| {
+            std::iter::once("pdf2md".to_string())
+                .chain(list.iter().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            positional_args(&args(&["--json", "document.pdf"])).unwrap(),
+            vec!["document.pdf".to_string()]
+        );
+        assert_eq!(
+            positional_args(&args(&["--password", "secret", "document.pdf", "out.md"])).unwrap(),
+            vec!["document.pdf".to_string(), "out.md".to_string()]
+        );
+        assert_eq!(
+            positional_args(&args(&["document.pdf", "--select-pages", "1,3-5", "--raw"])).unwrap(),
+            vec!["document.pdf".to_string()]
+        );
+        assert_eq!(
+            positional_args(&args(&["--", "--json"])).unwrap(),
+            vec!["--json".to_string()]
+        );
+        assert!(positional_args(&args(&["--json"])).is_err());
+        assert!(positional_args(&args(&["a.pdf", "b.md", "c.md"])).is_err());
     }
 
     #[test]
@@ -439,43 +586,97 @@ fn print_layout_info(layout: &LayoutComplexity) {
     }
 }
 
+const VALUE_OPTIONS: &[&str] = &[
+    "--select-pages",
+    "--password",
+    "--ocr",
+    "--ocr-dpi",
+    "--ocr-min-confidence",
+    "--ocr-hosted-threshold",
+    "--ocr-model-dir",
+];
+
+fn print_usage(argv0: &str) {
+    eprintln!("Usage: {argv0} <pdf_file> [output_file]");
+    eprintln!("       {argv0} --json <pdf_file>");
+    eprintln!("       {argv0} --items-json <pdf_file>");
+    eprintln!("       {argv0} --raw <pdf_file>");
+    eprintln!();
+    eprintln!("Converts PDF to Markdown with smart type detection.");
+    eprintln!("Returns early if PDF is scanned (OCR needed).");
+    eprintln!();
+    eprintln!("Options may appear before or after the PDF path.");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --json              Output result as JSON");
+    eprintln!("  --items-json        Output positioned TextItem JSON");
+    eprintln!("  --layout-blocks-json  Output Markdown plus typed layout blocks JSON");
+    eprintln!("  --raw               Output only markdown (no headers)");
+    eprintln!("  --compact           Collapse token-heavy source formatting such as dot leaders");
+    eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
+    eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
+    eprintln!("  --password PW       Password for an encrypted PDF");
+    eprintln!("  --detect-only       Only detect PDF type (no extraction)");
+    eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
+    eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
+    eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
+    eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
+    eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
+    eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
+    eprintln!("  --ocr-offline       Never download missing OCR models");
+}
+
+/// Non-option arguments, in order. Options may precede the PDF path
+/// (`pdf2md --json file.pdf`). A flag in [`VALUE_OPTIONS`] consumes the
+/// following argument. `--` ends option parsing.
+fn positional_args(args: &[String]) -> Result<Vec<String>, ()> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    let mut positional = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if positional {
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--help" || arg == "-h" {
+            return Err(());
+        }
+        if arg.starts_with('-') && arg != "-" {
+            if VALUE_OPTIONS.contains(&arg.as_str()) && i + 1 < args.len() {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    if out.is_empty() || out.len() > 2 {
+        return Err(());
+    }
+    Ok(out)
+}
+
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <pdf_file> [output_file]", args[0]);
-        eprintln!("       {} <pdf_file> --json", args[0]);
-        eprintln!("       {} <pdf_file> --items-json", args[0]);
-        eprintln!("       {} <pdf_file> --raw", args[0]);
-        eprintln!();
-        eprintln!("Converts PDF to Markdown with smart type detection.");
-        eprintln!("Returns early if PDF is scanned (OCR needed).");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --json              Output result as JSON");
-        eprintln!("  --items-json        Output positioned TextItem JSON");
-        eprintln!("  --layout-blocks-json  Output Markdown plus typed layout blocks JSON");
-        eprintln!("  --raw               Output only markdown (no headers)");
-        eprintln!(
-            "  --compact           Collapse token-heavy source formatting such as dot leaders"
-        );
-        eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
-        eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
-        eprintln!("  --password PW       Password for an encrypted PDF");
-        eprintln!("  --detect-only       Only detect PDF type (no extraction)");
-        eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
-        eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
-        eprintln!("  --ocr-dpi N         OCR render resolution (default: 150)");
-        eprintln!("  --ocr-min-confidence N  Drop OCR spans below N (default: 0)");
-        eprintln!("  --ocr-hosted-threshold N  Recommend hosted parsing below N (default: 0.5)");
-        eprintln!("  --ocr-model-dir DIR Use a package-managed local model directory");
-        eprintln!("  --ocr-offline       Never download missing OCR models");
-        process::exit(1);
-    }
-
-    let pdf_path = &args[1];
+    let positionals = match positional_args(&args) {
+        Ok(positionals) => positionals,
+        Err(()) => {
+            print_usage(&args[0]);
+            process::exit(1);
+        }
+    };
+    let pdf_path = positionals[0].as_str();
     let json_output = args.iter().any(|a| a == "--json");
     let items_json_output = args.iter().any(|a| a == "--items-json");
     let layout_blocks_json_output = args.iter().any(|a| a == "--layout-blocks-json");
@@ -518,10 +719,7 @@ fn main() {
             })
         });
 
-    let output_file = args
-        .get(2)
-        .filter(|a| !a.starts_with("--"))
-        .map(|s| s.as_str());
+    let output_file = positionals.get(1).map(String::as_str);
 
     let has_ocr_only_option = [
         "--ocr-dpi",
@@ -731,8 +929,9 @@ fn main() {
                         .map(|p| p.to_string())
                         .collect();
                     let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
+                    let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                     println!(
-                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{}}}"#,
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}],{}}}"#,
                         pdf_type_str,
                         result.page_count,
                         result.processing_time_ms,
@@ -742,6 +941,8 @@ fn main() {
                         table_pages.join(","),
                         col_pages.join(","),
                         result.has_encoding_issues,
+                        cmap_gaps,
+                        format_document_info(&result),
                     );
                 } else {
                     eprintln!("Type: {}", pdf_type_str);
@@ -779,8 +980,9 @@ fn main() {
                     .map(|p| p.to_string())
                     .collect();
                 let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
+                let cmap_gaps = format_cmap_gaps(&result.cmap_gaps);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"cmap_gaps":[{}],{},"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -797,6 +999,8 @@ fn main() {
                     table_pages.join(","),
                     col_pages.join(","),
                     result.has_encoding_issues,
+                    cmap_gaps,
+                    format_document_info(&result),
                     md_escaped
                 );
             } else if raw_output {
@@ -890,7 +1094,7 @@ fn main() {
         }
         Err(e) => {
             if json_output {
-                println!(r#"{{"error":"{}"}}"#, e);
+                println!(r#"{{"error":"{}"}}"#, json_escape(&e.to_string()));
             } else {
                 eprintln!("Error: {}", e);
             }

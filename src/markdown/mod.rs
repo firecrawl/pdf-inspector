@@ -56,7 +56,7 @@ fn is_chart_adjacent_label(item: &TextItem, region: (f32, f32, f32, f32)) -> boo
         0.0
     };
     let is_caption = is_caption_line(text);
-    let em = item.height.max(item.font_size).max(1.0);
+    let em = item.cross_extent().max(item.font_size).max(1.0);
     let compact_label = item_width <= em * 18.5;
     let category_band = (em * 1.85).clamp(6.0, CHART_REGION_PAD);
     let close_to_chart_edge = if is_caption {
@@ -2720,14 +2720,24 @@ mod tests {
             height: 10.0,
             font: String::new(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 

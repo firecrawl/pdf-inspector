@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use crate::tables::Table;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
+use super::cell_text::{cell_fragment, join_cell_items, push_cell_item};
 use super::detect_rects::{assign_items_to_grid, snap_edges};
-use super::grid::join_cell_items;
 
 const RULE_Y_TOLERANCE: f32 = 2.0;
 const RULE_JOIN_GAP: f32 = 6.0;
@@ -226,6 +226,11 @@ fn collect_anchored_rows<'a>(
         .map(|rule| rule.2)
         .fold(f32::NEG_INFINITY, f32::max);
 
+    // Detection clusters rows on raw glyph baselines on purpose. Switching
+    // these paths to `line_y()` changed which table hypotheses win on the
+    // eval corpus (a footnoted location list became a grid and dissolved a
+    // neighbouring header row), so only cell ASSIGNMENT and rendering are
+    // script-aware (`assign_items_to_grid`, `cell_text`).
     let mut selected: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
@@ -306,10 +311,10 @@ fn build_stacked_token_table(rows: &[AnchoredRow<'_>], rules: &[HorizontalRule])
         return None;
     }
 
-    let header = rows[0].1[0].1.text.trim().to_string();
+    let header = cell_fragment(rows[0].1[0].1, rows[0].1[0].1.text.trim());
     let value = body
         .iter()
-        .map(|(_, row)| row[0].1.text.trim())
+        .map(|(_, row)| cell_fragment(row[0].1, row[0].1.text.trim()))
         .collect::<Vec<_>>()
         .join(" ");
     let mut item_indices: Vec<usize> = rows
@@ -440,11 +445,16 @@ fn build_text_anchor_table(
     columns.push(x_max);
 
     let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
     let mut wide_items = 0usize;
     let mut measured_items = 0usize;
+    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
+            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
+                continue;
+            }
             let column = anchors
                 .iter()
                 .enumerate()
@@ -457,10 +467,12 @@ fn build_text_anchor_table(
                     wide_items += 1;
                 }
             }
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
-            }
-            cells[row_index][column].push_str(item.text.trim());
+            push_cell_item(
+                &mut cells[row_index][column],
+                &mut last_items[row_index][column],
+                item,
+                item.text.trim(),
+            );
             item_indices.push(*item_index);
         }
     }
@@ -860,14 +872,21 @@ fn build_dense_row_anchor_table(
     columns.push(x_max.max(*anchors.last()?));
 
     let mut cells = vec![vec![String::new(); anchors.len()]; rows.len()];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; anchors.len()]; rows.len()];
     let mut item_indices = Vec::new();
+    let row_baselines: Vec<f32> = rows.iter().map(|(y, _)| *y).collect();
     for (row_index, (_, row)) in rows.iter().enumerate() {
         for (item_index, item) in row {
-            let column = nearest_anchor_column(item, &anchors)?;
-            if !cells[row_index][column].is_empty() {
-                cells[row_index][column].push(' ');
+            if super::crosses_other_rows(item, &row_baselines, Some(row_index)) {
+                continue;
             }
-            cells[row_index][column].push_str(item.text.trim());
+            let column = nearest_anchor_column(item, &anchors)?;
+            push_cell_item(
+                &mut cells[row_index][column],
+                &mut last_items[row_index][column],
+                item,
+                item.text.trim(),
+            );
             item_indices.push(*item_index);
         }
     }
@@ -977,16 +996,19 @@ fn build_open_edge_grid_table_for_rules(
     let header_rows = collect_anchored_rows(items, &header_band, page);
     let header_y = header_rows.first()?.0;
     let mut header_cells = vec![String::new(); column_count];
+    let mut header_last: Vec<Option<&TextItem>> = vec![None; column_count];
     let mut header_indices = Vec::new();
     for (_, header_items) in &header_rows {
         for (item_index, item) in header_items {
             let center_x = item.x + item.width / 2.0;
             let column = (0..column_count)
                 .find(|&index| center_x >= col_edges[index] && center_x <= col_edges[index + 1])?;
-            if !header_cells[column].is_empty() {
-                header_cells[column].push(' ');
-            }
-            header_cells[column].push_str(item.text.trim());
+            push_cell_item(
+                &mut header_cells[column],
+                &mut header_last[column],
+                item,
+                item.text.trim(),
+            );
             header_indices.push(*item_index);
         }
     }
@@ -1375,12 +1397,7 @@ fn refine_segment_grid_text_rows(
             row.iter_mut()
                 .map(|items| {
                     if crate::text_utils::is_rtl_text(items.iter().map(|item| &item.text)) {
-                        crate::text_utils::sort_rtl_cell_items(
-                            items,
-                            |item| item.x,
-                            |item| item.y,
-                            |item| item.text.as_str(),
-                        );
+                        crate::text_utils::sort_rtl_cell_items(items, |item| *item);
                     } else {
                         items.sort_by(|left, right| left.x.total_cmp(&right.x));
                     }
@@ -2117,14 +2134,24 @@ mod tests {
             height: 10.0,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
