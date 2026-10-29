@@ -27,6 +27,25 @@ pub enum ItemType {
     FormField,
 }
 
+/// Where `TextItem.isBold` came from. When more than one of them says bold
+/// the first in this order is reported.
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum BoldSource {
+    /// A bold word or foundry style abbreviation in the font name ("Bold",
+    /// "-Bd", "Black", "Demi", "-Hv", "W7").
+    FontName,
+    /// The FontDescriptor's ForceBold flag, or the embedded font program's
+    /// own bold selection.
+    FontFlags,
+    /// The weight class: `fontWeight` at or above `boldWeightThreshold`
+    /// (only with `boldFromWeight`).
+    WeightClass,
+    /// Text filled and stroked to look heavier, in a face that is not bold
+    /// itself.
+    Painted,
+}
+
 /// Selects when OCR runs.
 #[napi(string_enum)]
 #[derive(Clone, Copy)]
@@ -62,12 +81,39 @@ pub struct PdfResult {
     pub pages_needing_ocr: Vec<u32>,
     /// Machine-readable OCR reasons by 1-indexed page.
     pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// The `/Title` of the document information dictionary, decoded as a PDF
+    /// text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    /// otherwise). Omitted when the entry is missing or not a string. The
+    /// entries below follow the same decoding and missing-value rule.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator`: the application the
+    /// document was authored in.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer`: the application
+    /// that wrote the PDF.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate` as written, a
+    /// PDF date string such as `D:20240115103000+01'00'`.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate` as written.
+    pub mod_date: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
+    /// Fonts whose ToUnicode CMap — or, for a font without one, the embedded
+    /// program's cmap table — lacked an entry for a code the document shows
+    /// through it, with the counts of codes shown, read from their neighbours
+    /// and left as U+FFFD. Always empty for `detectPdf`, which decodes no
+    /// text; otherwise empty when every such code had an entry.
+    pub cmap_gaps: Vec<FontCmapGaps>,
 }
 
 /// OCR reasons for a single 1-indexed page.
@@ -75,6 +121,22 @@ pub struct PdfResult {
 pub struct PageOcrReasons {
     pub page: u32,
     pub reasons: Vec<String>,
+}
+
+/// A font whose ToUnicode CMap — or, for a font without one, the embedded
+/// program's cmap table — had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
+#[napi(object)]
+pub struct FontCmapGaps {
+    /// The font's /BaseFont name, or its resource name when it has none.
+    pub font: String,
+    /// Codes shown through the font's CMap, repeats included: two-byte codes,
+    /// or the bytes of a single-byte CMap.
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around them.
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in the text.
+    pub unmapped: u32,
 }
 
 /// Lightweight PDF classification result.
@@ -88,25 +150,127 @@ pub struct PdfClassification {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// `x`/`y` are PDF points relative to the page's **visible page box**
+/// (`CropBox ∩ MediaBox`, else the MediaBox; a CropBox that does not overlap
+/// the MediaBox is ignored, and a page without a MediaBox is measured against
+/// US Letter), origin at the box's lower-left corner with `y` growing upward.
+/// [`extractTextInRegions`] reads its regions relative to the same box but
+/// from its top-left corner with `y` growing downward; flip with the box
+/// height. `/Rotate` is not applied.
+///
+/// On a page whose text is predominantly rotated the extractor turns the
+/// coordinate frame so that text reads left-to-right, and the shift into the
+/// visible page box is turned the same way; items on such a page are
+/// expressed in that turned frame. Use
+/// [`extract_text_with_positions_and_rotations`] (`extractTextWithPositionsAndRotations`
+/// in JavaScript) to learn which pages were turned and which way.
+///
+/// Pass `{ frame: "display" }` (see [`FrameOptions`]) to get every item in
+/// the rendered page's frame instead: the visible page box turned clockwise
+/// by the page's inheritable `/Rotate`, with the turn of a rotated page
+/// undone, so `x`/`y`/`width`/`height` and `rotation` describe the item as
+/// a renderer draws it.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     pub x: f64,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in `[0, 360)`: `0` for ordinary horizontal text, `90`
+    /// for text reading bottom-to-top (a rotated margin stamp), `270` for
+    /// top-to-bottom, `180` for upside-down. `x`/`y`/`width`/`height` is the
+    /// run's axis-aligned box, so a vertical run is tall and thin (height
+    /// ≫ width) instead of zero-width.
+    pub rotation: f64,
+    /// Whether the run's advance came from font metrics. `false` when the
+    /// font carries no width information (or an ActualText span's advance
+    /// could not be recovered): the box's extent along the baseline is then
+    /// an estimate of half an em per painted glyph (an ActualText span counts
+    /// the glyphs it covers, not its replacement text), not a measurement.
+    pub advance_known: bool,
     pub font: String,
     pub font_tag: String,
+    /// Present only when legacy private-use symbol cleanup changed a source
+    /// character. This is decoding provenance, not a request to run OCR.
+    /// Merged items retain evidence from all contributing runs.
+    pub legacy_symbol_rewrite: Option<bool>,
     pub font_size: f64,
     pub page: u32,
+    /// Bold from the font name, the FontDescriptor's ForceBold flag, the
+    /// embedded program's bold selection, or text filled and stroked to
+    /// look heavier. With `{ boldFromWeight: true }` (see [`FrameOptions`])
+    /// also `true` when `fontWeight` is `boldWeightThreshold` (600 by
+    /// default) or more. `boldSource` says which.
     pub is_bold: bool,
     pub is_italic: bool,
+    /// The font's weight class on the 100..900 scale shared by CSS
+    /// `font-weight` and the OS/2 `usWeightClass` field (400 regular, 700
+    /// bold): the embedded font program's OS/2 table, else the
+    /// FontDescriptor's `/FontWeight`, else a weight word in the font name
+    /// ("Light", "Medium", "-Md", "Black", "W6"). Omitted when none of them
+    /// says, and for image, link and form-field items. Independent of
+    /// `isBold`, which is unchanged: a medium face reports `500` with
+    /// `isBold: false`.
+    pub font_weight: Option<u32>,
+    /// Where `isBold` came from — `"FontName"`, `"FontFlags"`,
+    /// `"WeightClass"` (with `boldFromWeight`) or `"Painted"`, the first of
+    /// them in that order when more than one says bold — so a verdict can be
+    /// weighed against `fontWeight`: a face whose name says Bold over a
+    /// weight class of 400 reports `"FontName"`. Omitted when `isBold` is
+    /// `false`, and for image, link and form-field items.
+    pub bold_source: Option<BoldSource>,
+    /// Whether the font is fixed-pitch (monospaced): `true` when the
+    /// FontDescriptor's FixedPitch flag or the embedded program's `post`
+    /// table says so, else measured from the font's width table — `true`
+    /// when a dozen or more of its glyphs share one advance, `false` when
+    /// two differ. Omitted when the font declares nothing and no two
+    /// advances differ but fewer than a dozen share one, and for image,
+    /// link and form-field items.
+    /// Many producers write `/Flags 4` whatever the face, so the flag is
+    /// only ever read as a yes.
+    pub fixed_pitch: Option<bool>,
+    /// The fill colour the run was shown with, as sRGB `[red, green, blue]`
+    /// of 0..255: what its glyphs are filled with in the render modes that
+    /// fill (0, 2, 4, 6). DeviceRGB is read as sRGB, DeviceGray as three
+    /// equal components and DeviceCMYK converted as the PDF specification
+    /// converts it to DeviceRGB; ICCBased spaces are read by their component
+    /// count and Indexed spaces through their palette. Omitted for any other
+    /// colour space (Separation, DeviceN, Pattern, CalRGB, Lab, ...), and for
+    /// image, link and form-field items. A merged item keeps its first run's.
+    #[napi(ts_type = "[number, number, number]")]
+    pub fill_color: Option<Vec<u32>>,
+    /// The stroke colour the run was shown with, read like `fillColor`: what
+    /// its glyph outlines are stroked with in the render modes that stroke
+    /// (1, 2, 5, 6).
+    #[napi(ts_type = "[number, number, number]")]
+    pub stroke_color: Option<Vec<u32>>,
+    /// The text render mode (`Tr`) the run was shown with, 0..7: 0 fill, 1
+    /// stroke, 2 fill and stroke, 3 invisible (the mode of OCR text layers),
+    /// 4..6 as 0..2 and clip, 7 clip only. Runs in modes 3 and 7 put no
+    /// glyphs on the page. The mode holds across text objects, is saved and
+    /// restored by `q`/`Q` and is inherited by Form XObjects. Which runs are
+    /// extracted is unchanged by it. Omitted for image, link and form-field
+    /// items.
+    pub render_mode: Option<u32>,
     /// Underline detected geometrically (drawn rule/thin rect under the
     /// baseline) — PDFs carry no underline font flag.
     pub is_underline: bool,
     /// Strikeout detected geometrically (rule crossing the glyphs at mid
     /// x-height).
     pub is_strikeout: bool,
+    /// Signed baseline offset (PDF points, y-up) of a super/subscript glyph
+    /// run from the body baseline it is attached to; `0` for normal text.
+    /// Positive = raised (superscript: footnote/affiliation markers,
+    /// exponents), negative = lowered (subscript). Emit `<sup>`/`<sub>` from
+    /// the sign. Digit-only markers beside a word are already fused into it
+    /// as Unicode super/subscript characters ("word²") and carry `0`.
+    pub baseline_shift: f64,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
@@ -121,8 +285,54 @@ pub struct TextItem {
 #[napi(object)]
 pub struct PageRegions {
     pub page: u32,
-    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin.
+    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin of the
+    /// visible page box (`CropBox ∩ MediaBox`, else the MediaBox). By
+    /// default the box is read as laid out in the content stream with
+    /// `/Rotate` not applied — the frame `extractTextWithPositions` reports
+    /// items in, flipped to a top-left origin — which matches a rendered
+    /// page image only for pages with `/Rotate 0` whose text is not
+    /// predominantly rotated (such a page is turned so its text reads
+    /// left-to-right, see [`TextItem`]). With
+    /// `{ frame: "display" }` (see [`FrameOptions`]) the bbox is read on the
+    /// rendered page: the visible box turned clockwise by the page's
+    /// inheritable `/Rotate`, top-left origin, `y` down.
     pub regions: Vec<Vec<f64>>,
+}
+
+/// Options shared by `extractTextWithPositions`,
+/// `extractTextWithPositionsAndRotations`, `extractTextInRegions` and
+/// `extractTablesInRegions`: the coordinate frame, and whether (and from
+/// which weight class) bold is also read from the font's weight class.
+#[napi(object)]
+#[derive(Clone, Default)]
+pub struct FrameOptions {
+    /// `"sheet"` (default): the visible page box as laid out in the content
+    /// stream, `/Rotate` not applied; pages whose text is predominantly
+    /// rotated are turned so that text reads left-to-right (see
+    /// [`TextItem`]). `"display"`: the rendered page — the visible page box
+    /// turned clockwise by the page's inheritable `/Rotate`, lower-left
+    /// origin and `y` up for items, top-left origin and `y` down for region
+    /// bboxes — with the turn of a rotated page undone, so items sit where a
+    /// renderer draws them and region bboxes can be taken from a rendered
+    /// page image.
+    #[napi(ts_type = "\"sheet\" | \"display\"")]
+    pub frame: Option<String>,
+    /// Also read bold from the font's weight class. When `true`,
+    /// `TextItem.isBold` is also `true` for items whose `fontWeight` is
+    /// `boldWeightThreshold` (600, SemiBold, by default) or more — with
+    /// `boldSource: "WeightClass"` unless the font's name or flags already
+    /// said bold — and adjacent runs are merged by that
+    /// verdict: a run the weight makes bold stays apart from its plain
+    /// neighbours, so a heavier run inside a lighter paragraph keeps its own
+    /// item, while runs whose weights differ but agree on bold merge as
+    /// usual. `false` by default: `isBold` and item merging are then
+    /// unchanged, and `fontWeight` is reported either way.
+    pub bold_from_weight: Option<bool>,
+    /// The weight class from which `boldFromWeight` reads bold, on the
+    /// 100..900 scale: 600 by default, so SemiBold and heavier faces are
+    /// bold. It matters only when `boldFromWeight` is `true`, but a value
+    /// outside 100..900 is an argument error either way.
+    pub bold_weight_threshold: Option<u32>,
 }
 
 /// Extracted text for a single region.
@@ -249,12 +459,31 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_napi_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
+        author: r.author,
+        subject: r.subject,
+        keywords: r.keywords,
+        creator: r.creator,
+        producer: r.producer,
+        creation_date: r.creation_date,
+        mod_date: r.mod_date,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        cmap_gaps: to_napi_font_cmap_gaps(r.cmap_gaps),
     }
+}
+
+fn to_napi_font_cmap_gaps(gaps: Vec<pdf_inspector::FontCMapGaps>) -> Vec<FontCmapGaps> {
+    gaps.into_iter()
+        .map(|gap| FontCmapGaps {
+            font: gap.font,
+            codes: gap.codes,
+            interpolated: gap.interpolated,
+            unmapped: gap.unmapped,
+        })
+        .collect()
 }
 
 fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<PageOcrReasons> {
@@ -364,6 +593,15 @@ fn to_napi_ocr_result(result: pdf_inspector::vision::OcrPdfResult) -> OcrPdfResu
     }
 }
 
+fn convert_bold_source(source: pdf_inspector::BoldSource) -> BoldSource {
+    match source {
+        pdf_inspector::BoldSource::FontName => BoldSource::FontName,
+        pdf_inspector::BoldSource::FontFlags => BoldSource::FontFlags,
+        pdf_inspector::BoldSource::WeightClass => BoldSource::WeightClass,
+        pdf_inspector::BoldSource::Painted => BoldSource::Painted,
+    }
+}
+
 fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<String>) {
     match t {
         pdf_inspector::types::ItemType::Text => (ItemType::Text, None),
@@ -375,6 +613,38 @@ fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<St
 
 fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
     Error::new(Status::GenericFailure, format!("{ctx}: {e}"))
+}
+
+/// The options an optional `FrameOptions` asks for; an unknown frame is an
+/// argument error rather than a silent fallback to the default.
+fn position_options(
+    options: Option<&FrameOptions>,
+    ctx: &str,
+) -> Result<pdf_inspector::PositionOptions> {
+    let frame = match options.and_then(|options| options.frame.as_deref()) {
+        None | Some("sheet") => pdf_inspector::PositionFrame::Sheet,
+        Some("display") => pdf_inspector::PositionFrame::Display,
+        Some(other) => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("{ctx}: unknown frame {other:?}; expected \"sheet\" or \"display\""),
+            ))
+        }
+    };
+    let bold_from_weight = options.is_some_and(|options| options.bold_from_weight == Some(true));
+    let mut position = pdf_inspector::PositionOptions::new()
+        .frame(frame)
+        .bold_from_weight(bold_from_weight);
+    if let Some(threshold) = options.and_then(|options| options.bold_weight_threshold) {
+        if !(100..=900).contains(&threshold) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("{ctx}: boldWeightThreshold {threshold} is outside 100..900"),
+            ));
+        }
+        position = position.bold_weight_threshold(threshold as u16);
+    }
+    Ok(position)
 }
 
 /// Run a closure, catching any Rust panic and converting it to a NAPI error.
@@ -475,50 +745,196 @@ pub fn extract_text(buffer: Buffer) -> Result<String> {
 }
 
 /// Extract text with position information from a PDF Buffer.
+///
+/// Items are reported in PDF points relative to the page's visible page box
+/// (`CropBox ∩ MediaBox`, else the MediaBox) with the box's lower-left
+/// corner as origin — see [`TextItem`]. `pages` is 1-indexed (matching
+/// `TextItem.page`); omit it for the whole document. `options.frame`
+/// selects the coordinate frame (see [`FrameOptions`]): `"sheet"` by
+/// default, `"display"` for the rendered page's frame.
 #[napi]
 pub fn extract_text_with_positions(
     buffer: Buffer,
     pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<TextItem>> {
     let bytes: Vec<u8> = buffer.to_vec();
+    let position = position_options(options.as_ref(), "extract_text_with_positions")?;
     catch_panic("extract_text_with_positions", move || {
-        let items = match pages {
-            Some(p) => {
-                let page_set: HashSet<u32> = p.into_iter().collect();
-                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
-                    &bytes,
-                    Some(&page_set),
-                )
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?
-            }
-            None => pdf_inspector::extractor::extract_text_with_positions_mem(&bytes)
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
-        };
+        extract_text_with_positions_impl(&bytes, pages, position)
+    })
+}
 
-        Ok(items
+fn extract_text_with_positions_impl(
+    bytes: &[u8],
+    pages: Option<Vec<u32>>,
+    position: pdf_inspector::PositionOptions,
+) -> Result<Vec<TextItem>> {
+    let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+    let items = pdf_inspector::extract_text_with_positions_mem_with_options(
+        bytes,
+        page_set.as_ref(),
+        position,
+    )
+    .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
+
+    Ok(items.into_iter().map(convert_text_item).collect())
+}
+
+pub struct ExtractTextWithPositionsTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+    position: pdf_inspector::PositionOptions,
+}
+
+impl Task for ExtractTextWithPositionsTask {
+    type Output = Vec<TextItem>;
+    type JsValue = Vec<TextItem>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        let position = self.position;
+        catch_panic(
+            "extract_text_with_positions",
+            panic::AssertUnwindSafe(move || extract_text_with_positions_impl(&bytes, pages, position)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`extractTextWithPositions`]: same result, but the
+/// extraction runs on the libuv thread pool instead of the event loop and
+/// the call returns a promise. Options are validated before the call
+/// returns (an unknown frame throws synchronously, as in the sync call), and
+/// the buffer is copied then, so it may be reused or mutated immediately.
+#[napi(ts_return_type = "Promise<Array<TextItem>>")]
+pub fn extract_text_with_positions_async(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
+) -> Result<AsyncTask<ExtractTextWithPositionsTask>> {
+    let position = position_options(options.as_ref(), "extract_text_with_positions_async")?;
+    Ok(AsyncTask::new(ExtractTextWithPositionsTask {
+        bytes: buffer.to_vec(),
+        pages,
+        position,
+    }))
+}
+
+/// An sRGB colour as the `[red, green, blue]` array the Node API reports.
+fn convert_color(color: [u8; 3]) -> Vec<u32> {
+    color
+        .iter()
+        .map(|&component| u32::from(component))
+        .collect()
+}
+
+fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
+    let (item_type, link_url) = convert_item_type(&item.item_type);
+    TextItem {
+        text: item.text,
+        x: item.x as f64,
+        y: item.y as f64,
+        width: item.width as f64,
+        height: item.height as f64,
+        font: item.font,
+        font_tag: item.font_tag,
+        legacy_symbol_rewrite: item.legacy_symbol_rewrite.then_some(true),
+        font_size: item.font_size as f64,
+        page: item.page,
+        is_bold: item.is_bold,
+        is_italic: item.is_italic,
+        font_weight: item.font_weight.map(u32::from),
+        bold_source: item.bold_source.map(convert_bold_source),
+        fixed_pitch: item.fixed_pitch,
+        fill_color: item.fill_color.map(convert_color),
+        stroke_color: item.stroke_color.map(convert_color),
+        render_mode: item.render_mode.map(u32::from),
+        is_underline: item.is_underline,
+        is_strikeout: item.is_strikeout,
+        rotation: item.rotation as f64,
+        advance_known: item.advance_known,
+        baseline_shift: item.baseline_shift as f64,
+        item_type,
+        link_url,
+        mcid: item.mcid,
+    }
+}
+
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[napi(object)]
+pub struct PageRotation {
+    /// 1-indexed page number, matching `TextItem.page`.
+    pub page: u32,
+    /// `"ccw"` when the page's runs read bottom-to-top and the frame was
+    /// turned so they read left-to-right, `"cw"` for runs reading
+    /// top-to-bottom.
+    pub rotation: String,
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[napi(object)]
+pub struct PositionedText {
+    pub items: Vec<TextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    pub page_rotations: Vec<PageRotation>,
+}
+
+/// Extract text with positions from a PDF Buffer, together with the
+/// coordinate frame of every page whose text was predominantly rotated.
+/// Items on such a page are expressed in the turned frame (their dominant
+/// runs read left-to-right there); pages absent from `pageRotations` are
+/// upright.
+///
+/// `pages` is 1-indexed (matching `TextItem.page`); omit it for the whole
+/// document. `options.frame` selects the coordinate frame (see
+/// [`FrameOptions`]); with `"display"` the turn of a rotated page is undone
+/// and every item is in the rendered page's frame, while `pageRotations`
+/// keeps reporting which pages were turned.
+#[napi]
+pub fn extract_text_with_positions_and_rotations(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
+) -> Result<PositionedText> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let position = position_options(
+        options.as_ref(),
+        "extract_text_with_positions_and_rotations",
+    )?;
+    catch_panic("extract_text_with_positions_and_rotations", move || {
+        let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+        let (items, rotations) =
+            pdf_inspector::extract_text_with_positions_and_rotations_mem_with_options(
+                &bytes,
+                page_set.as_ref(),
+                position,
+            )
+            .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
+        let mut page_rotations: Vec<PageRotation> = rotations
             .into_iter()
-            .map(|item| {
-                let (item_type, link_url) = convert_item_type(&item.item_type);
-                TextItem {
-                    text: item.text,
-                    x: item.x as f64,
-                    y: item.y as f64,
-                    width: item.width as f64,
-                    height: item.height as f64,
-                    font: item.font,
-                    font_tag: item.font_tag,
-                    font_size: item.font_size as f64,
-                    page: item.page,
-                    is_bold: item.is_bold,
-                    is_italic: item.is_italic,
-                    is_underline: item.is_underline,
-                    is_strikeout: item.is_strikeout,
-                    item_type,
-                    link_url,
-                    mcid: item.mcid,
-                }
+            .filter_map(|(page, rotation)| {
+                let rotation = match rotation {
+                    pdf_inspector::PageRotation::Upright => return None,
+                    pdf_inspector::PageRotation::Ccw => "ccw",
+                    pdf_inspector::PageRotation::Cw => "cw",
+                };
+                Some(PageRotation {
+                    page,
+                    rotation: rotation.to_string(),
+                })
             })
-            .collect())
+            .collect();
+        page_rotations.sort_by_key(|r| r.page);
+        Ok(PositionedText {
+            items: items.into_iter().map(convert_text_item).collect(),
+            page_rotations,
+        })
     })
 }
 
@@ -622,18 +1038,29 @@ pub fn extract_outline(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<Vec<Ou
 /// Each region result includes `needsOcr` — set when the extracted text
 /// is unreliable (empty, GID-encoded fonts, garbage, encoding issues).
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (`CropBox ∩ MediaBox`, else the MediaBox) — the same box
+/// [`extractTextWithPositions`] reports items in, flipped to a top-left
+/// origin: a positioned `y` becomes `boxHeight - y`. For text items `y` is
+/// the baseline, so `[x, boxHeight - y - height, x + width, boxHeight - y]`
+/// covers the glyph band above the baseline; for image, link and form-field
+/// items `y` is the rect bottom and that box is exact. `/Rotate` is not
+/// applied by default; pass `{ frame: "display" }` (see [`FrameOptions`]) to
+/// give bboxes on the rendered page instead.
 #[napi]
 pub fn extract_text_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
+    let position = position_options(options.as_ref(), "extract_text_in_regions")?;
 
     catch_panic("extract_text_in_regions", move || {
-        let results = pdf_inspector::extract_text_in_regions_mem(&bytes, &regions)
-            .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
+        let results =
+            pdf_inspector::extract_text_in_regions_mem_with_options(&bytes, &regions, position)
+                .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
 }
@@ -647,18 +1074,23 @@ pub fn extract_text_in_regions(
 /// `needsOcr` is `false`. When no table is found, `text` is empty and
 /// `needsOcr` is `true` so the caller can fall back to GPU OCR.
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (see `extractTextInRegions`); `options.frame` selects the frame
+/// the same way.
 #[napi]
 pub fn extract_tables_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
+    let position = position_options(options.as_ref(), "extract_tables_in_regions")?;
 
     catch_panic("extract_tables_in_regions", move || {
-        let results = pdf_inspector::extract_tables_in_regions_mem(&bytes, &regions)
-            .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
+        let results =
+            pdf_inspector::extract_tables_in_regions_mem_with_options(&bytes, &regions, position)
+                .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
 }
@@ -669,7 +1101,8 @@ pub fn extract_tables_in_regions(
 /// `null` when the region does not contain a valid vector grid.
 ///
 /// `pageIdx` is 0-indexed. `regionPdfPtBbox` is `[x1,y1,x2,y2]` in PDF
-/// points with top-left origin. `renderDpi` is the DPI of the crop image that
+/// points with top-left origin, relative to the visible page box (see
+/// `extractTextInRegions`). `renderDpi` is the DPI of the crop image that
 /// will consume the returned cell bboxes.
 #[napi]
 pub fn detect_vector_grid_in_region(
@@ -722,7 +1155,8 @@ pub struct TsrTableInputJs {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// top-left origin.
+    /// top-left origin, relative to the visible page box (see
+    /// `extractTextInRegions`).
     pub crop_pdf_pt_bbox: Vec<f64>,
     /// DPI the crop image was rendered at (e.g. `200.0`).
     pub render_dpi: f64,
@@ -772,7 +1206,8 @@ pub struct StructuredCellJs {
     /// Text extracted from the native PDF for this cell (may be empty).
     pub text: String,
     /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left
-    /// origin. Useful for debug overlays or per-cell post-processing.
+    /// origin, relative to the visible page box (the crop's own frame).
+    /// Useful for debug overlays or per-cell post-processing.
     pub page_pt_bbox: Vec<f64>,
 }
 

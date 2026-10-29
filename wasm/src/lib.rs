@@ -1,6 +1,6 @@
 use pdf_inspector::{
-    LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult, PdfType,
-    ProcessMode,
+    FontCMapGaps, LayoutComplexity, MarkdownProfile, PageOcrReasons, PdfOptions, PdfProcessResult,
+    PdfType, ProcessMode,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -29,6 +29,22 @@ export interface PageOcrReasons {
   reasons: string[];
 }
 
+/**
+ * A font whose ToUnicode CMap — or, for a font without one, the embedded
+ * program's cmap table — had no entry for some of the codes the document
+ * shows through it, and what became of those codes.
+ */
+export interface FontCmapGaps {
+  /** The font's /BaseFont name, or its resource name when it has none. */
+  font: string;
+  /** Codes shown through the font's CMap, repeats included: two-byte codes, or the bytes of a single-byte CMap. */
+  codes: number;
+  /** Codes without an entry that were read from the mapped codes around them. */
+  interpolated: number;
+  /** Codes without an entry that could not be read; each is a U+FFFD in the text. */
+  unmapped: number;
+}
+
 export interface LayoutComplexity {
   isComplex: boolean;
   /** 1-indexed page numbers. */
@@ -45,10 +61,37 @@ export interface PdfProcessResult {
   /** 1-indexed page numbers. */
   pagesNeedingOcr: number[];
   ocrReasonsByPage: PageOcrReasons[];
+  /**
+   * The `/Title` of the document information dictionary, decoded as a PDF
+   * text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+   * otherwise). Absent when the entry is missing or not a string. The
+   * entries below follow the same decoding and missing-value rule.
+   */
   title?: string;
+  /** The document information dictionary's `/Author`. */
+  author?: string;
+  /** The document information dictionary's `/Subject`. */
+  subject?: string;
+  /** The document information dictionary's `/Keywords`. */
+  keywords?: string;
+  /** The document information dictionary's `/Creator`: the application the document was authored in. */
+  creator?: string;
+  /** The document information dictionary's `/Producer`: the application that wrote the PDF. */
+  producer?: string;
+  /** The document information dictionary's `/CreationDate` as written, a PDF date string such as `D:20240115103000+01'00'`. */
+  creationDate?: string;
+  /** The document information dictionary's `/ModDate` as written. */
+  modDate?: string;
   confidence: number;
   layout: LayoutComplexity;
   hasEncodingIssues: boolean;
+  /**
+   * Fonts whose ToUnicode CMap — or, for a font without one, the embedded
+   * program's cmap table — lacked an entry for a code the document shows
+   * through it. Always empty for `detectPdf`, which decodes no text;
+   * otherwise empty when every such code had an entry.
+   */
+  cmapGaps: FontCmapGaps[];
 }
 
 export interface PdfClassification {
@@ -101,6 +144,26 @@ impl From<PageOcrReasons> for WasmPageOcrReasons {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WasmFontCmapGaps {
+    font: String,
+    codes: u32,
+    interpolated: u32,
+    unmapped: u32,
+}
+
+impl From<FontCMapGaps> for WasmFontCmapGaps {
+    fn from(value: FontCMapGaps) -> Self {
+        Self {
+            font: value.font,
+            codes: value.codes,
+            interpolated: value.interpolated,
+            unmapped: value.unmapped,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WasmLayoutComplexity {
     is_complex: bool,
     pages_with_tables: Vec<u32>,
@@ -127,9 +190,17 @@ struct WasmPdfProcessResult {
     pages_needing_ocr: Vec<u32>,
     ocr_reasons_by_page: Vec<WasmPageOcrReasons>,
     title: Option<String>,
+    author: Option<String>,
+    subject: Option<String>,
+    keywords: Option<String>,
+    creator: Option<String>,
+    producer: Option<String>,
+    creation_date: Option<String>,
+    mod_date: Option<String>,
     confidence: f64,
     layout: WasmLayoutComplexity,
     has_encoding_issues: bool,
+    cmap_gaps: Vec<WasmFontCmapGaps>,
 }
 
 impl From<PdfProcessResult> for WasmPdfProcessResult {
@@ -146,9 +217,17 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
                 .map(Into::into)
                 .collect(),
             title: value.title,
+            author: value.author,
+            subject: value.subject,
+            keywords: value.keywords,
+            creator: value.creator,
+            producer: value.producer,
+            creation_date: value.creation_date,
+            mod_date: value.mod_date,
             confidence: value.confidence as f64,
             layout: value.layout.into(),
             has_encoding_issues: value.has_encoding_issues,
+            cmap_gaps: value.cmap_gaps.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -391,6 +470,20 @@ mod tests {
 
         assert_eq!(pdf_type, "TextBased");
         assert!(!markdown.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn reports_document_information() {
+        let result = detect_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("detect PDF");
+        let producer = Reflect::get(&result, &JsValue::from_str("producer"))
+            .expect("producer")
+            .as_string();
+        assert_eq!(producer.as_deref(), Some("pypdf"));
+        for absent in ["title", "author", "creationDate", "modDate"] {
+            assert!(Reflect::get(&result, &JsValue::from_str(absent))
+                .expect(absent)
+                .is_undefined());
+        }
     }
 
     #[wasm_bindgen_test]

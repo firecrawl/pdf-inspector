@@ -9,6 +9,12 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod content_geometry;
+mod content_mask;
+mod content_resources;
+mod content_scan;
+use content_scan::ContentCounts;
+
 /// PDF type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdfType {
@@ -52,8 +58,34 @@ pub struct PdfTypeResult {
     pub pages_with_text: u32,
     /// Confidence score (0.0 - 1.0)
     pub confidence: f32,
-    /// Title from metadata (if available)
+    /// The `/Title` of the document information dictionary (the trailer's
+    /// `/Info`), decoded as a PDF text string: UTF-16BE after the byte order
+    /// mark `FE FF`, UTF-8 after `EF BB BF`, PDFDocEncoding otherwise — with
+    /// UTF-16LE after `FF FE` and valid UTF-8 written without a mark read as
+    /// such, language escapes and trailing NULs dropped. `None` when the
+    /// document has no such dictionary, the entry is missing or its value is
+    /// not a string. The other entries below are read the same way; XMP
+    /// metadata is not read.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`, read like `title`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`, read like `title`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`, read like `title`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator` (the application
+    /// the document was authored in), read like `title`.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer` (the application
+    /// that wrote the PDF), read like `title`.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate`, read like
+    /// `title` and returned as written: a PDF date string such as
+    /// `D:20240115103000+01'00'`, neither validated nor converted.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate`, returned as
+    /// written like `creation_date`.
+    pub mod_date: Option<String>,
     /// Whether OCR is recommended for better extraction
     /// True when images provide essential context (e.g., template-based PDFs)
     pub ocr_recommended: bool,
@@ -61,8 +93,8 @@ pub struct PdfTypeResult {
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
     /// Per-page explanation for `pages_needing_ocr`: 1-indexed page → reason
-    /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
-    /// Only contains pages that need OCR.
+    /// codes (`scanned`, `no_text`, `vector_text`, `invisible_text_layer`,
+    /// `suspected_garbled_text`). Only contains pages that need OCR.
     pub ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>>,
 }
 
@@ -217,21 +249,33 @@ pub(crate) fn detect_from_document(
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
+    // Pages read whose form content ran past the scan's byte budget.
+    let mut pages_past_form_budget = 0u32;
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
             log::debug!(
-                "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
-                page_num, analysis.text_operator_count, analysis.has_images,
-                analysis.image_count, analysis.has_template_image,
+                "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} form_bytes={} form_bytes_exceeded={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
+                page_num, analysis.text_operator_count, analysis.executed_text_operator_count,
+                analysis.invisible_text_operator_count,
+                analysis.has_images, analysis.image_count, analysis.has_template_image,
+                analysis.has_covering_image,
+                analysis.executed_form_bytes, analysis.form_bytes_exceeded,
                 analysis.unique_text_chars, analysis.unique_alphanum_chars,
                 analysis.path_op_count, analysis.has_vector_text,
                 analysis.total_image_area, analysis.has_identity_h_no_tounicode,
                 analysis.has_only_type3_fonts, analysis.font_change_count,
                 analysis.has_decodable_text_fonts
             );
+            if analysis.form_bytes_exceeded {
+                pages_past_form_budget += 1;
+                log::debug!(
+                    "page {}: form content past the scan's byte budget after {} bytes; the rest went unread and the page keeps its classification",
+                    page_num, analysis.executed_form_bytes
+                );
+            }
             let is_image_dominated = analysis.image_count > 10
                 && analysis.image_count > analysis.text_operator_count * 3;
             let effective_min_ops = if analysis.has_images || analysis.image_count > 0 {
@@ -244,6 +288,7 @@ pub(crate) fn detect_from_document(
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
                 && !analysis.has_only_type3_fonts
+                && !analysis.has_invisible_text_layer
             {
                 pages_with_text += 1;
             }
@@ -261,8 +306,12 @@ pub(crate) fn detect_from_document(
             // as having real text regardless of raw byte diversity.
             let alphanum_ok = analysis.unique_alphanum_chars < 10
                 && !(analysis.has_decodable_text_fonts && analysis.text_operator_count >= 10);
-            if analysis.has_template_image
-                && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok)
+            // A page whose text is all invisible under an image covering
+            // the page is a scan however many operators the layer has:
+            // the page shows its raster, and the layer only describes it.
+            if (analysis.has_template_image
+                && (analysis.image_count <= 1 && analysis.text_operator_count < 50 && alphanum_ok))
+                || analysis.has_invisible_text_layer
             {
                 pages_with_template_images += 1;
             }
@@ -277,7 +326,8 @@ pub(crate) fn detect_from_document(
             if allow_early_exit
                 && (analysis.text_operator_count < config.min_text_ops_per_page
                     || is_image_dominated
-                    || analysis.unique_text_chars < 5)
+                    || analysis.unique_text_chars < 5
+                    || analysis.has_invisible_text_layer)
                 && (analysis.has_images || analysis.has_template_image)
             {
                 break;
@@ -411,6 +461,7 @@ pub(crate) fn detect_from_document(
                     && analysis.text_operator_count < config.min_text_ops_per_page.max(10);
                 if (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
+                    || analysis.has_invisible_text_layer
                     || sparse_text_over_scan
                     || (analysis.text_operator_count < config.min_text_ops_per_page
                         && analysis.has_images)
@@ -456,20 +507,56 @@ pub(crate) fn detect_from_document(
     pages_needing_ocr.dedup();
 
     // Explain each OCR-flagged page. Pages we analyzed get a signal-derived
-    // reason; pages flagged only by whole-document classification (unsampled
-    // pages of a Scanned/ImageBased doc) default to `scanned`.
+    // reason. Pages flagged only by whole-document classification — the
+    // pages a sample left out of a Scanned/ImageBased document — are still
+    // read for the one signal the byte scan alone gives, so a text layer
+    // nobody sees is named wherever it is; the font and path signals come
+    // from the full analysis and stay with the sampled pages, so such a
+    // page otherwise defaults to `scanned`.
     let mut ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>> =
         std::collections::BTreeMap::new();
     for &page_num in &pages_needing_ocr {
         let reasons = match analysis_cache.get(&page_num) {
             Some(analysis) => page_ocr_reasons(analysis),
-            None => vec![crate::OCR_REASON_SCANNED],
+            None => match pages.get(&page_num) {
+                Some(&page_id) => {
+                    let executed = content_scan::page_executed_content(doc, page_id);
+                    if executed.form_bytes_exceeded {
+                        pages_past_form_budget += 1;
+                        log::debug!(
+                            "page {}: form content past the scan's byte budget after {} bytes; the rest went unread and the page keeps its classification",
+                            page_num, executed.form_bytes
+                        );
+                    }
+                    if executed.shows_only_a_hidden_text_layer {
+                        vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+                    } else {
+                        vec![crate::OCR_REASON_SCANNED]
+                    }
+                }
+                None => vec![crate::OCR_REASON_SCANNED],
+            },
         };
         ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
     }
+    if pages_past_form_budget > 0 {
+        log::debug!(
+            "{} page(s) ran past the scan's byte budget for form content; their evidence is incomplete and their classification unchanged",
+            pages_past_form_budget
+        );
+    }
 
-    // Try to get title from metadata
-    let title = get_document_title(doc);
+    // The document information dictionary's entries, when it has them.
+    let DocumentInfo {
+        title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
+    } = read_document_info(doc);
 
     Ok(PdfTypeResult {
         pdf_type,
@@ -478,6 +565,13 @@ pub(crate) fn detect_from_document(
         pages_with_text,
         confidence,
         title,
+        author,
+        subject,
+        keywords,
+        creator,
+        producer,
+        creation_date,
+        mod_date,
         ocr_recommended,
         pages_needing_ocr,
         ocr_reasons_by_page,
@@ -523,9 +617,35 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
 #[derive(Clone, Default)]
 struct PageAnalysis {
     text_operator_count: u32,
+    /// Text-showing operators the page executes: in its own content and in
+    /// the Form XObjects that content invokes, each once — unlike
+    /// `text_operator_count`, which also counts forms merely bound.
+    executed_text_operator_count: u32,
+    /// Those of `executed_text_operator_count` that left nothing to see:
+    /// run under text render mode 3 (invisible), or under mode 7 (clip
+    /// only) with nothing painted through the clip.
+    invisible_text_operator_count: u32,
     has_images: bool,
     /// Whether page has a large background/template image (>50% coverage)
     has_template_image: bool,
+    /// Whether the images the page's content draws — by `Do`, in its own
+    /// content and in the forms it invokes, each draw clipped to the
+    /// visible page box — cover at least half of the page area, whatever
+    /// their pixel size. Images bound in resources but never drawn do not
+    /// count.
+    has_covering_image: bool,
+    /// Whether every text-showing operator the page executes is invisible
+    /// while images cover the page: a scan carrying a text layer nobody
+    /// sees. What the layer says is not what the page shows, so the page
+    /// is read from its raster.
+    has_invisible_text_layer: bool,
+    /// Bytes of Form XObject and pattern-cell content the page's content
+    /// executed, and whether a form went unread because the page's budget
+    /// of them ran out — the page then keeps the classification it had
+    /// before the executed content was followed, never
+    /// `has_invisible_text_layer`.
+    executed_form_bytes: usize,
+    form_bytes_exceeded: bool,
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
@@ -556,13 +676,21 @@ struct PageAnalysis {
     has_decodable_text_fonts: bool,
 }
 
-/// Explain *why* a page needs OCR, from its content analysis. Priority:
+/// Explain *why* a page needs OCR, from its content analysis. Priority: a
+/// text layer nobody sees under a covering image (`invisible_text_layer`)
+/// comes first — such a page is a scan whatever its fonts are — then
 /// undecodable fonts (`suspected_garbled_text`) and vector-outlined text
-/// (`vector_text`) come first because they persist even when a text layer is
-/// present; otherwise a page with no extractable text is `scanned` when an
-/// image backs it or `no_text` when nothing does.
+/// (`vector_text`), which persist even when a text layer is present;
+/// otherwise a page with no extractable text is `scanned` when an image
+/// backs it or `no_text` when nothing does. `extract_pages_markdown_mem`
+/// puts `invisible_text_layer` first as well; the reasons after it keep
+/// each surface's own order (there, `scanned` can stand beside the font
+/// and path reasons, which here pre-empt it).
 fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    if a.has_invisible_text_layer {
+        reasons.push(crate::OCR_REASON_INVISIBLE_TEXT_LAYER);
+    }
     if a.has_identity_h_no_tounicode || a.has_only_type3_fonts {
         reasons.push(crate::OCR_REASON_SUSPECTED_GARBLED_TEXT);
     }
@@ -740,11 +868,7 @@ fn resolve_with_shadowing(
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
-    let mut text_ops = 0u32;
-    let mut has_images = false;
-    let mut image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+    let mut counts = ContentCounts::default();
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
@@ -755,47 +879,29 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // page-level Resources + Form XObject Resources.
     let mut font_map: HashMap<ObjectId, FontInfo> = HashMap::new();
 
-    // Get content streams for this page — these use the page's resource dict
-    let content_streams = doc.get_page_contents(page_id);
-
     // We need the page's resource dict to resolve font names from page content.
     // get_page_resources returns (Option<&Dictionary>, Vec<ObjectId>) for
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
-    for content_id in content_streams {
-        if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
+    // The page's content streams, read as one and followed through `Do`
+    // (see `content_scan`), with the raw font names they use.
+    let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
+    let (executed, page_counts) =
+        content_scan::scan_page_content(doc, page_id, &mut all_unique_chars, &mut page_font_names);
+    counts.add(page_counts);
 
-            // Scan for text operators, collecting raw font names
-            let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
-                &content,
-                &mut all_unique_chars,
-                &mut page_font_names,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
-
-            // Resolve font names against the page's resource dictionaries,
-            // respecting PDF resource inheritance shadowing: the most-specific
-            // scope (page's own /Resources) wins over inherited ancestors.
-            if let Some((ref resource_dict, ref resource_ids)) = page_resources {
-                resolve_with_shadowing(
-                    doc,
-                    *resource_dict,
-                    resource_ids,
-                    &page_font_names,
-                    &mut used_font_ids,
-                );
-            }
-        }
+    // Resolve font names against the page's resource dictionaries,
+    // respecting PDF resource inheritance shadowing: the most-specific
+    // scope (page's own /Resources) wins over inherited ancestors.
+    if let Some((ref resource_dict, ref resource_ids)) = page_resources {
+        resolve_with_shadowing(
+            doc,
+            *resource_dict,
+            resource_ids,
+            &page_font_names,
+            &mut used_font_ids,
+        );
     }
 
     // Scan XObject Form contents for text operators, collect their fonts,
@@ -804,46 +910,56 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
-            let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+            counts.add(scan_xobjects_in_resources(
                 doc,
                 resources,
                 &mut visited,
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
+            ));
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
                 collect_fonts_from_resource_dict(doc, resources, &mut font_map);
-                let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+                counts.add(scan_xobjects_in_resources(
                     doc,
                     resources,
                     &mut visited,
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
-                );
-                text_ops += ops;
-                image_count += imgs;
-                path_ops += paths;
-                font_changes += fonts;
-                has_images = has_images || imgs > 0;
+                ));
             }
         }
     }
+    let text_ops = counts.text_ops;
+    let image_count = counts.image_count;
+    let path_ops = counts.path_ops;
+    let font_changes = counts.font_changes;
 
-    // Check for XObject images and calculate coverage
+    // Check for XObject images and calculate coverage. An image the
+    // content drew — an inline image, or one a pattern's cell draws — is
+    // an image of the page too, whatever its resources bind.
     let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
+    let has_images = image_count > 0 || found_images || executed.draws_image;
 
-    if found_images {
-        has_images = true;
-    }
+    // The images the page's content drew — in its own streams and in the
+    // forms they invoke, each draw clipped to the page — cover the page
+    // when their boxes on it add up to at least half of it, whatever their
+    // pixel size. Images the resources merely bind, and forms never
+    // invoked, are not content: `has_template_image` judges the pixels of
+    // whatever is bound and has no say here.
+    let has_covering_image = executed.covers_page;
+
+    // A page whose every executed text-showing operator left nothing to
+    // see while images cover it shows the raster alone; the text layer
+    // describes the raster rather than being the page's content.
+    let executed_text_ops = executed.text_ops;
+    let hidden_text_ops = executed.hidden_text_ops;
+    let has_invisible_text_layer = executed.shows_only_a_hidden_text_layer;
+    let executed_form_bytes = executed.form_bytes;
+    let form_bytes_exceeded = executed.form_bytes_exceeded;
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
@@ -858,8 +974,21 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // very few because each glyph is a path, not a Tj/TJ text op. Pages with
     // real selectable text plus decorative paths (column borders, dividers)
     // have many unique alphanum chars — these are NOT vector-outlined text.
-    let has_vector_text =
-        path_ops >= 1000 && path_ops > text_ops.saturating_mul(200) && unique_alphanum_chars < 30;
+    //
+    // The byte count says nothing about text shown through a CID-keyed
+    // font: its two-byte codes are glyph indices whose bytes are rarely
+    // ASCII letters or digits, however much text they carry. A page the
+    // byte count would flag is therefore judged on its decoded text when
+    // any of it came through such a font's ToUnicode CMap (see
+    // `DecodedTextCounts::is_page_text`); decoding walks the content
+    // streams again, so it is not done for the other pages.
+    let mut has_vector_text = path_ops >= 1000
+        && path_ops > text_ops.saturating_mul(200)
+        && (unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS;
+    if has_vector_text {
+        let decoded = decoded_text_counts(doc, page_id);
+        has_vector_text = !(decoded.through_cid_cmap && decoded.is_page_text(path_ops));
+    }
 
     // Check for Identity-H/V fonts without ToUnicode — these produce garbage text.
     // Only consider fonts actually USED by Tf operators in content streams (P1 fix),
@@ -880,8 +1009,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     PageAnalysis {
         text_operator_count: text_ops,
+        executed_text_operator_count: executed_text_ops,
+        invisible_text_operator_count: hidden_text_ops,
         has_images,
         has_template_image,
+        has_covering_image,
+        has_invisible_text_layer,
+        executed_form_bytes,
+        form_bytes_exceeded,
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
@@ -893,6 +1028,366 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         font_change_count: font_changes,
         has_decodable_text_fonts,
     }
+}
+
+/// Distinct alphanumeric characters a page must show for its text to count
+/// as real text next to a mass of path operators — below it, the paths are
+/// taken for outlined glyphs and the page for vector text. Applied to the
+/// bytes of string operands, and to the decoded text of pages that show
+/// text through a CID-keyed font with a ToUnicode CMap.
+const VECTOR_TEXT_MIN_ALPHANUMERICS: usize = 30;
+
+/// Path operators per decoded alphanumeric character beyond which a page's
+/// text is a header or footer next to a drawing rather than the page's
+/// content: outlined body text with a live title and address line runs into
+/// the hundreds, a title over an illustration or a paragraph beside a chart
+/// stays well under.
+const VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER: u32 = 100;
+
+/// Form XObjects read at most when counting a page's decoded text; a page
+/// invoking more is counted as far as that. The page and its forms
+/// together are also held to the extractor's page budgets of decompressed
+/// bytes and of operations.
+const DECODED_TEXT_MAX_FORMS: usize = 1_000;
+
+/// What a page's text amounts to once every string is decoded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DecodedTextCounts {
+    /// Distinct alphanumeric characters.
+    distinct_alphanumerics: usize,
+    /// Alphanumeric characters, repeats included.
+    alphanumerics: usize,
+    /// Whether any string was decoded through the ToUnicode CMap of a
+    /// CID-keyed (Type0) font — the strings whose bytes the byte count
+    /// cannot read.
+    through_cid_cmap: bool,
+}
+
+impl DecodedTextCounts {
+    /// Whether text this diverse and this plentiful is the content of a
+    /// page carrying `path_ops` path operators, rather than the caption,
+    /// title or footer of a drawing: as many distinct letters and digits as
+    /// the byte count asks of a simple font, and at most
+    /// [`VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER`] path operators per
+    /// character.
+    fn is_page_text(self, path_ops: u32) -> bool {
+        self.distinct_alphanumerics >= VECTOR_TEXT_MIN_ALPHANUMERICS
+            && (self.alphanumerics as u64) * u64::from(VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER)
+                >= u64::from(path_ops)
+    }
+}
+
+/// How a font's string operands are read for the decoded text counts.
+enum FontDecoder {
+    /// Codes mapped through the font's ToUnicode CMap; `cid` when the font
+    /// is CID-keyed.
+    CMap {
+        cmap: crate::tounicode::ToUnicodeCMap,
+        cid: bool,
+    },
+    /// A simple font without a usable CMap: one character per byte.
+    Bytes,
+}
+
+/// The decoder for the font dictionary `font`: its ToUnicode CMap when it
+/// has one that parses, direct or referenced; the bytes themselves for a
+/// simple font without one; `None` for a font whose text cannot be decoded
+/// here (a CID-keyed font without a CMap, a Type3 font), whose strings
+/// count for nothing.
+fn font_decoder(doc: &Document, font: &lopdf::Dictionary) -> Option<FontDecoder> {
+    let subtype = font.get(b"Subtype").ok().and_then(|s| s.as_name().ok());
+    let to_unicode = match font.get(b"ToUnicode") {
+        Ok(Object::Stream(stream)) => Some(stream),
+        Ok(Object::Reference(id)) => match doc.get_object(*id) {
+            Ok(Object::Stream(stream)) => Some(stream),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(stream) = to_unicode {
+        // Decompressed within the loader's per-stream bound, which the
+        // largest real CMaps come nowhere near: a stream inflating past it
+        // is not read, and the font goes undecoded rather than costing
+        // more memory than the document's own streams may.
+        let data = match stream
+            .decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
+        {
+            Ok(data) => data,
+            Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
+                ..
+            })) => return None,
+            Err(_) if stream.content.len() > crate::MAX_STREAM_DECOMPRESSED_BYTES => return None,
+            Err(_) => stream.content.clone(),
+        };
+        if let Some(mut cmap) = crate::tounicode::ToUnicodeCMap::parse(&data) {
+            let cid = subtype == Some(b"Type0");
+            // A simple font's codes are one byte, whatever width its CMap
+            // declares: read its strings byte by byte, as extraction does.
+            // A font whose subtype is not a name keeps the CMap's width, in
+            // both (see `PageFontKinds`).
+            if subtype.is_some_and(|name| name != b"Type0") && cmap.code_byte_length != 1 {
+                cmap.code_byte_length = 1;
+                cmap.refresh_gap_fills();
+            }
+            return Some(FontDecoder::CMap { cmap, cid });
+        }
+    }
+    match subtype {
+        Some(b"Type1") | Some(b"TrueType") | Some(b"MMType1") => Some(FontDecoder::Bytes),
+        _ => None,
+    }
+}
+
+/// The font dictionary `name` resolves to in `resources`, with its object
+/// id when it is an indirect object; an inline dictionary has none.
+fn lookup_font<'a>(
+    doc: &'a Document,
+    resources: &'a lopdf::Dictionary,
+    name: &[u8],
+) -> Option<(Option<ObjectId>, &'a lopdf::Dictionary)> {
+    let fonts = match resources.get(b"Font").ok()? {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        _ => return None,
+    };
+    match fonts.get(name).ok()? {
+        Object::Reference(id) => Some((Some(*id), doc.get_dictionary(*id).ok()?)),
+        Object::Dictionary(dict) => Some((None, dict)),
+        _ => None,
+    }
+}
+
+/// The Form XObject `name` resolves to in `resources`, when it is one.
+fn lookup_form(doc: &Document, resources: &lopdf::Dictionary, name: &[u8]) -> Option<ObjectId> {
+    let xobjects = match resources.get(b"XObject").ok()? {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        _ => return None,
+    };
+    let id = xobjects.get(name).ok()?.as_reference().ok()?;
+    let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+        return None;
+    };
+    (stream
+        .dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|s| s.as_name().ok())
+        == Some(b"Form"))
+    .then_some(id)
+}
+
+/// The alphanumeric characters in the text the page shows — in its own
+/// content and in the Form XObjects its content invokes with `Do`, each
+/// once — once every string is decoded through the font in force: its
+/// ToUnicode CMap where it has one, the bytes themselves for a simple font
+/// without one, nothing for a font that cannot be decoded here. Font names
+/// resolve against the stream's own resources, then those of the stream
+/// that invoked it, up to the page's and its ancestors'; the font in force
+/// follows `q`/`Q` like the rest of the graphics state, and a form starts
+/// with the font its invoker had selected, as it does the rest of the text
+/// state. A form is decompressed when its turn comes, so one form's
+/// content is held at a time. Replacement characters, which a CMap that
+/// does not cover its codes produces, are not alphanumeric and do not
+/// count. The page and its forms together are read within the extractor's
+/// page budgets of decompressed bytes and of operations, in the order
+/// invoked — the page, then the forms it invokes, then theirs — so the
+/// budgets go to the text drawn first; what lies beyond them is not
+/// counted, as the extractor would not read it either. A stream that does
+/// not parse is skipped, as the extractor skips it.
+fn decoded_text_counts(doc: &Document, page_id: ObjectId) -> DecodedTextCounts {
+    decoded_text_counts_within(
+        doc,
+        page_id,
+        crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES,
+        crate::extractor::content_decode::MAX_PAGE_OPERATIONS,
+    )
+}
+
+/// [`decoded_text_counts`] within the budgets given: at most `max_bytes`
+/// of decompressed content and `max_operations` operators, over the page
+/// and the forms it invokes together.
+fn decoded_text_counts_within(
+    doc: &Document,
+    page_id: ObjectId,
+    max_bytes: usize,
+    max_operations: usize,
+) -> DecodedTextCounts {
+    use std::rc::Rc;
+
+    let mut page_scope: Vec<&lopdf::Dictionary> = Vec::new();
+    if let Ok((own, ancestors)) = doc.get_page_resources(page_id) {
+        page_scope.extend(own);
+        page_scope.extend(
+            ancestors
+                .iter()
+                .filter_map(|id| doc.get_dictionary(*id).ok()),
+        );
+    }
+    // A page whose content alone is over the budget is not read here, as
+    // the extractor does not read it.
+    let Ok(page_content) = doc.get_page_content_with_limit(page_id, max_bytes) else {
+        return DecodedTextCounts::default();
+    };
+    let mut bytes_left = max_bytes.saturating_sub(page_content.len());
+    let mut operations_left = max_operations;
+
+    enum Pending {
+        Page(Vec<u8>),
+        Form(ObjectId),
+    }
+    /// A stream waiting to be read: the page, or a form with the resource
+    /// scope and the font in force where it was invoked.
+    struct Invocation<'a> {
+        source: Pending,
+        scope: Vec<&'a lopdf::Dictionary>,
+        font: Option<Rc<FontDecoder>>,
+    }
+    let mut pending = std::collections::VecDeque::from([Invocation {
+        source: Pending::Page(page_content),
+        scope: page_scope,
+        font: None,
+    }]);
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    let mut counts = DecodedTextCounts::default();
+    let mut seen: HashSet<char> = HashSet::new();
+    let mut decoders: HashMap<ObjectId, Option<Rc<FontDecoder>>> = HashMap::new();
+    while let Some(Invocation {
+        source,
+        scope: invoking_scope,
+        font: inherited,
+    }) = pending.pop_front()
+    {
+        let (content, scope) = match source {
+            Pending::Page(content) => (content, invoking_scope),
+            Pending::Form(id) => {
+                let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+                    continue;
+                };
+                let mut scope: Vec<&lopdf::Dictionary> = match stream.dict.get(b"Resources") {
+                    Ok(Object::Dictionary(dict)) => vec![dict],
+                    Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok().into_iter().collect(),
+                    _ => Vec::new(),
+                };
+                scope.extend(invoking_scope);
+                // Decompressed within what is left of the page's byte
+                // budget; a stream that fails to decode for another reason
+                // is read raw, as the page content is, if that fits too.
+                let content = match stream.decompressed_content_with_limit(bytes_left) {
+                    Ok(content) => content,
+                    Err(lopdf::Error::Decompress(
+                        lopdf::DecompressError::MemoryLimitExceeded { .. },
+                    )) => break,
+                    Err(_) if stream.content.len() > bytes_left => break,
+                    Err(_) => stream.content.clone(),
+                };
+                bytes_left = bytes_left.saturating_sub(content.len());
+                (content, scope)
+            }
+        };
+        let ops = match crate::extractor::content_decode::decode_content_bounded(
+            &content,
+            operations_left,
+        ) {
+            Ok(Some(ops)) => ops,
+            // The operation budget is spent: nothing further is read.
+            Ok(None) => break,
+            // A stream that does not parse is skipped, as the extractor
+            // skips it; the streams after it are still read.
+            Err(_) => continue,
+        };
+        operations_left = operations_left.saturating_sub(ops.operations.len());
+        let mut current: Option<Rc<FontDecoder>> = inherited;
+        let mut saved: Vec<Option<Rc<FontDecoder>>> = Vec::new();
+        for op in &ops.operations {
+            match op.operator.as_str() {
+                "q" => saved.push(current.clone()),
+                "Q" => {
+                    if let Some(restored) = saved.pop() {
+                        current = restored;
+                    }
+                }
+                "Do" => {
+                    if visited.len() >= DECODED_TEXT_MAX_FORMS {
+                        continue;
+                    }
+                    let form = op
+                        .operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| {
+                            scope
+                                .iter()
+                                .find_map(|resources| lookup_form(doc, resources, name))
+                        });
+                    if let Some(id) = form {
+                        if visited.insert(id) {
+                            pending.push_back(Invocation {
+                                source: Pending::Form(id),
+                                scope: scope.clone(),
+                                font: current.clone(),
+                            });
+                        }
+                    }
+                }
+                "Tf" => {
+                    current = op
+                        .operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| {
+                            scope
+                                .iter()
+                                .find_map(|resources| lookup_font(doc, resources, name))
+                        })
+                        .and_then(|(id, font)| match id {
+                            Some(id) => decoders
+                                .entry(id)
+                                .or_insert_with(|| font_decoder(doc, font).map(Rc::new))
+                                .clone(),
+                            None => font_decoder(doc, font).map(Rc::new),
+                        });
+                }
+                "Tj" | "'" | "\"" | "TJ" => {
+                    let Some(decoder) = current.as_deref() else {
+                        continue;
+                    };
+                    let mut shown: Vec<&[u8]> = Vec::new();
+                    if op.operator == "TJ" {
+                        if let Some(Ok(array)) = op.operands.first().map(|array| array.as_array()) {
+                            shown.extend(array.iter().filter_map(|element| match element {
+                                Object::String(bytes, _) => Some(bytes.as_slice()),
+                                _ => None,
+                            }));
+                        }
+                    } else if let Some(Object::String(bytes, _)) = op.operands.last() {
+                        shown.push(bytes);
+                    }
+                    for bytes in shown {
+                        let decoded: Vec<char> = match decoder {
+                            FontDecoder::CMap { cmap, cid } => {
+                                counts.through_cid_cmap |= *cid && !bytes.is_empty();
+                                cmap.decode_cids(bytes)
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric())
+                                    .collect()
+                            }
+                            FontDecoder::Bytes => bytes
+                                .iter()
+                                .map(|&b| b as char)
+                                .filter(|c| c.is_alphanumeric())
+                                .collect(),
+                        };
+                        counts.alphanumerics += decoded.len();
+                        seen.extend(decoded);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    counts.distinct_alphanumerics = seen.len();
+    counts
 }
 
 /// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
@@ -1030,6 +1525,19 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
             });
         if let Some(ff_ref) = font_file_ref {
             if embedded_font_has_cmap(doc, ff_ref) {
+                return true;
+            }
+            // Fallback 3: no cmap, but the glyph order is the standard
+            // Macintosh one and the metrics corroborate it (see
+            // `mac_glyph_order`); extraction decodes it.
+            if crate::mac_glyph_order::cid_to_gid_is_identity(cid_font_dict, doc)
+                && doc
+                    .get_object(ff_ref)
+                    .and_then(Object::as_stream)
+                    .ok()
+                    .and_then(|stream| stream.decompressed_content().ok())
+                    .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
+            {
                 return true;
             }
         }
@@ -1273,11 +1781,8 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
-) -> (u32, u32, u32, u32) {
-    let mut text_ops = 0u32;
-    let mut image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+) -> ContentCounts {
+    let mut counts = ContentCounts::default();
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -1306,17 +1811,23 @@ fn scan_xobjects_in_resources(
                     let content = stream
                         .decompressed_content()
                         .unwrap_or_else(|_| stream.content.clone());
-                    // Collect raw font names from this XObject's content stream
+                    // Collect raw font names from this XObject's content stream.
+                    // Every form bound is counted here, invoked or not, as
+                    // the text and font tallies always have been; what the
+                    // page executes is followed from its own content, so
+                    // this scan follows no `Do`.
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
-                    let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+                    let own_resources: Vec<&lopdf::Dictionary> =
+                        content_resources::stream_resources(doc, stream)
+                            .into_iter()
+                            .collect();
+                    counts.add(content_scan::scan_content_stream_alone(
+                        doc,
                         &content,
                         unique_chars,
                         &mut xobj_font_names,
-                    );
-                    text_ops += ops;
-                    image_count += imgs;
-                    path_ops += paths;
-                    font_changes += fonts;
+                        &own_resources,
+                    ));
 
                     // Resolve the Form XObject's /Resources — handle both inline
                     // dicts and indirect references (P2 fix: indirect refs were
@@ -1338,144 +1849,44 @@ fn scan_xobjects_in_resources(
                         // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
                         // Recurse into nested XObjects
-                        let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
+                        counts.add(scan_xobjects_in_resources(
                             doc,
                             res,
                             visited,
                             unique_chars,
                             used_font_ids,
                             font_map,
-                        );
-                        text_ops += ops2;
-                        image_count += imgs2;
-                        path_ops += paths2;
-                        font_changes += fonts2;
+                        ));
                     }
                 }
                 Some(b"Image") => {
-                    image_count += 1;
+                    counts.image_count += 1;
                 }
                 _ => {}
             }
         }
     }
 
-    (text_ops, image_count, path_ops, font_changes)
+    counts
 }
 
-/// Fast scan of content stream bytes for text operators
-///
-/// This is a fast heuristic scan that looks for:
-/// - "Tj" - show text string
-/// - "TJ" - show text with individual glyph positioning
-/// - "'" - move to next line and show text
-/// - "\"" - set word/char spacing, move to next line, show text
-///
-/// Returns (text_op_count, image_count, path_op_count, font_change_count).
-/// Unique non-whitespace text characters are collected into `unique_chars`.
+/// [`content_scan::scan_content_stream_alone`] as the counts alone:
+/// `(text_ops, image_count, path_ops, font_changes)`.
+#[cfg(test)]
 fn scan_content_for_text_operators(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
 ) -> (u32, u32, u32, u32) {
-    let mut text_ops = 0u32;
-    let image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
-
-    // Helper: check if position is a word boundary (start of content or preceded by whitespace)
-    let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
-    // Helper: check if position is at end or followed by whitespace
-    let is_word_end =
-        |pos: usize| -> bool { pos + 1 >= content.len() || content[pos + 1].is_ascii_whitespace() };
-
-    // Simple state machine to find operators.
-    // Each Tj/TJ/Tf lookback stops at the previous text/font operator so a
-    // malformed `] TJ` (no `[`) cannot rescan the entire prefix — that was
-    // quadratic in the number of operators.
-    // `Tj`/`TJ` are only counted when the preceding token closes a string or
-    // array (')', '>', ']'), so `Tj` inside `(Hello Tj World)` cannot pin the floor.
-    let mut operand_floor = 0usize;
-    let mut i = 0;
-    while i < content.len() {
-        let b = content[i];
-
-        // Look for 'T' followed by 'j', 'J', or 'f'
-        if b == b'T' && i + 1 < content.len() {
-            let next = content[i + 1];
-            if next == b'j' || next == b'J' {
-                // Verify it's an operator (followed by whitespace or newline)
-                if (i + 2 >= content.len()
-                    || content[i + 2].is_ascii_whitespace()
-                    || content[i + 2] == b'\n'
-                    || content[i + 2] == b'\r')
-                    && preceding_operand_closer(content, i, operand_floor)
-                {
-                    text_ops += 1;
-                    collect_text_chars_before(content, i, unique_chars, operand_floor);
-                    operand_floor = i;
-                }
-            } else if next == b'f' {
-                // Tf = set font operator
-                // Some PDFs concatenate Tf with the next operator without
-                // whitespace (e.g. "25 Tf[<01>..." or "25 Tf(<text>..."),
-                // so also accept '[', '(', '<', '/' as valid followers.
-                if i + 2 >= content.len()
-                    || content[i + 2].is_ascii_whitespace()
-                    || content[i + 2] == b'\n'
-                    || content[i + 2] == b'\r'
-                    || content[i + 2] == b'['
-                    || content[i + 2] == b'('
-                    || content[i + 2] == b'<'
-                    || content[i + 2] == b'/'
-                {
-                    if let Some(name) = extract_font_name_before_tf(content, i, operand_floor) {
-                        used_font_names.insert(name);
-                        font_changes += 1;
-                        operand_floor = i;
-                    }
-                }
-            }
-        }
-
-        // Note: We do NOT count 'Do' operators here because Do invokes any
-        // XObject — including Form XObjects that contain text.  Actual image
-        // detection is handled by scan_xobjects_in_resources (checks Subtype)
-        // and analyze_page_images (measures pixel area).
-
-        // Count path construction/painting operators.
-        // Single-byte: m (moveto), l (lineto), c (curveto), h (closepath),
-        //              f (fill), S (stroke), s (close+stroke), B (fill+stroke),
-        //              F (fill, variant)
-        // These are the high-volume operators in vector-outlined text.
-        match b {
-            b'm' | b'l' | b'c' | b'h' | b'f' | b'S' | b's' | b'B' | b'F'
-                if is_word_start(i) && is_word_end(i) =>
-            {
-                path_ops += 1;
-            }
-            // Two-byte: re (rect), f* (fill even-odd)
-            b'r' if i + 1 < content.len()
-                && content[i + 1] == b'e'
-                && is_word_start(i)
-                && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
-            {
-                path_ops += 1;
-            }
-            b'f' if i + 1 < content.len()
-                && content[i + 1] == b'*'
-                && is_word_start(i)
-                && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace()) =>
-            {
-                path_ops += 1;
-            }
-            _ => {}
-        }
-
-        i += 1;
-    }
-
-    (text_ops, image_count, path_ops, font_changes)
+    let doc = Document::new();
+    let counts =
+        content_scan::scan_content_stream_alone(&doc, content, unique_chars, used_font_names, &[]);
+    (
+        counts.text_ops,
+        counts.image_count,
+        counts.path_ops,
+        counts.font_changes,
+    )
 }
 
 /// True when the token before `op_pos` (skipping whitespace, not crossing
@@ -1485,7 +1896,7 @@ fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool
     let mut j = op_pos;
     while j > floor {
         j -= 1;
-        if !content[j].is_ascii_whitespace() {
+        if !is_pdf_whitespace(content[j]) {
             return matches!(content[j], b')' | b'>' | b']');
         }
     }
@@ -1498,13 +1909,15 @@ fn preceding_operand_closer(content: &[u8], op_pos: usize, floor: usize) -> bool
 /// We scan backward from the position of 'T' in 'Tf' past the size number and
 /// whitespace to find the `/Name` token.
 ///
-/// Returns the font name bytes (without the leading `/`), e.g. `b"F1"` for `/F1`.
-/// `floor` is the start of the previous text/font operator (or 0); lookback
-/// must not cross it.
+/// Returns the font name bytes (without the leading `/`, its `#xx` escapes
+/// decoded as the resource dictionary's keys are), e.g. `b"F1"` for `/F1`
+/// or `/F#31`. `floor` is the start of the previous text/font operator (or
+/// 0); lookback must not cross it. Whitespace is the file format's, NUL
+/// included.
 fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> Option<Vec<u8>> {
     // Scan backward past whitespace before "Tf"
     let mut j = tf_pos;
-    while j > floor && content[j - 1].is_ascii_whitespace() {
+    while j > floor && is_pdf_whitespace(content[j - 1]) {
         j -= 1;
     }
     // Scan backward past the size number (digits, '.', '-')
@@ -1514,15 +1927,14 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> O
         j -= 1;
     }
     // Scan backward past whitespace between font name and size
-    while j > floor && content[j - 1].is_ascii_whitespace() {
+    while j > floor && is_pdf_whitespace(content[j - 1]) {
         j -= 1;
     }
     // Now j should point just after the font name. Scan backward to find '/'.
     let name_end = j;
     while j > floor && content[j - 1] != b'/' {
         // Font names consist of regular characters (not whitespace, not delimiters)
-        if content[j - 1].is_ascii_whitespace() || content[j - 1] == b'(' || content[j - 1] == b')'
-        {
+        if is_pdf_whitespace(content[j - 1]) || content[j - 1] == b'(' || content[j - 1] == b')' {
             return None;
         }
         j -= 1;
@@ -1532,7 +1944,7 @@ fn extract_font_name_before_tf(content: &[u8], tf_pos: usize, floor: usize) -> O
     }
     // j-1 is the '/', font name is content[j..name_end]
     if j < name_end {
-        Some(content[j..name_end].to_vec())
+        Some(content_mask::decode_name_escapes(&content[j..name_end]))
     } else {
         None
     }
@@ -1550,11 +1962,12 @@ fn collect_text_chars_before(
     unique_chars: &mut HashSet<u8>,
     floor: usize,
 ) {
-    // Walk backward past whitespace to find the closing delimiter
+    // Walk backward past whitespace (the file format's, NUL included) to
+    // find the closing delimiter
     let mut j = op_pos;
     while j > floor {
         j -= 1;
-        if !content[j].is_ascii_whitespace() {
+        if !is_pdf_whitespace(content[j]) {
             break;
         }
     }
@@ -1785,8 +2198,9 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
     (has_images, total_area, has_template_image)
 }
 
-/// Computes both `(needs_ocr_for_template_image, has_vector_text)` for a
-/// page from a single shared `analyze_page_content` pass — that call
+/// Computes `template_image_needs_ocr`, `has_vector_text` and
+/// `has_invisible_text_layer` (see [`PageOcrSignals`]) for a page from a
+/// single shared `analyze_page_content` pass — that call
 /// decompresses and scans every content stream (page + XObjects) plus
 /// image coverage, so `extract_pages_markdown_mem` must not invoke it
 /// twice per page (once per signal) the way `detect_from_document` avoids
@@ -1830,7 +2244,7 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
 /// Exposed at crate visibility so `extract_pages_markdown_mem` can apply
 /// the same gates classification needs elsewhere instead of treating the
 /// raw signals alone as sufficient — see #227/#231.
-pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSignals {
     let analysis = analyze_page_content(doc, page_id);
 
     let needs_ocr_for_template_image = if !analysis.has_template_image {
@@ -1845,7 +2259,25 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> (bool, bool
         looks_like_scan || insufficient_text
     };
 
-    (needs_ocr_for_template_image, analysis.has_vector_text)
+    PageOcrSignals {
+        template_image_needs_ocr: needs_ocr_for_template_image,
+        has_vector_text: analysis.has_vector_text,
+        has_invisible_text_layer: analysis.has_invisible_text_layer,
+    }
+}
+
+/// The per-page signals [`page_ocr_signals`] shares between classification
+/// and per-page extraction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PageOcrSignals {
+    /// The page's template image is a scan needing OCR rather than a
+    /// watermark, letterhead or figure under a text page.
+    pub(crate) template_image_needs_ocr: bool,
+    /// The page's text is drawn as vector outlines.
+    pub(crate) has_vector_text: bool,
+    /// Every text-showing operator on the page is invisible while an image
+    /// covers the page.
+    pub(crate) has_invisible_text_layer: bool,
 }
 
 /// Recursively collect image dimensions from XObject resources,
@@ -1940,34 +2372,108 @@ fn collect_images_from_resources(
     }
 }
 
-/// Get document title from Info dictionary
-fn get_document_title(doc: &Document) -> Option<String> {
-    let info_ref = doc.trailer.get(b"Info").ok()?.as_reference().ok()?;
-    let info = doc.get_dictionary(info_ref).ok()?;
-    let title_obj = info.get(b"Title").ok()?;
+/// The text entries of a document information dictionary, each decoded as
+/// a PDF text string (see [`PdfTypeResult::title`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DocumentInfo {
+    pub(crate) title: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) subject: Option<String>,
+    pub(crate) keywords: Option<String>,
+    pub(crate) creator: Option<String>,
+    pub(crate) producer: Option<String>,
+    pub(crate) creation_date: Option<String>,
+    pub(crate) mod_date: Option<String>,
+}
 
-    match title_obj {
-        Object::String(bytes, _) => {
-            // Handle UTF-16BE encoding (BOM: 0xFE 0xFF)
-            if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-                let utf16: Vec<u16> = bytes[2..]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|chunk| u16::from_be_bytes(*chunk))
-                    .collect();
-                Some(String::from_utf16_lossy(&utf16))
-            } else {
-                Some(String::from_utf8_lossy(bytes).to_string())
-            }
-        }
+/// Read the document information dictionary the trailer's `/Info` names,
+/// directly or by reference. An entry that is missing, or whose value
+/// (followed through a reference) is not a string, reads as `None`.
+pub(crate) fn read_document_info(doc: &Document) -> DocumentInfo {
+    let info = match doc.trailer.get(b"Info") {
+        Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+        Ok(Object::Dictionary(dict)) => Some(dict),
         _ => None,
+    };
+    let Some(info) = info else {
+        return DocumentInfo::default();
+    };
+    let entry = |key: &[u8]| -> Option<String> {
+        let value = match info.get(key).ok()? {
+            Object::Reference(id) => doc.get_object(*id).ok()?,
+            value => value,
+        };
+        match value {
+            Object::String(bytes, _) => Some(crate::text_utils::decode_pdf_text_string(bytes)),
+            _ => None,
+        }
+    };
+    DocumentInfo {
+        title: entry(b"Title"),
+        author: entry(b"Author"),
+        subject: entry(b"Subject"),
+        keywords: entry(b"Keywords"),
+        creator: entry(b"Creator"),
+        producer: entry(b"Producer"),
+        creation_date: entry(b"CreationDate"),
+        mod_date: entry(b"ModDate"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_info_entries_are_read_and_decoded() {
+        use lopdf::{dictionary, StringFormat};
+
+        let utf16 = |text: &str| {
+            let mut bytes = vec![0xFE, 0xFF];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            Object::String(bytes, StringFormat::Hexadecimal)
+        };
+        let mut doc = Document::with_version("1.7");
+        let keywords = doc.add_object(Object::string_literal("annual, colour"));
+        let info = doc.add_object(dictionary! {
+            "Title" => utf16("Größe – Überblick"),
+            "Author" => Object::string_literal(b"Jos\xE9 Mart\xEDnez \x84 Acme\x92".to_vec()),
+            "Subject" => Object::string_literal("Quarterly results"),
+            "Keywords" => Object::Reference(keywords),
+            "Creator" => Object::string_literal("Writer"),
+            "Producer" => utf16("PDF Library 1.0"),
+            "CreationDate" => Object::string_literal("D:20240115103000+01'00'"),
+            "ModDate" => Object::Name(b"NotAString".to_vec()),
+        });
+        doc.trailer.set("Info", Object::Reference(info));
+        assert_eq!(
+            read_document_info(&doc),
+            DocumentInfo {
+                title: Some("Größe – Überblick".into()),
+                author: Some("José Martínez — Acme™".into()),
+                subject: Some("Quarterly results".into()),
+                keywords: Some("annual, colour".into()),
+                creator: Some("Writer".into()),
+                producer: Some("PDF Library 1.0".into()),
+                creation_date: Some("D:20240115103000+01'00'".into()),
+                mod_date: None,
+            }
+        );
+
+        // An information dictionary written in place of a reference reads
+        // the same; a document without one reads nothing.
+        doc.trailer.set(
+            "Info",
+            dictionary! { "Producer" => Object::string_literal("Inline") },
+        );
+        let inline = read_document_info(&doc);
+        assert_eq!(inline.producer.as_deref(), Some("Inline"));
+        assert_eq!(inline.title, None);
+        doc.trailer.remove(b"Info");
+        assert_eq!(read_document_info(&doc), DocumentInfo::default());
+    }
 
     #[test]
     fn page_ocr_reasons_classify() {
@@ -2024,6 +2530,37 @@ mod tests {
         assert_eq!(
             page_ocr_reasons(&text_with_image),
             vec![crate::OCR_REASON_SCANNED]
+        );
+
+        // A text layer nobody sees under a covering image: the specific
+        // reason, not the `scanned` fall-through, and ahead of garbled
+        // fonts and vector text — the page is a scan whatever its fonts.
+        let invisible_layer = PageAnalysis {
+            text_operator_count: 300,
+            executed_text_operator_count: 300,
+            invisible_text_operator_count: 300,
+            unique_text_chars: 40,
+            has_images: true,
+            has_covering_image: true,
+            has_invisible_text_layer: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&invisible_layer),
+            vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+        );
+        let garbled_vector_invisible_layer = PageAnalysis {
+            has_identity_h_no_tounicode: true,
+            has_vector_text: true,
+            ..invisible_layer
+        };
+        assert_eq!(
+            page_ocr_reasons(&garbled_vector_invisible_layer),
+            vec![
+                crate::OCR_REASON_INVISIBLE_TEXT_LAYER,
+                crate::OCR_REASON_SUSPECTED_GARBLED_TEXT,
+                crate::OCR_REASON_VECTOR_TEXT
+            ]
         );
     }
 
@@ -2091,7 +2628,8 @@ mod tests {
     fn test_scan_content_malformed_tj_lookback_stays_linear() {
         // `] TJ` with no `[` used to walk the entire prefix for every operator
         // (quadratic). 30k repeats is enough that a prefix rescan would dominate
-        // the test runtime; with the floor it is a single linear pass.
+        // the test runtime; with the floor it is a single linear pass. Such an
+        // operator has no string to show, so none of them is counted.
         let n = 30_000usize;
         let mut content = Vec::with_capacity(n * 5);
         for _ in 0..n {
@@ -2100,7 +2638,7 @@ mod tests {
         let mut uchars = HashSet::new();
         let (ops, _, _, _) =
             scan_content_for_text_operators(&content, &mut uchars, &mut HashSet::new());
-        assert_eq!(ops, n as u32);
+        assert_eq!(ops, 0);
         assert!(uchars.is_empty());
     }
 
@@ -3102,7 +3640,7 @@ mod tests {
             analysis.unique_alphanum_chars >= 10,
             "sanity: masthead text is diverse, alphanum_low cannot fire"
         );
-        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        let needs_ocr = page_ocr_signals(&doc, page_id).template_image_needs_ocr;
         assert!(
             needs_ocr,
             "template image + text below the pages_with_text floor is a scan"
@@ -3128,7 +3666,7 @@ mod tests {
             analysis.text_operator_count >= 10,
             "sanity: body text clears the floor"
         );
-        let (needs_ocr, _) = page_ocr_signals(&doc, page_id);
+        let needs_ocr = page_ocr_signals(&doc, page_id).template_image_needs_ocr;
         assert!(
             !needs_ocr,
             "a text page with a background image must stay native"
@@ -3918,6 +4456,566 @@ mod tests {
         assert!(
             analysis.has_decodable_text_fonts,
             "P3: inherited decodable font should be detected as used"
+        );
+    }
+
+    /// Three lines that together show forty distinct letters, digits and
+    /// spaces.
+    const CID_TEXT_LINES: [&str; 3] = [
+        "The quick brown fox jumps over the lazy dog",
+        "Pack my box with five dozen liquor jugs 0123456789",
+        "Sphinx of black quartz judge my vow",
+    ];
+
+    /// Where a page's CID text is shown and how its font is written.
+    #[derive(Clone, Copy, PartialEq)]
+    enum CidTextLayout {
+        /// In the page content, the font an indirect object with a
+        /// referenced ToUnicode stream.
+        Page,
+        /// In the page content, the font dictionary and its ToUnicode
+        /// stream written inline in the resources.
+        InlineFont,
+        /// In a Form XObject with its own font resources.
+        Form,
+        /// In a Form XObject without resources, using the page's font.
+        FormInheritingFonts,
+        /// In the page content after a `q`/`Q` that selected another font
+        /// inside the saved state.
+        AfterRestoredFont,
+        /// In a Form XObject the page's resources name but its content
+        /// never invokes.
+        UninvokedForm,
+        /// In a Form XObject without resources or a `Tf` of its own, shown
+        /// in the font the page selected before invoking it.
+        FormInheritingFontState,
+        /// In a Form XObject with its own font resources, invoked before a
+        /// second, larger form of paths.
+        FormThenLargerForm,
+        /// In a Form XObject with its own font resources, invoked after a
+        /// form whose content breaks off inside a string.
+        MalformedFormThenForm,
+    }
+
+    /// A page of `paths` filled triangles and `lines` of text shown as
+    /// two-byte codes through a Type0 font: an embedded TrueType subset
+    /// under Identity-H whose glyph `i` is the `i`th distinct character of
+    /// the lines, with a ToUnicode CMap saying so — or, when `broken_cmap`,
+    /// mapping every code to the same letter. `layout` says where the text
+    /// is shown and how the font is written.
+    fn cid_text_over_vector_art(
+        lines: &[&str],
+        paths: usize,
+        broken_cmap: bool,
+        layout: CidTextLayout,
+    ) -> (Document, ObjectId) {
+        use lopdf::{dictionary, Stream};
+
+        let mut alphabet: Vec<char> = lines.iter().flat_map(|line| line.chars()).collect();
+        alphabet.sort_unstable();
+        alphabet.dedup();
+        let code_of = |c: char| alphabet.iter().position(|&a| a == c).unwrap() as u16 + 1;
+
+        let mut cmap = String::from(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+             /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+             1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+        );
+        cmap.push_str(&format!("{} beginbfchar\n", alphabet.len()));
+        for &c in &alphabet {
+            let unicode = if broken_cmap { 'x' as u32 } else { c as u32 };
+            cmap.push_str(&format!("<{:04X}> <{:04X}>\n", code_of(c), unicode));
+        }
+        cmap.push_str(
+            "endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n",
+        );
+
+        let glyphs: Vec<(bool, u16)> = alphabet.iter().map(|_| (true, 600)).collect();
+        let codes: Vec<u8> = alphabet.iter().map(|&c| c as u8).collect();
+        let font_file =
+            crate::extractor::fonts::blank_glyph_tests::synthetic_truetype(&glyphs, &codes);
+
+        let mut doc = Document::with_version("1.5");
+        let font_file_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! { "Length1" => font_file.len() as i64 },
+            font_file,
+        )));
+        let descriptor_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "AAAAAA+Subset",
+            "Flags" => 4,
+            "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 700,
+            "Descent" => 0,
+            "CapHeight" => 700,
+            "StemV" => 80,
+            "FontFile2" => Object::Reference(font_file_id),
+        });
+        let cid_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "AAAAAA+Subset",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0,
+            },
+            "FontDescriptor" => Object::Reference(descriptor_id),
+            "DW" => 600,
+            "CIDToGIDMap" => "Identity",
+        });
+        let cmap_stream = Stream::new(dictionary! {}, cmap.into_bytes());
+        let font = |to_unicode: Object| {
+            dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => "AAAAAA+Subset",
+                "Encoding" => "Identity-H",
+                "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+                "ToUnicode" => to_unicode,
+            }
+        };
+        let font_entry = if layout == CidTextLayout::InlineFont {
+            Object::Dictionary(font(Object::Stream(cmap_stream)))
+        } else {
+            let cmap_id = doc.add_object(Object::Stream(cmap_stream));
+            Object::Reference(doc.add_object(font(Object::Reference(cmap_id))))
+        };
+        let helvetica_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+
+        let mut art = String::new();
+        for i in 0..paths {
+            let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
+            art.push_str(&format!(
+                "{x} {y} m {} {} l {} {y} l h f\n",
+                x + 5,
+                y + 8,
+                x + 10
+            ));
+        }
+        let mut text = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            let hex: String = line
+                .chars()
+                .map(|c| format!("{:04X}", code_of(c)))
+                .collect();
+            text.push_str(&format!(
+                "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+                700 - 20 * index
+            ));
+        }
+        let fonts = dictionary! {
+            "F1" => font_entry,
+            "F2" => Object::Reference(helvetica_id),
+        };
+        let (page_content, page_resources) = match layout {
+            CidTextLayout::Page | CidTextLayout::InlineFont => {
+                (format!("{art}{text}"), dictionary! { "Font" => fonts })
+            }
+            CidTextLayout::AfterRestoredFont => (
+                format!(
+                    "{art}BT /F1 12 Tf ET q BT /F2 12 Tf 72 40 Td (x) Tj ET Q\n{}",
+                    text.replace("/F1 12 Tf ", "")
+                ),
+                dictionary! { "Font" => fonts },
+            ),
+            CidTextLayout::Form
+            | CidTextLayout::FormInheritingFonts
+            | CidTextLayout::UninvokedForm
+            | CidTextLayout::FormInheritingFontState
+            | CidTextLayout::FormThenLargerForm
+            | CidTextLayout::MalformedFormThenForm => {
+                let form_dict = || {
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    }
+                };
+                let mut text_form_dict = form_dict();
+                if matches!(
+                    layout,
+                    CidTextLayout::Form
+                        | CidTextLayout::FormThenLargerForm
+                        | CidTextLayout::MalformedFormThenForm
+                ) {
+                    text_form_dict.set("Resources", dictionary! { "Font" => fonts.clone() });
+                }
+                let form_text = if layout == CidTextLayout::FormInheritingFontState {
+                    text.replace("/F1 12 Tf ", "")
+                } else {
+                    text
+                };
+                let form_id = doc.add_object(Object::Stream(Stream::new(
+                    text_form_dict,
+                    form_text.into_bytes(),
+                )));
+                let mut xobjects = dictionary! { "Fm1" => Object::Reference(form_id) };
+                let invoke = match layout {
+                    CidTextLayout::UninvokedForm => String::new(),
+                    CidTextLayout::FormInheritingFontState => {
+                        "BT /F1 12 Tf ET q /Fm1 Do Q\n".to_string()
+                    }
+                    CidTextLayout::FormThenLargerForm => {
+                        // A second form of paths, invoked after the text.
+                        let larger = doc.add_object(Object::Stream(Stream::new(
+                            form_dict(),
+                            art.clone().into_bytes(),
+                        )));
+                        xobjects.set("Fm2", Object::Reference(larger));
+                        "q /Fm1 Do Q q /Fm2 Do Q\n".to_string()
+                    }
+                    CidTextLayout::MalformedFormThenForm => {
+                        // A form whose content breaks off inside a string,
+                        // invoked before the text.
+                        let malformed = doc.add_object(Object::Stream(Stream::new(
+                            form_dict(),
+                            b"BT /F2 12 Tf 72 40 Td (broken".to_vec(),
+                        )));
+                        xobjects.set("Fm0", Object::Reference(malformed));
+                        "q /Fm0 Do Q q /Fm1 Do Q\n".to_string()
+                    }
+                    _ => "q /Fm1 Do Q\n".to_string(),
+                };
+                (
+                    format!("{art}{invoke}"),
+                    dictionary! {
+                        "Font" => fonts,
+                        "XObject" => xobjects,
+                    },
+                )
+            }
+        };
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            page_content.into_bytes(),
+        )));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => page_resources,
+            "Contents" => Object::Reference(content_id),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => Object::Integer(1),
+            }),
+        );
+        (doc, page_id)
+    }
+
+    /// Text shown through a CID-keyed font with a ToUnicode CMap counts by
+    /// its decoded characters: three lines of prose next to two thousand
+    /// path operators (a drawing of about seventeen operators per
+    /// character) are text, although their two-byte codes hold no ASCII
+    /// letter or digit.
+    #[test]
+    fn cid_text_with_a_working_tounicode_is_not_vector_text() {
+        for layout in [
+            CidTextLayout::Page,
+            CidTextLayout::InlineFont,
+            CidTextLayout::Form,
+            CidTextLayout::FormInheritingFonts,
+            CidTextLayout::AfterRestoredFont,
+            CidTextLayout::FormInheritingFontState,
+            CidTextLayout::FormThenLargerForm,
+            CidTextLayout::MalformedFormThenForm,
+        ] {
+            let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, layout);
+            let analysis = analyze_page_content(&doc, page_id);
+            assert!(analysis.path_op_count >= 1000, "{}", analysis.path_op_count);
+            assert!(
+                (analysis.unique_alphanum_chars as usize) < VECTOR_TEXT_MIN_ALPHANUMERICS,
+                "the byte count is blind to the codes: {}",
+                analysis.unique_alphanum_chars
+            );
+            assert!(!analysis.has_vector_text, "layout {}", layout as u8);
+            assert_eq!(page_ocr_signals(&doc, page_id), PageOcrSignals::default());
+        }
+    }
+
+    /// A caption's worth of decoded text does not make a page of paths a
+    /// text page; neither does a CMap that maps every code alike, nor a
+    /// title and address line, diverse as they are, over forty thousand
+    /// path operators of outlined body text, nor text in a form the page
+    /// never invokes.
+    #[test]
+    fn little_or_undecodable_cid_text_over_vector_art_stays_vector_text() {
+        let (doc, page_id) = cid_text_over_vector_art(&["Fig 3"], 400, false, CidTextLayout::Page);
+        assert!(analyze_page_content(&doc, page_id).has_vector_text);
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 400, true, CidTextLayout::Page);
+        assert!(analyze_page_content(&doc, page_id).has_vector_text);
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 8_000, false, CidTextLayout::Page);
+        let analysis = analyze_page_content(&doc, page_id);
+        assert!(
+            analysis.path_op_count >= 40_000,
+            "{}",
+            analysis.path_op_count
+        );
+        assert!(analysis.has_vector_text);
+        // Text in a form the page never invokes is not shown.
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, CidTextLayout::UninvokedForm);
+        assert!(analyze_page_content(&doc, page_id).has_vector_text);
+        assert!(!decoded_text_counts(&doc, page_id).through_cid_cmap);
+    }
+
+    /// A simple font's ToUnicode CMap declared two bytes wide over one-byte
+    /// entries decodes one byte per code, as extraction reads it; a
+    /// composite font keeps the CMap's two-byte codes.
+    #[test]
+    fn a_simple_fonts_cmap_declared_two_bytes_wide_decodes_one_byte_per_code() {
+        use lopdf::dictionary;
+
+        let cmap = b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+            3 beginbfchar\n<0A> <006E>\n<82> <0063>\n<0020> <0020>\nendbfchar\n";
+        let mut doc = Document::with_version("1.5");
+        let stream = doc.add_object(lopdf::Stream::new(dictionary! {}, cmap.to_vec()));
+        let simple = dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "ToUnicode" => stream,
+        };
+        let composite = dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "Composite",
+            "Encoding" => "Identity-H", "ToUnicode" => stream,
+        };
+        let decode = |font: &lopdf::Dictionary| match font_decoder(&doc, font) {
+            Some(FontDecoder::CMap { cmap, .. }) => cmap.decode_cids(&[0x0A, 0x82]),
+            _ => panic!("a CMap decoder"),
+        };
+        assert_eq!(decode(&simple), "nc");
+        assert_ne!(decode(&composite), "nc");
+        // A font without a subtype keeps the CMap's width, as extraction
+        // keeps it.
+        let unknown = dictionary! {
+            "Type" => "Font", "BaseFont" => "NoSubtype", "ToUnicode" => stream,
+        };
+        assert_ne!(decode(&unknown), "nc");
+    }
+
+    /// The decoded counts cover the whole text: the three lines show
+    /// thirty-nine distinct letters and digits, one hundred and six in all,
+    /// through the CID font's CMap. They are the page's text next to a
+    /// drawing of up to a hundred path operators per character, and a
+    /// header next to a larger one.
+    #[test]
+    fn decoded_text_counts_cover_the_whole_text() {
+        for layout in [
+            CidTextLayout::Page,
+            CidTextLayout::InlineFont,
+            CidTextLayout::FormInheritingFonts,
+            CidTextLayout::AfterRestoredFont,
+            CidTextLayout::FormInheritingFontState,
+            CidTextLayout::FormThenLargerForm,
+            CidTextLayout::MalformedFormThenForm,
+        ] {
+            let (doc, page_id) = cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, layout);
+            let counts = decoded_text_counts(&doc, page_id);
+            assert_eq!(
+                (counts.distinct_alphanumerics, counts.through_cid_cmap),
+                (39, true),
+                "layout {}",
+                layout as u8
+            );
+            // The restored-font layout paints one more glyph in the
+            // simple font before the CID text.
+            let extra = usize::from(layout == CidTextLayout::AfterRestoredFont);
+            assert_eq!(counts.alphanumerics, 106 + extra);
+            let at_the_bar = counts.alphanumerics as u32 * VECTOR_TEXT_MAX_PATH_OPS_PER_CHARACTER;
+            assert!(counts.is_page_text(at_the_bar));
+            assert!(!counts.is_page_text(at_the_bar + 1));
+        }
+        let sparse = DecodedTextCounts {
+            distinct_alphanumerics: 29,
+            alphanumerics: 1_000,
+            through_cid_cmap: true,
+        };
+        assert!(!sparse.is_page_text(1_000));
+    }
+
+    /// The page and the forms it invokes are read together within the
+    /// page's budgets: with the operations, or the bytes, spent on the
+    /// page's own content, the form's text goes uncounted; with room for
+    /// the form, it is counted in full; a page over the byte budget by
+    /// itself counts nothing.
+    #[test]
+    fn decoded_text_counts_stay_within_the_page_budgets() {
+        let (doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, CidTextLayout::Form);
+        let page_content = doc.get_page_content(page_id);
+        let page_operations = lopdf::content::Content::decode(&page_content)
+            .unwrap()
+            .operations
+            .len();
+        let form = doc
+            .objects
+            .values()
+            .find_map(|object| match object {
+                Object::Stream(stream)
+                    if stream.dict.get(b"Subtype").ok()
+                        == Some(&Object::Name(b"Form".to_vec())) =>
+                {
+                    Some(stream)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let form_operations = lopdf::content::Content::decode(&form.content)
+            .unwrap()
+            .operations
+            .len();
+        let full = DecodedTextCounts {
+            distinct_alphanumerics: 39,
+            alphanumerics: 106,
+            through_cid_cmap: true,
+        };
+        let bytes = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
+        let operations = crate::extractor::content_decode::MAX_PAGE_OPERATIONS;
+
+        assert_eq!(
+            decoded_text_counts_within(&doc, page_id, bytes, page_operations),
+            DecodedTextCounts::default()
+        );
+        assert_eq!(
+            decoded_text_counts_within(&doc, page_id, bytes, page_operations + form_operations),
+            full
+        );
+        assert_eq!(
+            decoded_text_counts_within(&doc, page_id, page_content.len(), operations),
+            DecodedTextCounts::default()
+        );
+        assert_eq!(
+            decoded_text_counts_within(
+                &doc,
+                page_id,
+                page_content.len() + form.content.len(),
+                operations
+            ),
+            full
+        );
+        assert_eq!(
+            decoded_text_counts_within(&doc, page_id, page_content.len() / 2, operations),
+            DecodedTextCounts::default()
+        );
+        assert_eq!(decoded_text_counts(&doc, page_id), full);
+    }
+
+    /// The Form XObject streams of `doc`, in no particular order.
+    fn form_streams(doc: &Document) -> Vec<&lopdf::Stream> {
+        doc.objects
+            .values()
+            .filter_map(|object| match object {
+                Object::Stream(stream)
+                    if stream.dict.get(b"Subtype").ok()
+                        == Some(&Object::Name(b"Form".to_vec())) =>
+                {
+                    Some(stream)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The forms a page invokes are read in the order invoked, so the
+    /// budgets go to the text drawn first: with room for the page and the
+    /// text form only, a larger form invoked after it goes unread and the
+    /// text is counted in full. A form whose content breaks off is read up
+    /// to the fault, and the forms invoked after it are still read.
+    #[test]
+    fn forms_are_read_in_invocation_order_within_the_budgets() {
+        let full = DecodedTextCounts {
+            distinct_alphanumerics: 39,
+            alphanumerics: 106,
+            through_cid_cmap: true,
+        };
+        let operations = |content: &[u8]| {
+            lopdf::content::Content::decode(content)
+                .unwrap()
+                .operations
+                .len()
+        };
+        let bytes = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
+        let ops = crate::extractor::content_decode::MAX_PAGE_OPERATIONS;
+
+        let (doc, page_id) = cid_text_over_vector_art(
+            &CID_TEXT_LINES,
+            400,
+            false,
+            CidTextLayout::FormThenLargerForm,
+        );
+        let page_content = doc.get_page_content(page_id);
+        let text_form = form_streams(&doc)
+            .into_iter()
+            .find(|stream| stream.content.windows(3).any(|w| w == &b" Tj"[..]))
+            .unwrap();
+        let just_enough_operations = operations(&page_content) + operations(&text_form.content);
+        let just_enough_bytes = page_content.len() + text_form.content.len();
+        assert_eq!(
+            decoded_text_counts_within(&doc, page_id, bytes, just_enough_operations),
+            full
+        );
+        assert_eq!(
+            decoded_text_counts_within(&doc, page_id, just_enough_bytes, ops),
+            full
+        );
+        assert_eq!(decoded_text_counts(&doc, page_id), full);
+
+        let (doc, page_id) = cid_text_over_vector_art(
+            &CID_TEXT_LINES,
+            400,
+            false,
+            CidTextLayout::MalformedFormThenForm,
+        );
+        assert_eq!(decoded_text_counts(&doc, page_id), full);
+        assert!(!analyze_page_content(&doc, page_id).has_vector_text);
+    }
+
+    /// A ToUnicode stream is read within the loader's per-stream bound: at
+    /// the bound the CMap is read and the text through it counted; one byte
+    /// over it the stream is not read, the font goes undecoded and the page
+    /// stays vector text.
+    #[test]
+    fn a_tounicode_cmap_over_the_stream_bound_is_not_read() {
+        fn pad_to(doc: &mut Document, id: ObjectId, total: usize) {
+            let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) else {
+                unreachable!()
+            };
+            stream.content.resize(total, b' ');
+        }
+        let (mut doc, page_id) =
+            cid_text_over_vector_art(&CID_TEXT_LINES, 400, false, CidTextLayout::Page);
+        let cmap_id = doc
+            .objects
+            .iter()
+            .find_map(|(id, object)| match object {
+                Object::Stream(stream)
+                    if stream.content.windows(9).any(|w| w == &b"begincmap"[..]) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let bound = crate::MAX_STREAM_DECOMPRESSED_BYTES;
+        pad_to(&mut doc, cmap_id, bound);
+        assert!(!analyze_page_content(&doc, page_id).has_vector_text);
+        pad_to(&mut doc, cmap_id, bound + 1);
+        assert!(analyze_page_content(&doc, page_id).has_vector_text);
+        assert_eq!(
+            decoded_text_counts(&doc, page_id),
+            DecodedTextCounts::default()
         );
     }
 }

@@ -2,6 +2,33 @@
 //!
 //! Detects tabular data in PDF text items and converts to markdown tables.
 
+mod cell_text;
+
+/// Whether a vertical run stands across several rows of a table beyond the
+/// one its foot is in. A rotated column header rises from its header row and
+/// crosses no other row, and a short row-group label spanning two rows stays
+/// glued to the row it touches, so both fill a cell as before; a running head
+/// or margin note standing beside a table on a page whose frame was turned
+/// covers many row baselines and must not be poured into whichever cell its
+/// foot happens to touch. `row_baselines` are the table's row positions,
+/// `own_row` the one the item was assigned to. Horizontal runs never cross
+/// rows this way.
+pub(crate) fn crosses_other_rows(
+    item: &crate::types::TextItem,
+    row_baselines: &[f32],
+    own_row: Option<usize>,
+) -> bool {
+    if item.is_horizontal() {
+        return false;
+    }
+    let (foot, head) = (item.y + 2.0, item.y + item.height - 2.0);
+    row_baselines
+        .iter()
+        .enumerate()
+        .filter(|(row, &baseline)| Some(*row) != own_row && baseline > foot && baseline < head)
+        .count()
+        >= 2
+}
 mod detect_heuristic;
 mod detect_lines;
 pub(crate) mod detect_rects;
@@ -96,8 +123,13 @@ pub(crate) fn try_build_rect_guided_table(
         }
     }
 
-    // 3. Derive row boundaries from item Y positions (5pt tolerance)
-    let mut y_values: Vec<f32> = expanded_items.iter().map(|(item, _)| item.y).collect();
+    // 3. Derive row boundaries from item Y positions (5pt tolerance). Body
+    //    baselines (`line_y`) on both sides — here and in the assignment
+    //    below — so a raised marker never opens a phantom row of its own.
+    let mut y_values: Vec<f32> = expanded_items
+        .iter()
+        .map(|(item, _)| item.line_y())
+        .collect();
     y_values.sort_by(|a, b| b.total_cmp(a)); // descending
     let mut row_boundaries: Vec<f32> = Vec::new();
     for y in &y_values {
@@ -117,6 +149,7 @@ pub(crate) fn try_build_rect_guided_table(
     let n_rows = row_boundaries.len();
     let n_cols = col_boundaries.len();
     let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; n_cols]; n_rows];
     let mut used_indices: Vec<usize> = Vec::new();
 
     // Compute max X to exclude legend text beyond the table area
@@ -136,18 +169,19 @@ pub(crate) fn try_build_rect_guided_table(
         // Find row (nearest Y within tolerance)
         let row = row_boundaries
             .iter()
-            .position(|&ry| (ry - item.y).abs() <= 5.0);
+            .position(|&ry| (ry - item.line_y()).abs() <= 5.0);
         // Find column: rightmost boundary ≤ item.x + tolerance.
         // 4pt tolerance catches annotation items (e.g. "Memorial Day") that sit
         // slightly before the next column boundary.
         let col = col_boundaries.iter().rposition(|&cx| item.x >= cx - 4.0);
 
         if let (Some(r), Some(c)) = (row, col) {
-            let cell = &mut cells[r][c];
-            if !cell.is_empty() {
-                cell.push(' ');
-            }
-            cell.push_str(item.text.trim());
+            cell_text::push_cell_item(
+                &mut cells[r][c],
+                &mut last_items[r][c],
+                item,
+                item.text.trim(),
+            );
             used_indices.push(*orig_idx);
         }
     }
@@ -294,14 +328,24 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             height: item.height,
             font: item.font.clone(),
             font_tag: item.font_tag.clone(),
+            legacy_symbol_rewrite: item.legacy_symbol_rewrite,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            font_weight: item.font_weight,
+            bold_source: item.bold_source,
+            fixed_pitch: item.fixed_pitch,
+            fill_color: item.fill_color,
+            stroke_color: item.stroke_color,
+            render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            rotation: item.rotation,
+            advance_known: item.advance_known,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
+            baseline_shift: item.baseline_shift,
         });
     }
 
@@ -317,14 +361,24 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             height: item.height,
             font: item.font.clone(),
             font_tag: item.font_tag.clone(),
+            legacy_symbol_rewrite: item.legacy_symbol_rewrite,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            font_weight: item.font_weight,
+            bold_source: item.bold_source,
+            fixed_pitch: item.fixed_pitch,
+            fill_color: item.fill_color,
+            stroke_color: item.stroke_color,
+            render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            rotation: item.rotation,
+            advance_known: item.advance_known,
             item_type: item.item_type.clone(),
             mcid: item.mcid,
+            baseline_shift: item.baseline_shift,
         });
     }
 
@@ -420,69 +474,95 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         }
     }
 
-    // Group items into per-column lines to check newspaper vs tabular
-    let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
-    let mut spanning_items: Vec<TextItem> = Vec::new();
-    for item in items {
-        if item.page != page {
-            continue;
-        }
-        // Check if item spans multiple columns
-        let item_left = item.x;
-        let item_right = item.x + item.width;
-        let mut spans = 0;
-        for col in &columns {
-            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
-            if overlap > 0.0 {
-                spans += 1;
+    // Group items into per-column lines to check newspaper vs tabular.
+    // Items in `excluded` (vertical runs standing across other rows, found
+    // below once the rows are known) take no part in the grouping.
+    let y_tol = 5.0;
+    let group = |excluded: &std::collections::HashSet<usize>| {
+        let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
+        let mut spanning_items: Vec<TextItem> = Vec::new();
+        for (item_idx, item) in items.iter().enumerate() {
+            if item.page != page || excluded.contains(&item_idx) {
+                continue;
             }
-        }
-        if spans > 1 {
-            spanning_items.push(item.clone());
-            continue;
-        }
-        // Assign to best-overlap column
-        let mut best_col = 0;
-        let mut best_overlap = f32::NEG_INFINITY;
-        for (ci, col) in columns.iter().enumerate() {
-            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
-            if overlap > best_overlap {
-                best_overlap = overlap;
-                best_col = ci;
+            // Check if item spans multiple columns
+            let item_left = item.x;
+            let item_right = item.x + item.width;
+            let mut spans = 0;
+            for col in &columns {
+                let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+                if overlap > 0.0 {
+                    spans += 1;
+                }
             }
+            if spans > 1 {
+                spanning_items.push(item.clone());
+                continue;
+            }
+            // Assign to best-overlap column
+            let mut best_col = 0;
+            let mut best_overlap = f32::NEG_INFINITY;
+            for (ci, col) in columns.iter().enumerate() {
+                let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+                if overlap > best_overlap {
+                    best_overlap = overlap;
+                    best_col = ci;
+                }
+            }
+            col_buckets[best_col].push(item.clone());
         }
-        col_buckets[best_col].push(item.clone());
-    }
 
-    let thresholds = HashMap::new();
-    let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
+        let thresholds = HashMap::new();
+        let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
+            .iter()
+            .map(|bucket| {
+                group_into_lines_with_thresholds(
+                    bucket.clone(),
+                    &thresholds,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .collect();
+
+        // Collect all unique Y positions across all columns (row boundaries)
+        let mut row_ys: Vec<f32> = Vec::new();
+        for col_lines in &per_column_lines {
+            for line in col_lines {
+                let y = line.y;
+                if !row_ys.iter().any(|&ry| (ry - y).abs() < y_tol) {
+                    row_ys.push(y);
+                }
+            }
+        }
+        row_ys.sort_by(|a, b| b.total_cmp(a));
+        (per_column_lines, row_ys)
+    };
+
+    // First pass finds the rows; a vertical run standing across two or more
+    // other rows (a running head beside a turned table) is then excluded and
+    // the rows collected again, so its foot seeds no phantom row either.
+    let (mut per_column_lines, mut row_ys) = group(&std::collections::HashSet::new());
+    let crossing: std::collections::HashSet<usize> = items
         .iter()
-        .map(|bucket| {
-            group_into_lines_with_thresholds(
-                bucket.clone(),
-                &thresholds,
-                &std::collections::HashSet::new(),
-            )
+        .enumerate()
+        .filter(|(_, item)| {
+            item.page == page && {
+                let own = row_ys
+                    .iter()
+                    .position(|&ry| (ry - item.line_y()).abs() < y_tol);
+                crosses_other_rows(item, &row_ys, own)
+            }
         })
+        .map(|(idx, _)| idx)
         .collect();
+    if !crossing.is_empty() {
+        (per_column_lines, row_ys) = group(&crossing);
+    }
 
     // Must be tabular (not newspaper) layout
     if is_newspaper_layout(&per_column_lines, &columns) {
         return None;
     }
-
-    // Collect all unique Y positions across all columns (row boundaries)
-    let y_tol = 5.0;
-    let mut row_ys: Vec<f32> = Vec::new();
-    for col_lines in &per_column_lines {
-        for line in col_lines {
-            let y = line.y;
-            if !row_ys.iter().any(|&ry| (ry - y).abs() < y_tol) {
-                row_ys.push(y);
-            }
-        }
-    }
-    row_ys.sort_by(|a, b| b.total_cmp(a));
 
     if row_ys.len() < 3 || row_ys.len() > 40 {
         return None;
@@ -491,6 +571,7 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
     // Build cell grid
     let col_xs: Vec<f32> = columns.iter().map(|c| c.x_min).collect();
     let mut cells: Vec<Vec<String>> = vec![vec![String::new(); columns.len()]; row_ys.len()];
+    let mut last_items: Vec<Vec<Option<&TextItem>>> = vec![vec![None; columns.len()]; row_ys.len()];
     let mut item_indices: Vec<usize> = Vec::new();
 
     for (item_idx, item) in items.iter().enumerate() {
@@ -519,12 +600,20 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         let col = best_col.unwrap();
 
         // Find row
-        let row = row_ys.iter().position(|&ry| (ry - item.y).abs() < y_tol);
+        let row = row_ys
+            .iter()
+            .position(|&ry| (ry - item.line_y()).abs() < y_tol);
+        // Vertical runs standing across other rows were excluded above.
+        if crossing.contains(&item_idx) {
+            continue;
+        }
         if let Some(row) = row {
-            if !cells[row][col].is_empty() {
-                cells[row][col].push(' ');
-            }
-            cells[row][col].push_str(&item.text);
+            cell_text::push_cell_item(
+                &mut cells[row][col],
+                &mut last_items[row][col],
+                item,
+                &item.text,
+            );
             item_indices.push(item_idx);
         }
     }
@@ -1038,14 +1127,15 @@ fn infer_key_value_split_x(rows: &[VisualRow], median_font_size: f32) -> Option<
 }
 
 fn join_row_item_text(items: &[&RowItem]) -> String {
-    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut last = None;
     for item in items {
         let trimmed = item.item.text.trim();
         if !trimmed.is_empty() {
-            parts.push(trimmed);
+            cell_text::push_cell_item(&mut text, &mut last, &item.item, trimmed);
         }
     }
-    normalize_cell_text(&parts.join(" "))
+    normalize_cell_text(&text)
 }
 
 fn normalize_cell_text(text: &str) -> String {
@@ -1482,6 +1572,38 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn column_table_leaves_out_a_vertical_run_across_rows() {
+        // A 4x5 grid of short cells (the builder wants four page columns),
+        // plus a vertical run whose foot sits just below the last row and
+        // whose extent covers every row: a running head beside a turned
+        // table. It fills no cell and seeds no row.
+        let mut grid: Vec<TextItem> = Vec::new();
+        for (r, y) in [700.0, 680.0, 660.0, 640.0, 620.0].into_iter().enumerate() {
+            for (c, x) in [60.0, 180.0, 300.0, 420.0].into_iter().enumerate() {
+                grid.push(make_item(&format!("{}{}", r + 1, c + 1), x, y, 10.0));
+            }
+        }
+        let columns = crate::extractor::detect_columns(&grid, 1, false);
+        assert!(columns.len() >= 4, "columns detected: {}", columns.len());
+        let plain = try_build_table_from_columns(&grid, 1).expect("grid is a table");
+        assert_eq!(plain.cells.len(), 5);
+
+        let mut head = make_item("Running head", 60.0, 613.0, 8.0);
+        head.rotation = 90.0;
+        head.width = 8.0;
+        head.height = 100.0;
+        let mut with_head = grid.clone();
+        with_head.push(head);
+        let table = try_build_table_from_columns(&with_head, 1).expect("still a table");
+        assert_eq!(table.cells.len(), 5, "{:?}", table.cells);
+        assert!(
+            table.cells.iter().flatten().all(|c| !c.contains("Running")),
+            "{:?}",
+            table.cells
+        );
+    }
+
     use super::*;
     use crate::types::{ItemType, TextItem};
 
@@ -1494,14 +1616,24 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1514,14 +1646,43 @@ mod tests {
             height: font_size,
             font: "F1".into(),
             font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn financial_value_splits_retain_source_rewrite_evidence() {
+        for rewritten in [false, true] {
+            let mut source = make_char("$ 120 230 340", 10.0, 50.0, 10.0, 300.0);
+            source.legacy_symbol_rewrite = rewritten;
+            let parts = financial::try_split_financial_item(&source).unwrap();
+            assert_eq!(
+                parts
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["$ 120", "230", "340"]
+            );
+            assert!(parts
+                .iter()
+                .all(|item| item.legacy_symbol_rewrite == rewritten));
         }
     }
 

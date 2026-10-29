@@ -10,7 +10,7 @@
 //! work so a crafted PDF cannot burn unbounded CPU on invalid or duplicate
 //! entries.
 
-use crate::text_utils::decode_pdfdoc_text_string;
+use crate::text_utils::decode_pdf_text_string;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 
@@ -163,7 +163,7 @@ fn walk_outline_level(
             .get(b"Title")
             .ok()
             .and_then(|obj| resolve_string_bytes(doc, obj))
-            .map(decode_pdfdoc_text_string)
+            .map(decode_pdf_text_string)
             .unwrap_or_default();
 
         let (page, dest_kind) = resolve_outline_destination(doc, node, page_map, named_dests);

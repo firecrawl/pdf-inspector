@@ -25,13 +25,15 @@ CI and every publishing workflow run this check before building or publishing.
 
 ## Release steps
 
-1. Choose the next shared semantic version and run `scripts/version.py`.
+1. Choose the next shared semantic version, rename the `Unreleased` section of
+   `CHANGELOG.md` to it, and run `scripts/version.py`.
 2. Review the manifest and lockfile changes in the version-bump pull request.
 3. Merge the pull request to `main`.
 4. The crates.io, PyPI, Node, and WASM workflows independently build and
    publish that version from the same commit.
 5. After all registries succeed, create one `v<version>` GitHub release that
-   links to each package and describes changes since the previous shared tag.
+   links to each package and describes changes since the previous shared tag
+   (the `CHANGELOG.md` entry is the starting point).
 
 The independent workflows are intentionally idempotent. A manual dispatch from
 `main` can repair a partial release, and already-published artifacts are skipped.

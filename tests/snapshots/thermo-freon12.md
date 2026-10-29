@@ -14,12 +14,16 @@
 
 ##### Technical Information Technical Information
 
-**®** **Thermodynamic Properties of Freon 12 Refrigerant** **(R-12)** **SI Units**
+##### Thermodynamic Properties of Freon<sup>®</sup> 12 Refrigerant
+
+##### (R-12)
+
+##### SI Units
 
 Tables of the thermodynamic **Units** properties of R-12 have been developed and are presented here. P = Pressure in kPa. Absolute This information is based on values calculated using the NIST REFPROP T = Temperature in Celcius Database (McLinden, M.O., Klein,
 
-S.A., Lemmon, E.W., and Peskin, Vf = Fluid (liquid) specific volume
-A.P., NIST Standard Reference in cubic meters per kilogram Database 23, NIST thermodynamic and transport properties of Vg = Vapour (gas) specific volume refrigerants and refrigerant in cubic meters per kilogram mixtures – REFPROP version 6.01, Standard Reference Data Program, df and dg = Fluid and Vapour National Institute of Standards and (respectively) densities in Technology, 1998).
+S.A., Lemmon, E.W., and Peskin, V<sub>f</sub> = Fluid (liquid) specific volume
+A.P., NIST Standard Reference in cubic meters per kilogram Database 23, NIST thermodynamic and transport properties of V<sub>g</sub> = Vapour (gas) specific volume refrigerants and refrigerant in cubic meters per kilogram mixtures – REFPROP version 6.01, Standard Reference Data Program, d<sub>f</sub> and d<sub>g</sub> = Fluid and Vapour National Institute of Standards and (respectively) densities in Technology, 1998).
 kilograms per cubic meter
 
 ##### H = Enthalpy (kJ/kg)
@@ -34,20 +38,18 @@ kilograms per cubic meter
 |Boiling Point At one atmosphere|-29.75°C|
 |Critical Temperature|111.97°C|
 |Critical Pressure|4136 kPa|
-|Critical Density|565.0 kg/m|
-|Critical Volume|0.0018 m|
-
-/kg
+|Critical Density|565.0 kg/m³|
+|Critical Volume|0.0018 m³/kg|
 
 l
 
 **TABLE 1**
 
-**Freon** **®** **12 Saturation Properties-Temperature Table**
+**Freon<sup>®</sup>12 Saturation Properties-Temperature Table**
 
 |Temp|Pressure||Volume||Density||Enthalpy|||Entropy|Temp|
 |---|---|---|---|---|---|---|---|---|---|---|---|
-|°C|[kPa]|[m³ Liquid v f|/kg] Vapour v g|[kg/m³ Liquid d f|] Vapour d g|Liquid H f|[kJ/kg] Latent H fg|Vapour H g|Liquid S f|[kJ/K-kg] Vapour S g|°C|
+|°C|[kPa]|[m³ Liquid v<sub>f</sub>|/kg] Vapour v<sub>g</sub>|[kg/m³ Liquid d<sub>f</sub>|] Vapour d<sub>g</sub>|Liquid H<sub>f</sub>|[kJ/kg] Latent H<sub>fg</sub>|Vapour H<sub>g</sub>|Liquid S<sub>f</sub>|[kJ/K-kg] Vapour S<sub>g</sub>|°C|
 
 |-100|1.2|0.0006|10.0000|1679.0|0.100|113.3|192.8|306.1|0.6077|1.7210|-100|
 |---|---|---|---|---|---|---|---|---|---|---|---|

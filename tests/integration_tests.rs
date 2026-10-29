@@ -4,6 +4,10 @@ use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, S
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
+use pdf_inspector::widen_degenerate_form_bboxes_mem;
+use pdf_inspector::{
+    collect_text_in_region_in_frame, extract_text_with_positions_and_rotations_mem, PageRotation,
+};
 use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
@@ -12,11 +16,57 @@ use pdf_inspector::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
+use pdf_inspector::{
+    detect_pdf_type_mem, detect_pdf_type_mem_with_config, PageOcrReasons,
+    OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED, OCR_REASON_VECTOR_TEXT,
+};
+use pdf_inspector::{
+    extract_tables_in_regions_mem_in_frame, extract_text_in_regions_mem_in_frame,
+    extract_text_with_positions_and_rotations_mem_in_frame,
+    extract_text_with_positions_mem_in_frame, PositionFrame,
+};
+use pdf_inspector::{
+    extract_text_in_regions_mem_with_options,
+    extract_text_with_positions_and_rotations_mem_with_options,
+    extract_text_with_positions_mem_with_options, BoldSource, PositionOptions,
+};
 use std::collections::HashSet;
 
+/// The `/F1` font object of the PDFs the builders below write unless told
+/// otherwise: Helvetica under its standard encoding.
+const HELVETICA_FONT: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
+    make_text_pdf_with_boxes(content, media_box, None)
+}
+
+/// Like [`make_text_pdf`], optionally declaring a `/CropBox` on the page.
+fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&str>) -> Vec<u8> {
+    make_text_pdf_with_rotate(content, media_box, crop_box, None, None, HELVETICA_FONT)
+}
+
+/// Like [`make_text_pdf_with_boxes`], optionally declaring a `/Rotate` on
+/// the page (`page_rotate`) and on the `/Pages` node (`pages_rotate`), with
+/// `font_body` as the `/F1` font object.
+fn make_text_pdf_with_rotate(
+    content: &str,
+    media_box: &str,
+    crop_box: Option<&str>,
+    page_rotate: Option<i64>,
+    pages_rotate: Option<i64>,
+    font_body: &str,
+) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
+    let crop_entry = crop_box
+        .map(|b| format!(" /CropBox [{b}]"))
+        .unwrap_or_default();
+    let page_rotate_entry = page_rotate
+        .map(|r| format!(" /Rotate {r}"))
+        .unwrap_or_default();
+    let pages_rotate_entry = pages_rotate
+        .map(|r| format!(" /Rotate {r}"))
+        .unwrap_or_default();
 
     fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
         offsets.push(pdf.len());
@@ -35,14 +85,14 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
         &mut pdf,
         &mut offsets,
         2,
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< /Type /Pages /Kids [3 0 R] /Count 1{pages_rotate_entry} >>"),
     );
     add_object(
         &mut pdf,
         &mut offsets,
         3,
         &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry}{page_rotate_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
         ),
     );
 
@@ -56,12 +106,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
             content
         ),
     );
-    add_object(
-        &mut pdf,
-        &mut offsets,
-        5,
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    );
+    add_object(&mut pdf, &mut offsets, 5, font_body);
 
     let xref_start = pdf.len();
     pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
@@ -272,6 +317,21 @@ fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf
 }
 
+/// Leading bytes before the header, e.g. an echoed multipart envelope: a
+/// boundary line and part headers before `%PDF`, a closing boundary after
+/// `%%EOF`.
+fn wrap_in_multipart_envelope(pdf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pdf.len() + 256);
+    out.extend_from_slice(
+        b"------------------------------123\r\n\
+          Content-Disposition: form-data; name=\"file\"; filename=\"file.pdf\"\r\n\
+          Content-Type: application/pdf\r\n\r\n",
+    );
+    out.extend_from_slice(pdf);
+    out.extend_from_slice(b"\r\n------------------------------123--\r\n");
+    out
+}
+
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
     use pdf_inspector::types::ItemType;
@@ -283,14 +343,24 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         height: font_size,
         font: "Helvetica".to_string(),
         font_tag: String::new(),
+        legacy_symbol_rewrite: false,
         font_size,
         page,
         is_bold: false,
         is_italic: false,
+        font_weight: None,
+        bold_source: None,
+        fixed_pitch: None,
+        fill_color: None,
+        stroke_color: None,
+        render_mode: None,
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
+        baseline_shift: 0.0,
     }
 }
 
@@ -311,14 +381,24 @@ fn make_text_item_with_font(
         height: font_size,
         font: font.to_string(),
         font_tag: String::new(),
+        legacy_symbol_rewrite: false,
         font_size,
         page,
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
+        font_weight: None,
+        bold_source: None,
+        fixed_pitch: None,
+        fill_color: None,
+        stroke_color: None,
+        render_mode: None,
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
+        baseline_shift: 0.0,
     }
 }
 
@@ -1172,6 +1252,134 @@ fn test_process_pdf_mem_repairs_leading_tab_and_truncated_eof() {
 }
 
 #[test]
+fn test_process_pdf_mem_tolerates_leading_bytes_before_header() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    assert!(!wrapped.starts_with(b"%PDF"));
+
+    let expected = process_pdf_mem(&original).expect("clean PDF should load");
+    let result =
+        process_pdf_mem(&wrapped).expect("leading bytes before the header should be tolerated");
+
+    assert_eq!(result.pdf_type, expected.pdf_type);
+    assert_eq!(result.page_count, expected.page_count);
+    assert_eq!(result.markdown, expected.markdown);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "wrapped PDF should still extract text"
+    );
+}
+
+fn page_texts(result: &pdf_inspector::PagesExtractionResult) -> Vec<String> {
+    result.pages.iter().map(|p| p.markdown.clone()).collect()
+}
+
+#[test]
+fn test_detect_and_extract_tolerate_leading_bytes_before_header() {
+    let original = std::fs::read("tests/fixtures/shannon-entropy-p1-2.pdf").unwrap();
+    let wrapped = wrap_in_multipart_envelope(&original);
+
+    let expected = pdf_inspector::detect_pdf_type_mem(&original).unwrap();
+    let detected = pdf_inspector::detect_pdf_type_mem(&wrapped)
+        .expect("detection should tolerate leading bytes before the header");
+    assert_eq!(detected.pdf_type, expected.pdf_type);
+    assert_eq!(detected.page_count, expected.page_count);
+    assert!(detected.page_count > 1);
+
+    let expected_pages = extract_pages_markdown_mem(&original, None).unwrap();
+    let pages = extract_pages_markdown_mem(&wrapped, None)
+        .expect("page extraction should tolerate leading bytes before the header");
+    assert_eq!(page_texts(&pages), page_texts(&expected_pages));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.pdf");
+    std::fs::write(&path, &wrapped).unwrap();
+    let from_path =
+        detect_pdf_type(&path).expect("path-based detection should tolerate leading bytes");
+    assert_eq!(from_path.page_count, expected.page_count);
+    let from_path_pages = extract_pages_markdown(&path, None)
+        .expect("path-based extraction should tolerate leading bytes");
+    assert_eq!(page_texts(&from_path_pages), page_texts(&expected_pages));
+}
+
+#[test]
+fn test_process_pdf_mem_skips_version_like_text_before_header() {
+    // Leading metadata that mentions version-like `%PDF-1` strings, even
+    // several of them, must not shadow the real header (the ranking picks the
+    // canonical line; a mention that did win would still load through xref
+    // reconstruction, as the prefix-counted-offsets test shows).
+    let mut buf =
+        b"X-A: %PDF-1.4 body\r\nX-B: %PDF-1 x\r\nX-C: %PDF-1.7 y\r\nX-D: %PDF-2 z\r\n\r\n".to_vec();
+    buf.extend_from_slice(&make_minimal_text_pdf());
+
+    let result = process_pdf_mem(&buf).expect("real header should still be found");
+
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+/// Rewrite a classic xref table and `startxref` so every offset counts an
+/// extra `shift` bytes, as if the writer had measured from the start of the
+/// leading bytes rather than from the header.
+fn shift_xref_offsets(pdf: &[u8], shift: usize) -> Vec<u8> {
+    let text = String::from_utf8(pdf.to_vec()).expect("minimal PDF is ASCII");
+    let entry = regex::Regex::new(r"(?m)^(\d{10}) (\d{5}) n").unwrap();
+    let shifted = entry.replace_all(&text, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("{:010} {} n", off + shift, &caps[2])
+    });
+    let start = regex::Regex::new(r"startxref\s*(\d+)").unwrap();
+    let shifted = start.replace(&shifted, |caps: &regex::Captures| {
+        let off: usize = caps[1].parse().unwrap();
+        format!("startxref\n{}", off + shift)
+    });
+    shifted.into_owned().into_bytes()
+}
+
+#[test]
+fn test_process_pdf_mem_tolerates_prefix_counted_xref_offsets() {
+    let original = make_minimal_text_pdf();
+    let wrapped = wrap_in_multipart_envelope(&original);
+    let prefix_len =
+        wrapped.len() - original.len() - b"\r\n------------------------------123--\r\n".len();
+    let mut buf = wrapped[..prefix_len].to_vec();
+    buf.extend_from_slice(&shift_xref_offsets(&original, prefix_len));
+    assert_ne!(buf[prefix_len..], original[..]);
+
+    let result = process_pdf_mem(&buf).expect("prefix-counted offsets should be recovered");
+    assert_eq!(result.page_count, 1);
+    assert!(result
+        .markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Hello World"));
+}
+
+#[test]
+fn test_bare_pdf_marker_without_dash_is_still_not_a_pdf() {
+    // A bare `%PDF` is not a header lopdf can load, so it fails the cheap
+    // magic check exactly as before.
+    let text = b"Notes: the %PDF marker alone is not a document.";
+    assert_not_a_pdf(process_pdf_mem(text), "plain text");
+    assert_not_a_pdf(pdf_inspector::detect_pdf_type_mem(text), "plain text");
+}
+
+#[test]
+fn test_header_beyond_search_window_is_not_a_pdf() {
+    let mut buf = vec![b'x'; 2048];
+    buf.extend_from_slice(&make_minimal_text_pdf());
+    assert_not_a_pdf(process_pdf_mem(&buf), "plain text");
+}
+
+#[test]
 fn test_detect_pdf_type_repairs_container_from_path() {
     let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
     let dir = tempfile::tempdir().unwrap();
@@ -1329,17 +1537,551 @@ fn test_snapshot_hebrew_visual_order() {
     );
 }
 
-/// Base-Hebrew text stored in logical (reading) order: each show op holds one
-/// word in reading order and successive ops are positioned right-to-left
-/// (the OCR-text-layer convention). Extraction must NOT reverse these runs —
-/// a codepoint-only trigger would corrupt them.
+// ============================================================================
+// Right-to-left text fixtures (generated by examples/rtl_fixtures.rs)
+// ============================================================================
+
+/// The positioned items of a one-page fixture, top line first, with each
+/// item's box as `(text, left, right)`.
+fn rtl_fixture_lines(fixture: &str) -> Vec<(String, f32, f32)> {
+    let mut items = extract_text_with_positions(format!("tests/fixtures/{fixture}.pdf"))
+        .unwrap_or_else(|e| panic!("extracting {fixture}: {e}"));
+    items.retain(|item| matches!(item.item_type, ItemType::Text));
+    items.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    items
+        .into_iter()
+        .map(|item| (item.text, item.x, item.x + item.width))
+        .collect()
+}
+
+/// One merged item per line, reading in logical order, whose box spans the
+/// glyphs painted for that line (extents as the generator laid them out).
+fn assert_rtl_fixture_lines(fixture: &str, expected: &[(&str, f32, f32)], right_tolerance: f32) {
+    let lines = rtl_fixture_lines(fixture);
+    let texts: Vec<&str> = lines.iter().map(|(t, _, _)| t.as_str()).collect();
+    let expected_texts: Vec<&str> = expected.iter().map(|(t, _, _)| *t).collect();
+    assert_eq!(texts, expected_texts, "{fixture}: line texts");
+    for ((text, left, right), (_, expected_left, expected_right)) in lines.iter().zip(expected) {
+        assert!(
+            (left - expected_left).abs() <= 0.6,
+            "{fixture}: left edge of {text:?} is {left}, expected {expected_left}"
+        );
+        assert!(
+            (right - expected_right).abs() <= right_tolerance,
+            "{fixture}: right edge of {text:?} is {right}, expected {expected_right}"
+        );
+    }
+}
+
+// דוח שנתי 2024
+const RTL_HEADING: &str = "\u{05D3}\u{05D5}\u{05D7} \u{05E9}\u{05E0}\u{05EA}\u{05D9} 2024";
+// מספר העובדים גדל ב-12% לעומת השנה הקודמת.
+const RTL_PERCENT_LINE: &str = "\u{05DE}\u{05E1}\u{05E4}\u{05E8} \u{05D4}\u{05E2}\u{05D5}\u{05D1}\u{05D3}\u{05D9}\u{05DD} \u{05D2}\u{05D3}\u{05DC} \u{05D1}-12% \u{05DC}\u{05E2}\u{05D5}\u{05DE}\u{05EA} \u{05D4}\u{05E9}\u{05E0}\u{05D4} \u{05D4}\u{05E7}\u{05D5}\u{05D3}\u{05DE}\u{05EA}.";
+// התקן (IFRS 16) אומץ בשנת 2019.
+const RTL_BRACKET_LINE: &str = "\u{05D4}\u{05EA}\u{05E7}\u{05DF} (IFRS 16) \u{05D0}\u{05D5}\u{05DE}\u{05E5} \u{05D1}\u{05E9}\u{05E0}\u{05EA} 2019.";
+// הוועדה בחנה את הנתונים במהלך הרבעון השלישי.
+const RTL_PARAGRAPH_1: &str = "\u{05D4}\u{05D5}\u{05D5}\u{05E2}\u{05D3}\u{05D4} \u{05D1}\u{05D7}\u{05E0}\u{05D4} \u{05D0}\u{05EA} \u{05D4}\u{05E0}\u{05EA}\u{05D5}\u{05E0}\u{05D9}\u{05DD} \u{05D1}\u{05DE}\u{05D4}\u{05DC}\u{05DA} \u{05D4}\u{05E8}\u{05D1}\u{05E2}\u{05D5}\u{05DF} \u{05D4}\u{05E9}\u{05DC}\u{05D9}\u{05E9}\u{05D9}.";
+// הממצאים הוצגו להנהלה, ולאחר דיון אושרו ההמלצות.
+const RTL_PARAGRAPH_2: &str = "\u{05D4}\u{05DE}\u{05DE}\u{05E6}\u{05D0}\u{05D9}\u{05DD} \u{05D4}\u{05D5}\u{05E6}\u{05D2}\u{05D5} \u{05DC}\u{05D4}\u{05E0}\u{05D4}\u{05DC}\u{05D4}, \u{05D5}\u{05DC}\u{05D0}\u{05D7}\u{05E8} \u{05D3}\u{05D9}\u{05D5}\u{05DF} \u{05D0}\u{05D5}\u{05E9}\u{05E8}\u{05D5} \u{05D4}\u{05D4}\u{05DE}\u{05DC}\u{05E6}\u{05D5}\u{05EA}.";
+// היישום יחל בתחילת השנה הבאה.
+const RTL_PARAGRAPH_3: &str = "\u{05D4}\u{05D9}\u{05D9}\u{05E9}\u{05D5}\u{05DD} \u{05D9}\u{05D7}\u{05DC} \u{05D1}\u{05EA}\u{05D7}\u{05D9}\u{05DC}\u{05EA} \u{05D4}\u{05E9}\u{05E0}\u{05D4} \u{05D4}\u{05D1}\u{05D0}\u{05D4}.";
+
+/// Hebrew stored in visual order, one show operator per word painted left
+/// to right, with Latin digits and punctuation from a second font and a
+/// right-aligned paragraph. Every line reads back in logical order: the
+/// number keeps its digits, the percent sign and the hyphen sit where they
+/// were written, the bracket pair around the Latin phrase is turned back,
+/// and the sentence period follows the year.
 #[test]
-fn test_snapshot_hebrew_logical_order() {
-    let output = assert_snapshot("hebrew_logical_order");
-    assert!(
-        output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
-        "logical-order Hebrew must stay in logical order, got: {output}"
+fn rtl_visual_word_runs_read_in_logical_order() {
+    assert_rtl_fixture_lines(
+        "rtl_hebrew_visual_words",
+        &[
+            (RTL_HEADING, 438.27, 540.0),
+            (RTL_PERCENT_LINE, 289.81, 540.0),
+            (RTL_BRACKET_LINE, 364.03, 540.0),
+            (RTL_PARAGRAPH_1, 289.61, 540.0),
+            (RTL_PARAGRAPH_2, 272.10, 540.0),
+            (RTL_PARAGRAPH_3, 371.87, 540.0),
+        ],
+        0.6,
     );
+}
+
+/// The same lines with their runs shown in reading order — right to left
+/// across the line, one text object per run — while each run's glyphs stay
+/// in visual order: the page reads exactly as the left-to-right emission
+/// does, though its show operators walk the other way.
+#[test]
+fn rtl_visual_word_runs_shown_in_reading_order_read_alike() {
+    assert_rtl_fixture_lines(
+        "rtl_hebrew_visual_words_in_reading_order",
+        &[
+            (RTL_HEADING, 438.27, 540.0),
+            (RTL_PERCENT_LINE, 289.81, 540.0),
+            (RTL_BRACKET_LINE, 364.03, 540.0),
+            (RTL_PARAGRAPH_1, 289.61, 540.0),
+            (RTL_PARAGRAPH_2, 272.10, 540.0),
+            (RTL_PARAGRAPH_3, 371.87, 540.0),
+        ],
+        0.6,
+    );
+}
+
+#[test]
+fn test_snapshot_rtl_hebrew_visual_words_in_reading_order() {
+    let output = assert_snapshot("rtl_hebrew_visual_words_in_reading_order");
+    assert!(
+        output.contains(RTL_PERCENT_LINE) && output.contains(RTL_BRACKET_LINE),
+        "visual-order runs shown in reading order must extract in logical order, got: {output}"
+    );
+}
+
+// הספרייה פתוחה בכָל ימות השבוע (one vowel point, kept after its base)
+const RTL_LIBRARY_LINE_1: &str = "\u{05D4}\u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05D9}\u{05D4} \u{05E4}\u{05EA}\u{05D5}\u{05D7}\u{05D4} \u{05D1}\u{05DB}\u{05B8}\u{05DC} \u{05D9}\u{05DE}\u{05D5}\u{05EA} \u{05D4}\u{05E9}\u{05D1}\u{05D5}\u{05E2}";
+// הקוראים מוזמנים להשאיל ספרים
+const RTL_LIBRARY_LINE_2: &str = "\u{05D4}\u{05E7}\u{05D5}\u{05E8}\u{05D0}\u{05D9}\u{05DD} \u{05DE}\u{05D5}\u{05D6}\u{05DE}\u{05E0}\u{05D9}\u{05DD} \u{05DC}\u{05D4}\u{05E9}\u{05D0}\u{05D9}\u{05DC} \u{05E1}\u{05E4}\u{05E8}\u{05D9}\u{05DD}";
+// ההרשמה נעשית בדלפק הכניסה
+const RTL_LIBRARY_LINE_3: &str = "\u{05D4}\u{05D4}\u{05E8}\u{05E9}\u{05DE}\u{05D4} \u{05E0}\u{05E2}\u{05E9}\u{05D9}\u{05EA} \u{05D1}\u{05D3}\u{05DC}\u{05E4}\u{05E7} \u{05D4}\u{05DB}\u{05E0}\u{05D9}\u{05E1}\u{05D4}";
+
+/// An invisible text layer (render mode 3) holding its words in logical
+/// order, one show operator per word placed right to left across the line:
+/// the convention of OCR layers. Its runs display nothing and cast no
+/// visual-storage vote, so the layer reads as it is stored, no word turned
+/// round. Region extraction reaches it through its invisible-layer fallback.
+#[test]
+fn rtl_invisible_logical_word_layer_reads_as_stored() {
+    let bytes = std::fs::read("tests/fixtures/rtl_hebrew_invisible_logical_words.pdf").unwrap();
+    let pages =
+        pdf_inspector::extract_text_in_regions_mem(&bytes, &[(0, vec![[0.0, 0.0, 612.0, 792.0]])])
+            .expect("region extraction");
+    let text = &pages[0].regions[0].text;
+    for line in [RTL_LIBRARY_LINE_1, RTL_LIBRARY_LINE_2, RTL_LIBRARY_LINE_3] {
+        assert!(
+            text.contains(line),
+            "an invisible logical-order layer must read as stored, got: {text}"
+        );
+    }
+}
+
+#[test]
+fn test_snapshot_rtl_hebrew_visual_words() {
+    let output = assert_snapshot("rtl_hebrew_visual_words");
+    assert!(
+        output.contains(RTL_PERCENT_LINE) && output.contains(RTL_BRACKET_LINE),
+        "visual-order Hebrew must extract in logical order, got: {output}"
+    );
+}
+
+/// Hebrew positioned one glyph per show operator, painted left to right,
+/// with declared glyph widths narrower than the painted advances: letters
+/// cluster into words by the line's own gap distribution instead of taking
+/// a word space after every wide letter, and the embedded numbers keep
+/// their digits together. The boxes end short of the last glyph by the
+/// width mismatch.
+#[test]
+fn rtl_glyph_by_glyph_text_clusters_into_words() {
+    assert_rtl_fixture_lines(
+        "rtl_hebrew_glyph_by_glyph",
+        &[
+            // שוק העבודה השתנה בעשור האחרון
+            (
+                "\u{05E9}\u{05D5}\u{05E7} \u{05D4}\u{05E2}\u{05D1}\u{05D5}\u{05D3}\u{05D4} \u{05D4}\u{05E9}\u{05EA}\u{05E0}\u{05D4} \u{05D1}\u{05E2}\u{05E9}\u{05D5}\u{05E8} \u{05D4}\u{05D0}\u{05D7}\u{05E8}\u{05D5}\u{05DF}",
+                361.91,
+                540.0,
+            ),
+            // בשנת 2023 נוספו 1,250 משרות חדשות
+            (
+                "\u{05D1}\u{05E9}\u{05E0}\u{05EA} 2023 \u{05E0}\u{05D5}\u{05E1}\u{05E4}\u{05D5} 1,250 \u{05DE}\u{05E9}\u{05E8}\u{05D5}\u{05EA} \u{05D7}\u{05D3}\u{05E9}\u{05D5}\u{05EA}",
+                342.17,
+                540.0,
+            ),
+            // הדוח המלא זמין באתר (PDF)
+            (
+                "\u{05D4}\u{05D3}\u{05D5}\u{05D7} \u{05D4}\u{05DE}\u{05DC}\u{05D0} \u{05D6}\u{05DE}\u{05D9}\u{05DF} \u{05D1}\u{05D0}\u{05EA}\u{05E8} (PDF)",
+                391.86,
+                540.0,
+            ),
+        ],
+        2.0,
+    );
+}
+
+#[test]
+fn test_snapshot_rtl_hebrew_glyph_by_glyph() {
+    let output = assert_snapshot("rtl_hebrew_glyph_by_glyph");
+    assert!(
+        output
+            .contains("\u{05E9}\u{05D5}\u{05E7} \u{05D4}\u{05E2}\u{05D1}\u{05D5}\u{05D3}\u{05D4}")
+            && output.contains("2023 \u{05E0}\u{05D5}\u{05E1}\u{05E4}\u{05D5} 1,250"),
+        "glyph-by-glyph Hebrew must cluster into words, got: {output}"
+    );
+}
+
+/// Hebrew and Arabic lines with Latin phrases, Latin and Arabic-Indic
+/// digits, and a Latin sentence quoting a Hebrew word: each line reads in
+/// its own base direction with the embedded runs the other way round.
+#[test]
+fn rtl_mixed_direction_lines_read_in_their_own_direction() {
+    assert_rtl_fixture_lines(
+        "rtl_mixed_direction",
+        &[
+            // המסמך נכתב על ידי Open Data Team בשנת 2025
+            (
+                "\u{05D4}\u{05DE}\u{05E1}\u{05DE}\u{05DA} \u{05E0}\u{05DB}\u{05EA}\u{05D1} \u{05E2}\u{05DC} \u{05D9}\u{05D3}\u{05D9} Open Data Team \u{05D1}\u{05E9}\u{05E0}\u{05EA} 2025",
+                283.24,
+                540.0,
+            ),
+            // التقرير السنوي 2024
+            (
+                "\u{0627}\u{0644}\u{062A}\u{0642}\u{0631}\u{064A}\u{0631} \u{0627}\u{0644}\u{0633}\u{0646}\u{0648}\u{064A} 2024",
+                408.34,
+                540.0,
+            ),
+            // بلغ عدد الطلاب ١٢٥٠ في عام ٢٠٢٤
+            (
+                "\u{0628}\u{0644}\u{063A} \u{0639}\u{062F}\u{062F} \u{0627}\u{0644}\u{0637}\u{0644}\u{0627}\u{0628} \u{0661}\u{0662}\u{0665}\u{0660} \u{0641}\u{064A} \u{0639}\u{0627}\u{0645} \u{0662}\u{0660}\u{0662}\u{0664}",
+                343.07,
+                540.0,
+            ),
+            (
+                "The word \u{05E9}\u{05DC}\u{05D5}\u{05DD} means peace",
+                72.0,
+                227.57,
+            ),
+        ],
+        0.6,
+    );
+}
+
+#[test]
+fn test_snapshot_rtl_mixed_direction() {
+    let output = assert_snapshot("rtl_mixed_direction");
+    assert!(
+        output.contains("Open Data Team \u{05D1}\u{05E9}\u{05E0}\u{05EA} 2025")
+            && output.contains("The word \u{05E9}\u{05DC}\u{05D5}\u{05DD} means peace"),
+        "mixed-direction lines must keep each run's order, got: {output}"
+    );
+}
+
+/// Arabic shaped into presentation forms and stored in visual order, the
+/// font mapping its glyphs to the presentation-form code points: the text
+/// comes back as base letters in reading order, the lam-alef ligature as
+/// its two letters, with Arabic-Indic digits, the percent sign, a Latin
+/// word in brackets and a time.
+#[test]
+fn rtl_arabic_presentation_forms_read_as_letters() {
+    let expected = [
+        // كتاب جديد للطلاب
+        (
+            "\u{0643}\u{062A}\u{0627}\u{0628} \u{062C}\u{062F}\u{064A}\u{062F} \u{0644}\u{0644}\u{0637}\u{0644}\u{0627}\u{0628}",
+            451.16,
+            540.0,
+        ),
+        // النسبة ٢٥٪ من المجموع
+        (
+            "\u{0627}\u{0644}\u{0646}\u{0633}\u{0628}\u{0629} \u{0662}\u{0665}\u{066A} \u{0645}\u{0646} \u{0627}\u{0644}\u{0645}\u{062C}\u{0645}\u{0648}\u{0639}",
+            426.70,
+            540.0,
+        ),
+        // الاجتماع (Zoom) في الساعة 10:30
+        (
+            "\u{0627}\u{0644}\u{0627}\u{062C}\u{062A}\u{0645}\u{0627}\u{0639} (Zoom) \u{0641}\u{064A} \u{0627}\u{0644}\u{0633}\u{0627}\u{0639}\u{0629} 10:30",
+            375.20,
+            540.0,
+        ),
+    ];
+    assert_rtl_fixture_lines("rtl_arabic_presentation_forms", &expected, 0.6);
+    for (text, _, _) in rtl_fixture_lines("rtl_arabic_presentation_forms") {
+        assert!(
+            !text
+                .chars()
+                .any(|c| matches!(c, '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFE}')),
+            "presentation forms must be normalized: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn test_snapshot_rtl_arabic_presentation_forms() {
+    let output = assert_snapshot("rtl_arabic_presentation_forms");
+    assert!(
+        output.contains("\u{0644}\u{0644}\u{0637}\u{0644}\u{0627}\u{0628}")
+            && output.contains("\u{0662}\u{0665}\u{066A}"),
+        "shaped Arabic must extract as base letters in reading order, got: {output}"
+    );
+}
+
+// ============================================================================
+// Symbolic fonts and base encodings (generated by examples/symbolic_font_fixtures.rs)
+// ============================================================================
+
+/// The text items of a one-page fixture, top line first.
+fn fixture_line_texts(fixture: &str) -> Vec<String> {
+    let mut items = extract_text_with_positions(format!("tests/fixtures/{fixture}.pdf"))
+        .unwrap_or_else(|e| panic!("extracting {fixture}: {e}"));
+    items.retain(|item| matches!(item.item_type, ItemType::Text));
+    items.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    items.into_iter().map(|item| item.text).collect()
+}
+
+/// Two lines of 4.7 pt type on a 4.5 pt pitch — a stacked table header —
+/// each shown glyph by glyph, keep their own lines and read in order; a
+/// fixed 5 pt window put them in one line and interleaved their glyphs
+/// along the baseline. The same lines shown as whole strings read the same,
+/// as they always did, and the control pair 6 pt apart is unchanged.
+#[test]
+fn small_stacked_lines_shown_glyph_by_glyph_keep_their_own_lines() {
+    let expected = ["Apples Picked", "Oranges Sold", "Water Usage", "Energy Mix"];
+    assert_eq!(fixture_line_texts("stacked_header_glyph_runs"), expected);
+    assert_eq!(fixture_line_texts("stacked_header_string_runs"), expected);
+}
+
+/// Non-embedded Symbol and ZapfDingbats without an `/Encoding` read through
+/// their built-in encodings — Greek letters, angle brackets, an arrow, check
+/// marks — instead of as the Latin letters at the same codes. A Symbol font
+/// with `/Differences` reads the codes it names through them and the rest
+/// through the built-in encoding. A named encoding replaces the built-in
+/// one, also when the name is an indirect object; the built-in encoding
+/// named outright is the built-in encoding.
+#[test]
+fn symbol_fonts_decode_through_their_builtin_encodings() {
+    assert_eq!(
+        fixture_line_texts("symbol_builtin_encoding"),
+        [
+            "\u{03B1}\u{03B2}\u{03B3}\u{03B4} \u{2329}\u{232A} \u{2192}",
+            "\u{2713}\u{2714}",
+            "\u{03C9}\u{03B2}",
+            "abgd",
+            "\u{03B1}\u{03B2}\u{03B3}\u{03B4}",
+        ]
+    );
+}
+
+#[test]
+fn test_snapshot_symbol_builtin_encoding() {
+    let output = assert_snapshot("symbol_builtin_encoding");
+    assert!(
+        output.contains("\u{03B1}\u{03B2}\u{03B3}\u{03B4}") && output.contains("\u{2713}\u{2714}"),
+        "Symbol codes must decode through the built-in encoding, got: {output}"
+    );
+}
+
+/// An encoding dictionary that names a `/BaseEncoding` and carries no
+/// `/Differences` — inline, as an indirect object, MacRoman — decodes the
+/// accented letters that the base encoding places above 0x7F, which
+/// StandardEncoding leaves undefined or maps elsewhere; with `/Differences`
+/// on top the named codes still win.
+#[test]
+fn base_encoding_applies_without_differences() {
+    assert_eq!(
+        fixture_line_texts("base_encoding_without_differences"),
+        [
+            "A\u{00F1}o caf\u{00E9} se\u{00F1}al \u{00FC}ber fa\u{00E7}ade",
+            "A\u{00F1}o caf\u{00E9} se\u{00F1}al \u{00FC}ber fa\u{00E7}ade",
+            "A\u{00F1}o caf\u{00E9}",
+            "\u{0391}\u{00F1}o caf\u{00E9} se\u{00F1}al \u{00FC}ber fa\u{00E7}ade",
+        ]
+    );
+}
+
+#[test]
+fn test_snapshot_base_encoding_without_differences() {
+    let output = assert_snapshot("base_encoding_without_differences");
+    assert!(
+        output.contains("A\u{00F1}o caf\u{00E9} se\u{00F1}al \u{00FC}ber fa\u{00E7}ade"),
+        "a BaseEncoding without Differences must decode accented letters, got: {output}"
+    );
+}
+
+/// Embedded TrueType programs without ToUnicode: a symbolic one decodes
+/// through its glyph names (`uniXXXX` and Adobe Glyph List forms) rather
+/// than the private-use code points of its (3,0) cmap, and `/Differences`
+/// names of the `gNN`/`glyphNN` form resolve to the glyphs they index
+/// through the font's (3,1) cmap — unless the program itself names a glyph
+/// that way, in which case that glyph is meant.
+#[test]
+fn embedded_fonts_decode_through_glyph_names_and_indexes() {
+    assert_eq!(
+        fixture_line_texts("glyph_names_in_embedded_fonts"),
+        [
+            "\u{03B1}\u{03B2}\u{03B3}\u{03C9}",
+            "\u{03B4}\u{03B5}\u{03B6}",
+            "\u{03B6}\u{03B5}"
+        ]
+    );
+}
+
+/// `/Differences` names that spell a ligature by its components (`f_t`,
+/// `f_f_i`, `T_h`, `t_z`), with a suffix (`a.sc`, `f_i.liga`) or as a `uni`
+/// sequence (`uni00660069`) read as the letters they join instead of being
+/// dropped as unknown names.
+#[test]
+fn component_ligature_names_read_as_their_letters() {
+    assert_eq!(
+        fixture_line_texts("ligature_glyph_names"),
+        ["ft ffi Th a fi fi tz"]
+    );
+}
+
+#[test]
+fn test_snapshot_ligature_glyph_names() {
+    let output = assert_snapshot("ligature_glyph_names");
+    assert!(
+        output.contains("ft ffi Th a fi fi tz"),
+        "component ligature names must read as their letters, got: {output}"
+    );
+}
+
+#[test]
+fn test_snapshot_glyph_names_in_embedded_fonts() {
+    let output = assert_snapshot("glyph_names_in_embedded_fonts");
+    assert!(
+        output.contains("\u{03B1}\u{03B2}\u{03B3}\u{03C9}")
+            && output.contains("\u{03B4}\u{03B5}\u{03B6}"),
+        "glyph names must decode the embedded fonts, got: {output}"
+    );
+}
+
+/// Academic front matter: 11.96pt author names with 7.97pt affiliation
+/// markers raised 4.3pt (the commas inside a marker run come from a second
+/// font), affiliation lines whose markers LEAD their institution, a title
+/// whose asterisk is raised more than the 5pt rough-line window, and body
+/// text with a chemistry subscript and single footnote references.
+///
+/// Every marker must stay on its visual line, attached to its word: either
+/// fused as Unicode ("Huo¹", "H₂O", "¹Hong Kong") or wrapped as
+/// `<sup>…</sup>` when the run carries separators or symbols ("1,2,3",
+/// "2,*"). A fixed 3pt baseline window used to emit the raised markers as
+/// their own orphan line (",2,3,2,4,*") above the names.
+#[test]
+fn test_snapshot_author_block_superscripts() {
+    let output = assert_snapshot("author_block_superscripts");
+    assert!(
+        output.contains("Yibo Yan<sup>1,2,3</sup>, Jiahao Huo¹, Guanbo Feng¹,"),
+        "multi-glyph marker run must stay with its name: {output}"
+    );
+    assert!(
+        output.contains("Mingdong Ou<sup>2,4</sup>, Yi Cao<sup>2,*</sup>,")
+            && output.contains("Wei Zhang³, Ling Chen<sup>1,4</sup>"),
+        "symbol markers must stay with their name: {output}"
+    );
+    assert!(
+        output.contains("¹Hong Kong University of Science and Technology (Guangzhou), ²Alibaba Cloud Computing,"),
+        "leading markers must attach to the FOLLOWING word: {output}"
+    );
+    assert!(
+        output.contains(
+            "<sup>3,4</sup>Some Institute of Technology, <sup>*</sup>Corresponding author,"
+        ) && output.contains("⁴Institute for Advanced Study"),
+        "leading multi-glyph markers must attach to the following word: {output}"
+    );
+    assert!(
+        output.contains("Water is H₂O and the result² holds.")
+            && output.contains("See note¹² for details.")
+            && output.contains("Energy E = mc² as usual."),
+        "chemistry subscripts and single footnote references keep fusing: {output}"
+    );
+    assert!(
+        output.contains("A Fixture Title<sup>*</sup>"),
+        "a marker raised beyond the 5pt rough-line window still attaches: {output}"
+    );
+    assert!(
+        !output.lines().any(is_orphan_marker_line),
+        "no orphan marker line may remain: {output}"
+    );
+}
+
+/// A line made only of marker glyphs (digits, commas, asterisks, script
+/// tags) — what the old fixed-window grouping produced.
+fn is_orphan_marker_line(line: &str) -> bool {
+    let stripped = line
+        .replace("<sup>", "")
+        .replace("</sup>", "")
+        .replace("<sub>", "")
+        .replace("</sub>", "");
+    let stripped = stripped.trim();
+    !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ',' | '*' | ' ' | '¹' | '²' | '³' | '⁴'))
+}
+
+/// The region-text path (`extractTextInRegions`, what fire-pdf consumes)
+/// groups lines on its own: one output line per visual line, markers
+/// adjacent to their words, no orphan marker line.
+#[test]
+fn test_extract_regions_author_block_superscripts_one_line_per_visual_line() {
+    let buf = std::fs::read("tests/fixtures/author_block_superscripts.pdf").unwrap();
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let text = &regions[0].regions[0].text;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "A Fixture Title<sup>*</sup>",
+            "Yibo Yan<sup>1,2,3</sup>, Jiahao Huo¹, Guanbo Feng¹,",
+            "Mingdong Ou<sup>2,4</sup>, Yi Cao<sup>2,*</sup>,",
+            "Wei Zhang³, Ling Chen<sup>1,4</sup>",
+            "¹Hong Kong University of Science and Technology (Guangzhou), ²Alibaba Cloud Computing,",
+            "<sup>3,4</sup>Some Institute of Technology, <sup>*</sup>Corresponding author,",
+            "⁴Institute for Advanced Study",
+            "Water is H₂O and the result² holds.",
+            "See note¹² for details.",
+            "Energy E = mc² as usual.",
+        ],
+        "region text: {text}"
+    );
+    assert!(!regions[0].regions[0].needs_ocr);
+}
+
+/// Positioned items expose the marker geometry: unfused runs carry a
+/// positive `baseline_shift` and snap to the body baseline via `line_y`.
+#[test]
+fn test_positions_author_block_superscripts_expose_baseline_shift() {
+    let buf = std::fs::read("tests/fixtures/author_block_superscripts.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+
+    let flagged: Vec<&TextItem> = items.iter().filter(|it| it.is_script()).collect();
+    let flagged_texts: Vec<&str> = flagged.iter().map(|it| it.text.as_str()).collect();
+    for expected in ["1,2,3", "2,4", "2,*", "1,4", "3,4", "*"] {
+        assert!(
+            flagged_texts.contains(&expected),
+            "expected {expected:?} among flagged runs {flagged_texts:?}"
+        );
+    }
+    for item in &flagged {
+        assert!(item.baseline_shift > 0.0, "raised marker: {item:?}");
+    }
+    let marker = flagged.iter().find(|it| it.text == "1,2,3").unwrap();
+    let name = items.iter().find(|it| it.text == "Yibo Yan").unwrap();
+    assert!(
+        (marker.line_y() - name.y).abs() < 0.01,
+        "marker snaps to its name's baseline"
+    );
+    assert!(
+        (marker.baseline_shift - 4.3).abs() < 0.05,
+        "shift is the raw raise: {}",
+        marker.baseline_shift
+    );
+
+    // Fused runs carry no shift and no separate item (the name arrives
+    // already merged with the body comma before it).
+    assert!(items
+        .iter()
+        .any(|it| it.text.ends_with("Jiahao Huo¹") && !it.is_script()));
+    assert!(items
+        .iter()
+        .any(|it| it.text.starts_with("¹Hong Kong University") && !it.is_script()));
+    assert!(items.iter().any(|it| it.text == "See note¹²"));
+    assert!(items.iter().any(|it| it.text == "Water is H₂"));
+    assert!(!items
+        .iter()
+        .any(|it| it.text == "12" || it.text == "1" || it.text == "2"));
 }
 
 /// First two pages of Shannon's "A Mathematical Theory of Communication"
@@ -1368,6 +2110,13 @@ fn test_pages_needing_ocr_field_accessible() {
         pages_with_text: 1,
         confidence: 1.0,
         title: None,
+        author: None,
+        subject: None,
+        keywords: None,
+        creator: None,
+        producer: None,
+        creation_date: None,
+        mod_date: None,
         ocr_recommended: false,
         pages_needing_ocr: Vec::new(),
         ocr_reasons_by_page: std::collections::BTreeMap::new(),
@@ -1382,9 +2131,17 @@ fn test_pages_needing_ocr_field_accessible() {
         pages_needing_ocr: vec![1, 3],
         ocr_reasons_by_page: Vec::new(),
         title: None,
+        author: None,
+        subject: None,
+        keywords: None,
+        creator: None,
+        producer: None,
+        creation_date: None,
+        mod_date: None,
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
+        cmap_gaps: Vec::new(),
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
 }
@@ -1901,6 +2658,913 @@ fn make_pdf_with_custom_text_layer(
 
 fn make_pdf_with_text_layer(text_render_mode: i32, visible_extra: Option<&str>) -> Vec<u8> {
     make_pdf_with_custom_text_layer(text_render_mode, visible_extra, None, false)
+}
+
+/// One page of [`make_pdf_with_glyph_layer`].
+#[derive(Clone, Copy)]
+struct GlyphLayerPage {
+    /// Draw the 2×2 gray image `Im0` — the 1500×2383 `ImBig` when
+    /// `large_image` — scaled with `cm` over the whole page, shifted right
+    /// by `image_dx` points.
+    covering_image: bool,
+    large_image: bool,
+    image_dx: i32,
+    /// Bind `ImBig` in the page's resources without drawing it.
+    spare_large_image: bool,
+    /// Text render mode, set once, of a layer of `layer_glyphs` one-glyph
+    /// showing blocks (`Tj`, or `'` and `"` with `quote_operators`); `None`
+    /// for no layer.
+    layer_mode: Option<u8>,
+    layer_glyphs: usize,
+    /// Put the layer in a Form XObject `Fm0` instead of the page's content,
+    /// invoked from the page when `invoke_form`, else bound and never run.
+    layer_in_form: bool,
+    invoke_form: bool,
+    /// Draw the image again after the layer, through any clip it set.
+    image_after_layer: bool,
+    /// Draw the 2×2 image after the layer as well, 20 points square with
+    /// its corner at the point given — through any clip the layer set,
+    /// where it lands.
+    small_image_after_layer: Option<(i32, i32)>,
+    /// Filled subpaths of five path operators each, painted before the
+    /// layer, as outlined glyphs would be.
+    vector_paths: usize,
+    /// Draw the covering image as this many horizontal strips instead of
+    /// one draw; 0 for one draw.
+    image_strips: usize,
+    /// Draw the covering image as an inline image (`BI … ID … EI`)
+    /// instead of an image XObject.
+    inline_image: bool,
+    /// Fill the whole page with a tiling pattern `P1` — one whose cell
+    /// draws the image when `pattern_draws_image`, else one drawing only
+    /// paths — before the layer.
+    pattern_fill: bool,
+    pattern_draws_image: bool,
+    /// Fill the whole page with a plain colour before the layer.
+    plain_fill: bool,
+    /// Show the layer with the `'` and `"` operators instead of `Tj`.
+    quote_operators: bool,
+    /// Wrap the body text in marked content whose property list has an
+    /// `/ID` key.
+    marked_content_id: bool,
+    /// A line of visible text at the foot of the page.
+    caption: Option<&'static str>,
+    /// Lines of ordinary visible body text.
+    body_lines: usize,
+}
+
+/// A PDF of the given pages, in the shape a producer gives a scanned page
+/// with a text layer: the raster first, then the render mode, then one
+/// `BT … Tj ET` block per glyph.
+fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
+    // Object bodies, numbered from 1: the catalog, then the page tree,
+    // written once the pages are numbered.
+    let mut objects: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), Vec::new()];
+    fn add(objects: &mut Vec<Vec<u8>>, body: Vec<u8>) -> usize {
+        objects.push(body);
+        objects.len()
+    }
+    fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+    let font = add(
+        &mut objects,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    );
+    let image = add(
+        &mut objects,
+        stream(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[200, 60, 60, 200],
+        ),
+    );
+    // A flat gray raster of scan size, deflated as a producer stores it,
+    // made when a page binds it.
+    let binds_large = |page: &GlyphLayerPage| {
+        page.spare_large_image
+            || ((page.covering_image || page.image_after_layer) && page.large_image)
+    };
+    let large = pages.iter().any(binds_large).then(|| {
+        let mut raster = lopdf::Stream::new(lopdf::dictionary! {}, vec![128u8; 1500 * 2383]);
+        raster.compress().expect("a flat raster deflates");
+        add(
+            &mut objects,
+            stream(
+                "/Type /XObject /Subtype /Image /Width 1500 /Height 2383 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                &raster.content,
+            ),
+        )
+    });
+    let mut kids = Vec::new();
+    for page in pages {
+        let mut xobjects = String::new();
+        let mut content = String::new();
+        let draws =
+            page.covering_image || page.image_after_layer || page.small_image_after_layer.is_some();
+        if (draws && !page.large_image && !page.inline_image)
+            || page.small_image_after_layer.is_some()
+        {
+            xobjects.push_str(&format!(" /Im0 {image} 0 R"));
+        }
+        if binds_large(page) {
+            let large = large.expect("made when a page binds it");
+            xobjects.push_str(&format!(" /ImBig {large} 0 R"));
+        }
+        let raster = if page.inline_image {
+            "BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI".to_string()
+        } else {
+            format!("/{} Do", if page.large_image { "ImBig" } else { "Im0" })
+        };
+        let draw_image = format!("q 612 0 0 792 {} 0 cm {raster} Q\n", page.image_dx);
+        let mut pattern_entry = String::new();
+        if page.pattern_fill {
+            let cell = if page.pattern_draws_image {
+                "q 612 0 0 792 0 0 cm /Im0 Do Q"
+            } else {
+                "0 0 10 10 re f"
+            };
+            let pattern = add(
+                &mut objects,
+                stream(
+                    &format!(
+                        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                         /BBox [0 0 612 792] /XStep 612 /YStep 792 \
+                         /Resources << /XObject << /Im0 {image} 0 R >> >>"
+                    ),
+                    cell.as_bytes(),
+                ),
+            );
+            pattern_entry = format!(" /Pattern << /P1 {pattern} 0 R >>");
+            content.push_str("/Pattern cs /P1 scn 0 0 612 792 re f\n");
+        }
+        if page.plain_fill {
+            content.push_str("0.5 g 0 0 612 792 re f\n");
+        }
+        if page.covering_image && page.image_strips > 0 {
+            let strip = 792.0 / page.image_strips as f64;
+            for k in 0..page.image_strips {
+                content.push_str(&format!(
+                    "q 612 0 0 {strip} {} {} cm {raster} Q\n",
+                    page.image_dx,
+                    k as f64 * strip
+                ));
+            }
+        } else if page.covering_image {
+            content.push_str(&draw_image);
+        }
+        for _ in 0..page.vector_paths {
+            content.push_str("100 200 m 150 250 l 200 200 100 100 200 200 c h f\n");
+        }
+        if page.body_lines > 0 {
+            if page.marked_content_id {
+                content.push_str("/Span <</ID 7 /MCID 0>> BDC\n");
+            }
+            content.push_str("BT /F1 12 Tf 72 720 Td ");
+            for line in 0..page.body_lines {
+                if line > 0 {
+                    content.push_str("0 -16 Td ");
+                }
+                content.push_str(&format!(
+                    "(Paragraph line {line} with ordinary body text) Tj "
+                ));
+            }
+            content.push_str("ET\n");
+            if page.marked_content_id {
+                content.push_str("EMC\n");
+            }
+        }
+        if let Some(mode) = page.layer_mode {
+            let mut layer = format!("{mode} Tr\n");
+            let glyphs = "thepagecarriesalayernobodysees"
+                .chars()
+                .cycle()
+                .take(page.layer_glyphs);
+            if page.quote_operators {
+                // One glyph per line, `'` and `"` in turn, under a leading
+                // small enough to keep every line on the page.
+                layer.push_str("BT /F1 10 Tf 5 TL 72 720 Td\n");
+                for (n, glyph) in glyphs.enumerate() {
+                    if n % 2 == 0 {
+                        layer.push_str(&format!("({glyph}) '\n"));
+                    } else {
+                        layer.push_str(&format!("0 0 ({glyph}) \"\n"));
+                    }
+                }
+                layer.push_str("ET\n");
+            } else {
+                for (n, glyph) in glyphs.enumerate() {
+                    let x = 72 + (n % 40) * 12;
+                    let y = 720 - (n / 40) * 14;
+                    layer.push_str(&format!(
+                        "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
+                    ));
+                }
+            }
+            if page.layer_in_form {
+                let form = add(
+                    &mut objects,
+                    stream(
+                        &format!(
+                            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+                             /Resources << /Font << /F1 {font} 0 R >> >>"
+                        ),
+                        layer.as_bytes(),
+                    ),
+                );
+                xobjects.push_str(&format!(" /Fm0 {form} 0 R"));
+                if page.invoke_form {
+                    content.push_str("/Fm0 Do\n");
+                }
+            } else {
+                content.push_str(&layer);
+            }
+        }
+        if page.image_after_layer {
+            content.push_str(&draw_image);
+        }
+        if let Some((x, y)) = page.small_image_after_layer {
+            content.push_str(&format!("q 20 0 0 20 {x} {y} cm /Im0 Do Q\n"));
+        }
+        if let Some(caption) = page.caption {
+            content.push_str(&format!("BT 0 Tr /F1 12 Tf 72 40 Td ({caption}) Tj ET\n"));
+        }
+        let contents = add(&mut objects, stream("", content.as_bytes()));
+        let xobject_entry = if xobjects.is_empty() {
+            String::new()
+        } else {
+            format!(" /XObject <<{xobjects} >>")
+        };
+        let page_object = add(
+            &mut objects,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 {font} 0 R >>{xobject_entry}{pattern_entry} >> \
+                 /Contents {contents} 0 R >>"
+            )
+            .into_bytes(),
+        );
+        kids.push(format!("{page_object} 0 R"));
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        pages.len()
+    )
+    .into_bytes();
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            objects.len() + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
+    covering_image: true,
+    large_image: false,
+    image_dx: 0,
+    spare_large_image: false,
+    layer_mode: Some(3),
+    layer_glyphs: 120,
+    layer_in_form: false,
+    invoke_form: false,
+    image_after_layer: false,
+    small_image_after_layer: None,
+    vector_paths: 0,
+    image_strips: 0,
+    inline_image: false,
+    pattern_fill: false,
+    pattern_draws_image: false,
+    plain_fill: false,
+    quote_operators: false,
+    marked_content_id: false,
+    caption: None,
+    body_lines: 0,
+};
+
+fn invisible_text_layer_reasons(page: u32) -> Vec<PageOcrReasons> {
+    vec![PageOcrReasons {
+        page,
+        reasons: vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()],
+    }]
+}
+
+/// A page whose only text is a layer nobody sees (render mode 3, or 7)
+/// under an image drawn over the whole page is not a text page, however
+/// many glyphs the layer has: classification flags it for OCR with
+/// `invisible_text_layer`, and per-page extraction agrees.
+#[test]
+fn test_invisible_text_layer_under_covering_image_needs_ocr() {
+    for mode in [3u8, 7] {
+        let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+            layer_mode: Some(mode),
+            ..SCAN_WITH_INVISIBLE_LAYER
+        }]);
+
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_ne!(detected.pdf_type, PdfType::TextBased, "mode {mode}");
+        assert_eq!(detected.pages_needing_ocr, vec![1], "mode {mode}");
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&1),
+            Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()]),
+            "mode {mode}"
+        );
+
+        let processed = process_pdf_mem(&buf).unwrap();
+        assert_ne!(processed.pdf_type, PdfType::TextBased, "mode {mode}");
+        assert_eq!(processed.pages_needing_ocr, vec![1], "mode {mode}");
+        assert_eq!(
+            processed.ocr_reasons_by_page,
+            invisible_text_layer_reasons(1),
+            "mode {mode}"
+        );
+
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert!(pages.pages[0].needs_ocr, "mode {mode}");
+        assert_eq!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER),
+            "mode {mode}"
+        );
+        assert!(pages.pages[0].markdown.is_empty(), "mode {mode}");
+        assert_eq!(pages.pages_needing_ocr, vec![1], "mode {mode}");
+        assert_eq!(
+            pages.ocr_reasons_by_page,
+            invisible_text_layer_reasons(1),
+            "mode {mode}"
+        );
+    }
+}
+
+/// The same layer painted (render mode 0) is a text page over an image,
+/// and keeps extracting as one.
+#[test]
+fn test_painted_text_layer_over_covering_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(0),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::TextBased);
+    assert!(processed.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages[0].ocr_reason, None);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// Clip-only text (mode 7) that an image is painted through is visible —
+/// a title filled with a picture — so the page stays a text page; the
+/// same order of operators under mode 3, which sets no clip, is still a
+/// layer nobody sees.
+#[test]
+fn test_clip_text_filled_with_an_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        image_after_layer: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_after_layer: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+}
+
+/// Clip-only text shows only where paint lands on its glyphs: a small
+/// image drawn after a mode-7 layer, in a corner the layer does not
+/// reach, leaves it a layer nobody sees; the same image drawn over the
+/// layer's first line shows the glyphs under it, and the page is a text
+/// page.
+#[test]
+fn test_clip_text_shows_only_where_paint_lands_on_it() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        small_image_after_layer: Some((580, 20)),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        small_image_after_layer: Some((60, 710)),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages[0].ocr_reason, None);
+}
+
+/// An image drawn mostly off the page covers only the part of it that
+/// lies on the page: a layer over one is not a layer nobody sees, while
+/// an image shifted a little still covers the page.
+#[test]
+fn test_image_drawn_off_the_page_does_not_cover_it() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_dx: 500,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_dx: -100,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// Resources a page binds without using them are not its content: a large
+/// image never drawn and a form holding a hidden layer never invoked leave
+/// a page of visible text a text page, while the same image drawn and the
+/// same form invoked, and nothing else, are a layer nobody sees.
+#[test]
+fn test_resources_bound_but_unused_are_not_evidence() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        spare_large_image: true,
+        layer_in_form: true,
+        invoke_form: false,
+        body_lines: 12,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: true,
+        large_image: true,
+        layer_in_form: true,
+        invoke_form: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// A page filled with a tiling pattern whose cell draws the scan image is
+/// covered by that image: a hidden layer over it is a layer nobody sees;
+/// a pattern drawing only paths, or a fill without a pattern, leaves a
+/// text page.
+#[test]
+fn test_pattern_filled_scan_is_covered() {
+    let filled = GlyphLayerPage {
+        covering_image: false,
+        pattern_fill: true,
+        pattern_draws_image: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let buf = make_pdf_with_glyph_layer(&[filled]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    for page in [
+        GlyphLayerPage {
+            pattern_draws_image: false,
+            ..filled
+        },
+        GlyphLayerPage {
+            covering_image: false,
+            plain_fill: true,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+    ] {
+        let buf = make_pdf_with_glyph_layer(&[page]);
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_eq!(detected.pdf_type, PdfType::TextBased);
+        assert!(detected.pages_needing_ocr.is_empty());
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert_ne!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+        );
+    }
+}
+
+/// A raster drawn as an inline image covers the page as an image XObject
+/// does: the hidden layer over it is a layer nobody sees, while the same
+/// inline image shifted mostly off the page leaves a text page.
+#[test]
+fn test_inline_image_raster_covers_the_page() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        image_dx: 500,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_ne!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    // The inline image alone, with no text at all, is a scan — the page
+    // has an image though its resources bind none.
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_SCANNED.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+}
+
+/// A scan tiled into two thousand strips — image XObjects or inline
+/// images — covers the page as one draw does: the hidden layer over it
+/// is a layer nobody sees.
+#[test]
+fn test_scan_tiled_into_strips_is_covered() {
+    for inline_image in [false, true] {
+        let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+            image_strips: 2000,
+            inline_image,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        }]);
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_ne!(
+            detected.pdf_type,
+            PdfType::TextBased,
+            "inline {inline_image}"
+        );
+        assert_eq!(detected.pages_needing_ocr, vec![1], "inline {inline_image}");
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&1),
+            Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()]),
+            "inline {inline_image}"
+        );
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert_eq!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER),
+            "inline {inline_image}"
+        );
+    }
+}
+
+/// A layer shown only with the `'` and `"` operators is a text layer like
+/// any other: hidden under a covering image it is a layer nobody sees;
+/// painted, it is a text page.
+#[test]
+fn test_quote_operator_layer_follows_the_render_mode() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        quote_operators: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        quote_operators: true,
+        layer_mode: Some(0),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// `/ID` is an ordinary name — here a marked-content property — and not
+/// the start of inline image data: the visible text after it is counted.
+#[test]
+fn test_id_name_is_not_inline_image_data() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        layer_mode: None,
+        marked_content_id: true,
+        body_lines: 12,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+}
+
+/// A document longer than classification's sample, whose one page with a
+/// hidden layer lies outside the sample: that page still reports
+/// `invisible_text_layer`, the other pages `scanned`.
+#[test]
+fn test_hidden_layer_page_outside_the_sample_reports_its_reason() {
+    // Twelve pages, sampled eight at a time — 1–7 and 12 — so that page 9
+    // is not read for classification, whatever the default strategy.
+    let image_only = GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let mut pages = [image_only; 12];
+    pages[8] = SCAN_WITH_INVISIBLE_LAYER;
+    let buf = make_pdf_with_glyph_layer(&pages);
+    let sample_of_eight = || DetectionConfig {
+        strategy: ScanStrategy::Sample(8),
+        ..DetectionConfig::default()
+    };
+
+    let detected = detect_pdf_type_mem_with_config(&buf, sample_of_eight()).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_sampled, 8);
+    assert_eq!(detected.pages_needing_ocr, (1..=12).collect::<Vec<u32>>());
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&9),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    for page in [1u32, 8, 10, 12] {
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&page),
+            Some(&vec![OCR_REASON_SCANNED.to_string()]),
+            "page {page}"
+        );
+    }
+
+    let processed =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().detection(sample_of_eight())).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+    assert_eq!(
+        processed
+            .ocr_reasons_by_page
+            .iter()
+            .find(|entry| entry.page == 9)
+            .map(|entry| entry.reasons.clone()),
+        Some(vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[8].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// A page that is both vector text and a layer nobody sees under a scan
+/// is a scan first: classification and per-page extraction both name
+/// `invisible_text_layer` before `vector_text`.
+#[test]
+fn test_invisible_text_layer_is_the_first_reason_on_both_surfaces() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_glyphs: 4,
+        vector_paths: 300,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    let reasons = detected
+        .ocr_reasons_by_page
+        .get(&1)
+        .expect("the page needs OCR");
+    assert_eq!(
+        reasons,
+        &vec![
+            OCR_REASON_INVISIBLE_TEXT_LAYER.to_string(),
+            OCR_REASON_VECTOR_TEXT.to_string()
+        ]
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+    assert_eq!(
+        pages.ocr_reasons_by_page[0].reasons.first(),
+        reasons.first()
+    );
+    assert!(pages.ocr_reasons_by_page[0]
+        .reasons
+        .iter()
+        .any(|reason| reason == OCR_REASON_VECTOR_TEXT));
+}
+
+/// Invisible text with no image under it is not a scan: the page stays a
+/// text page and its layer is served, as before.
+#[test]
+fn test_invisible_text_without_an_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::TextBased);
+    assert!(processed.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// A visible caption over the covering image means the page shows text of
+/// its own; it keeps its text-page classification and its caption.
+#[test]
+fn test_visible_caption_over_covering_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        caption: Some("Figure 1. A photograph"),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::TextBased);
+    assert!(processed.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Figure 1"));
+}
+
+/// An image alone is a scan with the `scanned` reason, as before.
+#[test]
+fn test_covering_image_alone_stays_scanned() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let scanned_reasons = vec![PageOcrReasons {
+        page: 1,
+        reasons: vec![OCR_REASON_SCANNED.to_string()],
+    }];
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_SCANNED.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+    assert_eq!(processed.ocr_reasons_by_page, scanned_reasons);
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages_needing_ocr, vec![1]);
+}
+
+/// A text page followed by such a scan: the document is mixed, and only
+/// the scan is flagged, with its specific reason.
+#[test]
+fn test_invisible_text_layer_page_after_a_text_page_is_flagged_alone() {
+    let buf = make_pdf_with_glyph_layer(&[
+        GlyphLayerPage {
+            covering_image: false,
+            layer_mode: None,
+            body_lines: 12,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+        SCAN_WITH_INVISIBLE_LAYER,
+    ]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Mixed);
+    assert_eq!(detected.pages_needing_ocr, vec![2]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&2),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Mixed);
+    assert_eq!(processed.pages_needing_ocr, vec![2]);
+    assert_eq!(
+        processed.ocr_reasons_by_page,
+        invisible_text_layer_reasons(2)
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+    assert!(pages.pages[1].needs_ocr);
+    assert_eq!(
+        pages.pages[1].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+    assert_eq!(pages.pages_needing_ocr, vec![2]);
 }
 
 /// A scanned page whose only text is an invisible (Tr 3) OCR layer behind
@@ -2500,6 +4164,14 @@ fn synthetic_dense_table_pdf() -> Vec<u8> {
 }
 
 fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
+    synthetic_vector_grid_pdf_with_crop_box(two_tables, None)
+}
+
+/// [`synthetic_vector_grid_pdf`] with an optional `/CropBox` on the page.
+fn synthetic_vector_grid_pdf_with_crop_box(
+    two_tables: bool,
+    crop_box: Option<[i64; 4]>,
+) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
@@ -2571,21 +4243,24 @@ fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
     doc.objects
         .insert(content_id, Stream::new(dictionary! {}, content).into());
 
-    doc.objects.insert(
-        page_id,
-        dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
-            "Resources" => dictionary! {
-                "Font" => dictionary! {
-                    "F1" => font_id,
-                },
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
             },
-            "Contents" => content_id,
-        }
-        .into(),
-    );
+        },
+        "Contents" => content_id,
+    };
+    if let Some(crop_box) = crop_box {
+        page.set(
+            "CropBox",
+            Object::Array(crop_box.iter().map(|&v| v.into()).collect()),
+        );
+    }
+    doc.objects.insert(page_id, page.into());
     doc.objects.insert(
         pages_id,
         dictionary! {
@@ -4199,6 +5874,647 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
 }
 
 // ============================================================================
+// Type0/Identity-H font whose ToUnicode CMap has gaps
+// ============================================================================
+
+/// A one-page document showing `lines` — each a run of two-byte codes shown
+/// by one `Tj` — through a Type0/Identity-H font whose embedded subset (see
+/// `minimal_truetype_subset`) has neither a cmap nor glyph names, so the
+/// font's ToUnicode CMap — `bfrange` lines of `(first, last, base)` — is the
+/// only reading of the codes.
+fn make_type0_pdf_with_tounicode_ranges(ranges: &[(u16, u16, u32)], lines: &[&[u16]]) -> Vec<u8> {
+    make_type0_pdf_with_tounicode_ranges_spaced(ranges, lines, 0.0)
+}
+
+/// A Type0/Identity-H font added to `doc`, whose embedded subset (see
+/// `minimal_truetype_subset`, with `highest_code` glyphs after `.notdef`)
+/// has neither a cmap nor glyph names, so the font's ToUnicode CMap —
+/// `bfrange` lines of `(first, last, base)` — is the only reading of its
+/// codes.
+fn add_type0_font_with_tounicode_ranges(
+    doc: &mut lopdf::Document,
+    ranges: &[(u16, u16, u32)],
+    highest_code: u16,
+) -> lopdf::ObjectId {
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfrange\n", ranges.len()));
+    for &(first, last, base) in ranges {
+        cmap.push_str(&format!("<{first:04X}> <{last:04X}> <{base:04X}>\n"));
+    }
+    cmap.push_str("endbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    add_type0_font_with_tounicode_cmap(doc, cmap, highest_code)
+}
+
+/// A Type0/Identity-H font added to `doc` as `add_type0_font_with_tounicode_ranges`
+/// makes it, under the ToUnicode CMap text `cmap`.
+fn add_type0_font_with_tounicode_cmap(
+    doc: &mut lopdf::Document,
+    cmap: String,
+    highest_code: u16,
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    let font_file = minimal_truetype_subset(usize::from(highest_code));
+    let font_file_id = doc.add_object(Stream::new(
+        dictionary! { "Length1" => font_file.len() as i64 },
+        font_file,
+    ));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+        "FontFile2" => font_file_id,
+    });
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Subset",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 600,
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Subset",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    })
+}
+
+/// A one-page document showing `lines` — each a run of two-byte codes shown
+/// by one `Tj`, with `char_spacing` between its glyphs — through the font of
+/// `add_type0_font_with_tounicode_ranges`.
+fn make_type0_pdf_with_tounicode_ranges_spaced(
+    ranges: &[(u16, u16, u32)],
+    lines: &[&[u16]],
+    char_spacing: f32,
+) -> Vec<u8> {
+    let highest_code = lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(ranges.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = lopdf::Document::with_version("1.5");
+    let font_id = add_type0_font_with_tounicode_ranges(&mut doc, ranges, highest_code);
+
+    let spacing = if char_spacing > 0.0 {
+        format!("{char_spacing} Tc ")
+    } else {
+        String::new()
+    };
+    let mut content = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+        content.push_str(&format!(
+            "BT /F1 12 Tf {spacing}72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+    }
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        LETTER_BOX,
+        None,
+        &[("F1", font_id)],
+    );
+    finish_document(doc, pages_id, vec![page_id])
+}
+
+/// A US-letter page box, in points.
+const LETTER_BOX: [i64; 4] = [0, 0, 612, 792];
+
+/// A page of `content` added to `doc` under the page tree `pages_id`, with
+/// `media_box`, `crop_box` when given, and the fonts named in `fonts`;
+/// returns the page's id.
+fn add_page(
+    doc: &mut lopdf::Document,
+    pages_id: lopdf::ObjectId,
+    content: &str,
+    media_box: [i64; 4],
+    crop_box: Option<[i64; 4]>,
+    fonts: &[(&str, lopdf::ObjectId)],
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    let boxed = |b: [i64; 4]| -> Object { Object::Array(b.iter().map(|&v| v.into()).collect()) };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let mut font_dict = lopdf::Dictionary::new();
+    for &(name, id) in fonts {
+        font_dict.set(name, id);
+    }
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => boxed(media_box),
+        "Resources" => dictionary! { "Font" => font_dict },
+        "Contents" => content_id,
+    };
+    if let Some(crop_box) = crop_box {
+        page.set("CropBox", boxed(crop_box));
+    }
+    doc.add_object(page)
+}
+
+/// `doc` finished with the page tree `pages_id` over `kids` and a catalog,
+/// serialized.
+fn finish_document(
+    mut doc: lopdf::Document,
+    pages_id: lopdf::ObjectId,
+    kids: Vec<lopdf::ObjectId>,
+) -> Vec<u8> {
+    use lopdf::dictionary;
+
+    let count = kids.len() as i64;
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids.into_iter().map(Into::into).collect::<Vec<lopdf::Object>>(),
+            "Count" => count,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Codes of the standard glyph order: space at 3, digits at 19..28, A..Z at
+/// 36..61 and a..z at 68..93.
+fn standard_order_codes(text: &str) -> Vec<u16> {
+    text.chars()
+        .map(|c| match c {
+            ' ' => 3,
+            '0'..='9' => 19 + (c as u16 - '0' as u16),
+            'A'..='Z' => 36 + (c as u16 - 'A' as u16),
+            'a'..='z' => 68 + (c as u16 - 'a' as u16),
+            other => panic!("no code for {other:?}"),
+        })
+        .collect()
+}
+
+/// The lines the gap fixtures show: the letters J, O and P and the digit 3
+/// sit in the holes of the gapped CMap.
+const CMAP_GAP_LINES: [&str; 3] = ["JAZZ POLKA", "ZIP 30 4212", "POP QUIZ"];
+
+/// Detection reads a page's strings as raw bytes, and two-byte codes yield
+/// few ASCII letters and digits; such a page counts as text only when it
+/// shows text through a decodable font in ten or more operators, so each
+/// fixture shows its lines this many times over.
+const SHOWINGS: usize = 4;
+
+/// `lines`, each shown `SHOWINGS` times.
+fn shown_lines<'a>(lines: &[&'a [u16]]) -> Vec<&'a [u16]> {
+    std::iter::repeat_n(lines, SHOWINGS)
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// `texts`, each `SHOWINGS` times, as the items of a fixture read.
+fn shown_texts(texts: &[&str]) -> Vec<String> {
+    std::iter::repeat_n(texts, SHOWINGS)
+        .flatten()
+        .map(|text| text.to_string())
+        .collect()
+}
+
+fn cmap_gap_lines() -> Vec<Vec<u16>> {
+    CMAP_GAP_LINES
+        .iter()
+        .map(|line| standard_order_codes(line))
+        .collect()
+}
+
+/// A CMap covering the space, the digits and A..Z.
+const FULL_RANGES: [(u16, u16, u32); 3] = [(3, 3, 0x20), (19, 28, 0x30), (36, 61, 0x41)];
+
+/// The same CMap with holes at 45 (J) and 50..51 (O, P), and at 22 (3).
+const GAPPED_RANGES: [(u16, u16, u32); 6] = [
+    (3, 3, 0x20),
+    (19, 21, 0x30),
+    (23, 28, 0x34),
+    (36, 44, 0x41),
+    (46, 49, 0x4B),
+    (52, 61, 0x51),
+];
+
+#[test]
+fn test_tounicode_gaps_inside_letter_and_digit_runs_read_as_the_characters_between() {
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let gapped = make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown);
+    let full = make_type0_pdf_with_tounicode_ranges(&FULL_RANGES, &shown);
+
+    let gapped_text: Vec<String> =
+        pdf_inspector::extractor::extract_text_with_positions_mem(&gapped)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+    assert_eq!(
+        gapped_text,
+        shown_texts(&CMAP_GAP_LINES),
+        "the holes read as J, O, P and 3"
+    );
+
+    // The text reads exactly as it does through the complete CMap.
+    let gapped_result = pdf_inspector::process_pdf_mem(&gapped).unwrap();
+    let full_result = pdf_inspector::process_pdf_mem(&full).unwrap();
+    assert_eq!(gapped_result.markdown, full_result.markdown);
+    assert!(gapped_result
+        .markdown
+        .as_deref()
+        .unwrap()
+        .contains("JAZZ POLKA"));
+    assert!(!gapped_result.has_encoding_issues);
+    assert!(gapped_result.pages_needing_ocr.is_empty());
+
+    // J, O, P and 3 are shown eight times over the three lines.
+    let codes: u32 = shown.iter().map(|line| line.len() as u32).sum();
+    let in_holes = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .filter(|code| matches!(code, 22 | 45 | 50 | 51))
+        .count() as u32;
+    assert_eq!(in_holes, 8 * SHOWINGS as u32);
+    assert_eq!(
+        gapped_result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes,
+            interpolated: in_holes,
+            unmapped: 0,
+        }]
+    );
+    assert!(full_result.cmap_gaps.is_empty());
+}
+
+#[test]
+fn test_tounicode_gap_across_a_change_of_case_or_kind_reads_as_a_replacement_character() {
+    // Z at 61 and a at 68, and 9 at 28 and A at 36, lie as far apart in
+    // code point as in code, but a gap is never read across a change of
+    // case or between a digit and a letter.
+    let ranges = [(3, 3, 0x20), (19, 28, 0x30), (36, 61, 0x41), (68, 93, 0x61)];
+    let base: [&[u16]; 3] = [&[36, 62, 68], &[28, 30, 36], &[68, 69, 70]];
+    let pdf = make_type0_pdf_with_tounicode_ranges(&ranges, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&["A\u{FFFD}a", "9\u{FFFD}A", "abc"]));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(result.markdown.as_deref().unwrap().contains('\u{FFFD}'));
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 9 * SHOWINGS as u32,
+            interpolated: 0,
+            unmapped: 2 * SHOWINGS as u32,
+        }]
+    );
+}
+
+#[test]
+fn test_tounicode_gap_at_the_edge_of_the_mapped_codes_reads_as_a_replacement_character() {
+    // A..I only: code 45 has no mapped code above it.
+    let ranges = [(3, 3, 0x20), (36, 44, 0x41)];
+    let base: [&[u16]; 3] = [&[44, 45], &[36, 37, 38], &[39, 40, 41]];
+    let pdf = make_type0_pdf_with_tounicode_ranges(&ranges, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&["I\u{FFFD}", "ABC", "DEF"]));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 8 * SHOWINGS as u32,
+            interpolated: 0,
+            unmapped: SHOWINGS as u32,
+        }]
+    );
+}
+
+#[test]
+fn test_fully_mapped_tounicode_reports_no_gaps() {
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let pdf = make_type0_pdf_with_tounicode_ranges(&FULL_RANGES, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&CMAP_GAP_LINES));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(!result.has_encoding_issues);
+    assert!(result.cmap_gaps.is_empty());
+    assert!(!result.markdown.as_deref().unwrap().contains('\u{FFFD}'));
+
+    // Detection alone reads no text, and reports no gaps.
+    let detected = pdf_inspector::process_pdf_mem_with_options(
+        &pdf,
+        pdf_inspector::PdfOptions::new().mode(pdf_inspector::ProcessMode::DetectOnly),
+    )
+    .unwrap();
+    assert!(detected.cmap_gaps.is_empty());
+}
+
+#[test]
+fn test_word_gap_analysis_does_not_count_a_string_twice() {
+    // Three codes shown with a character spacing wide enough for a word gap
+    // are decoded once more, one code at a time, by the word-gap analysis
+    // of the string; the coverage counts the string once, and the text —
+    // its spaces included — reads exactly as through the complete CMap.
+    // J, O and P sit in the holes of the CMap.
+    let base: [&[u16]; 3] = [&[45, 36, 61], &[51, 50, 47], &[46, 36, 55]];
+    let shown = shown_lines(&base);
+    let gapped = make_type0_pdf_with_tounicode_ranges_spaced(&GAPPED_RANGES, &shown, 4.0);
+    let full = make_type0_pdf_with_tounicode_ranges_spaced(&FULL_RANGES, &shown, 4.0);
+
+    let texts = |pdf: &[u8]| -> Vec<String> {
+        pdf_inspector::extractor::extract_text_with_positions_mem(pdf)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    };
+    let gapped_texts = texts(&gapped);
+    assert_eq!(gapped_texts, texts(&full));
+    assert_eq!(gapped_texts.len(), 3 * SHOWINGS);
+    for (text, letters) in gapped_texts
+        .iter()
+        .zip(["JAZ", "POL", "KAT"].iter().cycle())
+    {
+        assert_eq!(text.replace(' ', ""), *letters, "{text:?}");
+    }
+
+    let gapped_result = pdf_inspector::process_pdf_mem(&gapped).unwrap();
+    let full_result = pdf_inspector::process_pdf_mem(&full).unwrap();
+    assert_eq!(gapped_result.markdown, full_result.markdown);
+    assert!(full_result.cmap_gaps.is_empty());
+    assert_eq!(
+        gapped_result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 9 * SHOWINGS as u32,
+            interpolated: 3 * SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
+/// Four pages with a recurring page number at the page's edge beside a
+/// footer, as `make_recurring_contextual_folio_pdf` builds them, whose pages
+/// after the first also show lines through the font of
+/// `add_type0_font_with_tounicode_ranges` with `GAPPED_RANGES`.
+fn make_contextual_folio_pdf_with_gapped_later_pages() -> Vec<u8> {
+    use lopdf::{dictionary, Document};
+
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let highest_code = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(GAPPED_RANGES.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = Document::with_version("1.5");
+    let gapped_font_id =
+        add_type0_font_with_tounicode_ranges(&mut doc, &GAPPED_RANGES, highest_code);
+    let text_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let pages_id = doc.new_object_id();
+    let mut kids = Vec::new();
+    for page_number in 1..=4u32 {
+        let mut content = format!(
+            "BT /F1 12 Tf 1 0 0 1 25 30 Tm ({page_number}) Tj 1 0 0 1 41 30 Tm (Company report footer) Tj 1 0 0 1 72 700 Tm (Body page {page_number}) Tj ET\n"
+        );
+        if page_number > 1 {
+            for (index, line) in shown.iter().enumerate() {
+                let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+                content.push_str(&format!(
+                    "BT /F2 12 Tf 72 {} Td <{hex}> Tj ET\n",
+                    660 - 20 * index
+                ));
+            }
+        }
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", text_font_id), ("F2", gapped_font_id)],
+        ));
+    }
+    finish_document(doc, pages_id, kids)
+}
+
+#[test]
+fn test_page_filter_reports_no_cmap_gaps_from_context_pages() {
+    let pdf = make_contextual_folio_pdf_with_gapped_later_pages();
+
+    // The first page alone: its folio needs the other pages' evidence, which
+    // is gathered — the folio goes — while the gaps of the font only those
+    // pages show stay out of the result, as their text does.
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([1])).unwrap();
+    let markdown = result.markdown.unwrap();
+    assert!(markdown.contains("Company report footer"));
+    assert!(!markdown.contains("1 Company report footer"), "{markdown}");
+    assert!(!markdown.contains("JAZZ"));
+    assert!(result.cmap_gaps.is_empty(), "{:?}", result.cmap_gaps);
+
+    // A page that shows the font reports it.
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([2])).unwrap();
+    assert!(result.markdown.unwrap().contains("JAZZ POLKA"));
+    assert_eq!(result.cmap_gaps.len(), 1, "{:?}", result.cmap_gaps);
+    assert_eq!(result.cmap_gaps[0].font, "AAAAAA+Subset");
+    assert!(result.cmap_gaps[0].interpolated > 0);
+    assert_eq!(result.cmap_gaps[0].unmapped, 0);
+}
+
+#[test]
+fn test_blank_runs_count_towards_the_cmap_coverage() {
+    // A run of a single space code makes no item, yet its code was shown
+    // through the CMap: it counts with the next run's, and the text is the
+    // same as without it.
+    let base: [&[u16]; 3] = [&[3], &[45, 36, 61, 61], &[3]];
+    let shown = shown_lines(&base);
+    let pdf = make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown);
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, vec!["JAZZ"; SHOWINGS]);
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 6 * SHOWINGS as u32,
+            interpolated: SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
+#[test]
+fn test_analyze_mode_reports_unmapped_cmap_codes_as_encoding_issues() {
+    // Analysis generates no Markdown, so the U+FFFD a code no CMap could
+    // read would show is never seen there; the flag follows the coverage
+    // instead, in both modes alike, and a gap read from its neighbours does
+    // not raise it.
+    let analyze = || pdf_inspector::PdfOptions::new().mode(pdf_inspector::ProcessMode::Analyze);
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let interpolated_only =
+        make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown_lines(&base));
+    let edge: [&[u16]; 3] = [&[44, 45], &[36, 37, 38], &[39, 40, 41]];
+    let unmapped =
+        make_type0_pdf_with_tounicode_ranges(&[(3, 3, 0x20), (36, 44, 0x41)], &shown_lines(&edge));
+
+    let analyzed = pdf_inspector::process_pdf_mem_with_options(&unmapped, analyze()).unwrap();
+    assert!(analyzed.markdown.is_none());
+    assert!(analyzed.has_encoding_issues);
+    assert_eq!(analyzed.cmap_gaps.len(), 1);
+    assert!(analyzed.cmap_gaps[0].unmapped > 0);
+    let processed = pdf_inspector::process_pdf_mem(&unmapped).unwrap();
+    assert!(processed.has_encoding_issues);
+    assert_eq!(processed.cmap_gaps, analyzed.cmap_gaps);
+
+    let analyzed =
+        pdf_inspector::process_pdf_mem_with_options(&interpolated_only, analyze()).unwrap();
+    assert!(analyzed.markdown.is_none());
+    assert!(!analyzed.has_encoding_issues);
+    assert_eq!(analyzed.cmap_gaps.len(), 1);
+    assert!(analyzed.cmap_gaps[0].interpolated > 0);
+    assert_eq!(analyzed.cmap_gaps[0].unmapped, 0);
+    let processed = pdf_inspector::process_pdf_mem(&interpolated_only).unwrap();
+    assert!(!processed.has_encoding_issues);
+    assert_eq!(processed.cmap_gaps, analyzed.cmap_gaps);
+}
+
+/// A spread whose page box (its `/CropBox`) is the left half of the sheet:
+/// the lines of `cmap_gap_lines` shown through the font of
+/// `add_type0_font_with_tounicode_ranges` with `GAPPED_RANGES` once inside
+/// the box and once again, on other baselines, out on the right half, as a
+/// single-page extract of an imposed spread keeps its neighbour's text.
+fn make_spread_pdf_with_gapped_font_off_page() -> Vec<u8> {
+    use lopdf::Document;
+
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let highest_code = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(GAPPED_RANGES.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = Document::with_version("1.5");
+    let font_id = add_type0_font_with_tounicode_ranges(&mut doc, &GAPPED_RANGES, highest_code);
+    let mut content = String::new();
+    for (index, line) in shown.iter().enumerate() {
+        let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+        content.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+        content.push_str(&format!(
+            "BT /F1 12 Tf 700 {} Td <{hex}> Tj ET\n",
+            690 - 20 * index
+        ));
+    }
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        [0, 0, 1224, 792],
+        Some(LETTER_BOX),
+        &[("F1", font_id)],
+    );
+    finish_document(doc, pages_id, vec![page_id])
+}
+
+#[test]
+fn test_text_outside_the_page_box_takes_its_cmap_coverage_with_it() {
+    let pdf = make_spread_pdf_with_gapped_font_off_page();
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    let markdown = result.markdown.as_deref().unwrap();
+    // The neighbour's text is left out of the page ...
+    assert_eq!(
+        markdown.matches("JAZZ POLKA").count(),
+        SHOWINGS,
+        "{markdown}"
+    );
+    // ... and so are its codes: the coverage is that of the lines in the box.
+    let lines = cmap_gap_lines();
+    let codes: u32 = lines.iter().map(|line| line.len() as u32).sum::<u32>() * SHOWINGS as u32;
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes,
+            interpolated: 8 * SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
+// ============================================================================
 // Image XObject emission
 // ============================================================================
 
@@ -4537,4 +6853,4300 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
          trustworthy, got: {:?}",
         page.markdown
     );
+}
+
+// =========================================================================
+// Rotated text-run geometry (fixture: rotated_margin_stamp.pdf)
+// =========================================================================
+
+/// An upright Letter page with a title, a two-column body, and a 20pt
+/// arXiv-style identifier shown with a 90° counter-clockwise text matrix
+/// (`0 1 -1 0 32 200 Tm`) along the left margin, reading bottom to top.
+const ROTATED_STAMP_FIXTURE: &str = "tests/fixtures/rotated_margin_stamp.pdf";
+const ROTATED_STAMP_TEXT: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+#[test]
+fn test_rotated_margin_run_has_tall_thin_box_and_rotation() {
+    let items = extract_text_with_positions(ROTATED_STAMP_FIXTURE).unwrap();
+    let stamp = items
+        .iter()
+        .find(|i| i.text == ROTATED_STAMP_TEXT)
+        .expect("stamp item");
+    assert!(
+        (stamp.rotation - 90.0).abs() < 1e-3,
+        "rotation = {}",
+        stamp.rotation
+    );
+    assert!(!stamp.is_horizontal());
+    // The glyphs extend one em to the left of the baseline drawn at x = 32,
+    // and the run starts at y = 200 then advances up the page.
+    assert!((stamp.x - 12.0).abs() < 0.05, "x = {}", stamp.x);
+    assert!((stamp.width - 20.0).abs() < 0.05, "width = {}", stamp.width);
+    assert!((stamp.y - 200.0).abs() < 0.05, "y = {}", stamp.y);
+    assert!(
+        stamp.height > 300.0 && stamp.height < 500.0,
+        "height = {}",
+        stamp.height
+    );
+    assert!(
+        stamp.height > 10.0 * stamp.width,
+        "box must be tall and thin, got {}x{}",
+        stamp.width,
+        stamp.height
+    );
+    assert_eq!(stamp.font_size, 20.0);
+
+    // Upright body text keeps the historical box: baseline y, em height,
+    // advance width, no rotation.
+    let body = items
+        .iter()
+        .find(|i| i.text.starts_with("The quick brown fox"))
+        .expect("body item");
+    assert_eq!(body.rotation, 0.0);
+    assert!(body.is_horizontal());
+    assert_eq!((body.x, body.y, body.height), (72.0, 690.0, 11.0));
+    assert!(
+        body.width > 150.0 && body.width < 250.0,
+        "width = {}",
+        body.width
+    );
+
+    assert!(
+        items
+            .iter()
+            .filter(|i| !i.text.trim().is_empty())
+            .all(|i| i.width > 0.0),
+        "no run with glyphs may be zero-width"
+    );
+}
+
+#[test]
+fn test_rotated_margin_run_is_assigned_to_margin_region_only() {
+    let buf = std::fs::read(ROTATED_STAMP_FIXTURE).unwrap();
+    // Top-left page coordinates, as layout models report them: a left-margin
+    // strip next to the body area. Before the geometry fix the stamp's
+    // zero width was replaced by a chars × 0.5em phantom that crossed into
+    // the body box, so the body region won the exclusive assignment and the
+    // margin region came back empty.
+    let margin = [0.0, 0.0, 50.0, 792.0];
+    let body = [60.0, 0.0, 612.0, 792.0];
+    let results = extract_text_in_regions_mem(&buf, &[(0, vec![margin, body])]).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].regions.len(), 2);
+    let (margin_text, body_text) = (&results[0].regions[0], &results[0].regions[1]);
+    assert_eq!(margin_text.text.trim(), ROTATED_STAMP_TEXT);
+    assert!(!margin_text.needs_ocr);
+    assert!(
+        !body_text.text.contains("arXiv"),
+        "stamp leaked into the body region: {:?}",
+        body_text.text
+    );
+    assert!(body_text.text.contains("The quick brown fox"));
+    assert!(body_text.text.contains("title line across both columns."));
+
+    // The margin box alone recovers the same stamp: pairing it with the body
+    // box must not change the answer.
+    let solo = extract_text_in_regions_mem(&buf, &[(0, vec![margin])]).unwrap();
+    assert_eq!(solo[0].regions[0].text.trim(), ROTATED_STAMP_TEXT);
+}
+
+#[test]
+fn test_clockwise_rotated_page_reads_in_order_and_regions_follow() {
+    // Top-to-bottom runs (`Tm = [0 -1 1 0]`): a page rotated clockwise. The
+    // first line runs down the page at x = 300, the next line sits to its
+    // LEFT at x = 270. The frame must be turned clockwise (not the fixed
+    // counter-clockwise turn, which mirrors both word and line order), and
+    // region boxes given in page coordinates must follow that frame.
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let find = |t: &str| {
+        items
+            .iter()
+            .find(|i| i.text.contains(t))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {t} in {:?}",
+                    items.iter().map(|i| &i.text).collect::<Vec<_>>()
+                )
+            })
+    };
+    let (hello, second) = (find("HELLO"), find("SECOND"));
+    assert!(
+        items.iter().all(|i| i.rotation == 0.0 && i.is_horizontal()),
+        "{items:?}"
+    );
+    assert!(hello.y > second.y, "first line must stack above the second");
+    assert!(
+        (hello.x - second.x).abs() < 0.5,
+        "both lines start at the same left edge"
+    );
+
+    let full = extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    let text = &full[0].regions[0].text;
+    let at = |t: &str| text.find(t).unwrap_or_else(|| panic!("no {t} in {text:?}"));
+    assert!(at("HELLO") < at("WORLD") && at("WORLD") < at("SECOND") && at("SECOND") < at("LINE"));
+
+    // A top-left page box around the first line only (page x 290..320,
+    // y 87..192 from the top) must select exactly that line.
+    let first_line =
+        extract_text_in_regions_mem(&buf, &[(0, vec![[290.0, 87.0, 320.0, 192.0]])]).unwrap();
+    let text = &first_line[0].regions[0].text;
+    assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+    assert!(
+        !text.contains("SECOND") && !text.contains("LINE"),
+        "{text:?}"
+    );
+
+    // Callers holding the items can ask for each page's frame and pass it
+    // explicitly to the region helper instead of relying on inference.
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+    let text =
+        collect_text_in_region_in_frame(&items, 290.0, 87.0, 320.0, 192.0, 792.0, PageRotation::Cw);
+    assert!(
+        text.contains("HELLO") && !text.contains("SECOND"),
+        "{text:?}"
+    );
+
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        md.find("HELLO").unwrap() < md.find("WORLD").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("WORLD").unwrap() < md.find("SECOND").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("SECOND").unwrap() < md.find("LINE").unwrap(),
+        "{md}"
+    );
+}
+
+// =========================================================================
+// Coordinate frame: positions and regions share the visible page box
+// =========================================================================
+
+fn find_item<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+    items
+        .iter()
+        .find(|item| item.text.trim() == text)
+        .unwrap_or_else(|| panic!("no item with text {text:?} in {items:#?}"))
+}
+
+/// Top-left region (visible-box frame) covering exactly `item`, given the
+/// visible box height — how a consumer turns a positioned item back into the
+/// box a renderer draws around it.
+fn item_region(item: &TextItem, visible_height: f32) -> [f32; 4] {
+    [
+        item.x,
+        visible_height - item.y - item.height,
+        item.x + item.width,
+        visible_height - item.y,
+    ]
+}
+
+fn region_text(buf: &[u8], region: [f32; 4]) -> String {
+    extract_text_in_regions_mem(buf, &[(0, vec![region])])
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0)
+        .text
+}
+
+#[test]
+fn test_positions_are_relative_to_cropbox_origin() {
+    // MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is written
+    // at raw (120, 300), so a CropBox render puts it at (70, 240) from the
+    // visible box's lower-left corner.
+    let path = "tests/fixtures/cropbox_offset_origin.pdf";
+    let buf = std::fs::read(path).unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let glyph = find_item(&items, "Visible glyph");
+    assert_close(glyph.x, 70.0);
+    assert_close(glyph.y, 240.0);
+
+    // Every public variant shares the frame.
+    let from_path = extract_text_with_positions(path).unwrap();
+    let path_glyph = find_item(&from_path, "Visible glyph");
+    assert_eq!((path_glyph.x, path_glyph.y), (glyph.x, glyph.y));
+    let page_filter: HashSet<u32> = [1].into_iter().collect();
+    let paged =
+        pdf_inspector::extractor::extract_text_with_positions_mem_pages(&buf, Some(&page_filter))
+            .unwrap();
+    let paged_glyph = find_item(&paged, "Visible glyph");
+    assert_eq!((paged_glyph.x, paged_glyph.y), (glyph.x, glyph.y));
+
+    // The region API reads the same frame: the glyph's own box in the
+    // visible box's top-left space (300 x 400) yields exactly that line.
+    let text = region_text(&buf, item_region(glyph, 400.0));
+    assert!(text.contains("Visible glyph"), "got {text:?}");
+    assert!(!text.contains("Second line"), "got {text:?}");
+
+    // The same box in raw MediaBox coordinates (the previous frame) lands on
+    // a different line — the silent mis-selection the shared frame fixes.
+    let raw_region = [
+        120.0,
+        500.0 - 300.0 - glyph.height,
+        120.0 + glyph.width,
+        500.0 - 300.0,
+    ];
+    let raw_text = region_text(&buf, raw_region);
+    assert!(!raw_text.contains("Visible glyph"), "got {raw_text:?}");
+    assert!(raw_text.contains("Third line"), "got {raw_text:?}");
+}
+
+#[test]
+fn test_positions_use_cropbox_intersected_with_offset_mediabox() {
+    // The MediaBox origin is itself non-zero and the CropBox pokes below it:
+    // renderers show the intersection (36, 36)-(648, 783), 612 x 747.
+    let content = "BT /F1 12 Tf 100 100 Td (Anchor) Tj ET";
+    let buf = make_text_pdf_with_boxes(content, "36 36 648 819", Some("36 0 648 783"));
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 64.0);
+    assert_close(anchor.y, 64.0);
+    let text = region_text(&buf, item_region(anchor, 747.0));
+    assert!(text.contains("Anchor"), "got {text:?}");
+
+    // Without a CropBox, the MediaBox origin alone shifts the frame.
+    let buf = make_text_pdf_with_boxes(content, "36 36 648 819", None);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 64.0);
+    assert_close(anchor.y, 64.0);
+    let text = region_text(&buf, item_region(anchor, 783.0));
+    assert!(text.contains("Anchor"), "got {text:?}");
+}
+
+#[test]
+fn test_positions_unchanged_when_cropbox_matches_mediabox() {
+    // Origin MediaBox, no CropBox: raw coordinates pass through untouched.
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET";
+    let items = extract_text_with_positions_mem(&make_text_pdf(content, "0 0 612 792")).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 72.0);
+    assert_close(anchor.y, 700.0);
+
+    // An explicit CropBox equal to the MediaBox changes nothing either.
+    let buf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("0 0 612 792"));
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 72.0);
+    assert_close(anchor.y, 700.0);
+
+    // Real fixture without a CropBox: pinned to the previous output.
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.page == 1 && item.text == "Technical Information")
+        .expect("title item");
+    assert_close(title.x, 314.25);
+    assert_close(title.y, 645.0);
+}
+
+#[test]
+fn test_region_table_apis_use_visible_box_frame() {
+    use pdf_inspector::{
+        extract_tables_with_structure_cells_mem, extract_tables_with_structure_mem, TsrTableInput,
+    };
+
+    // The 2x2 ruled grid of `synthetic_vector_grid_pdf`, on a page whose
+    // CropBox [20 100 280 780] shifts the visible frame by (20, 20) from the
+    // MediaBox's top-left corner and makes it 260 x 680.
+    let buf = synthetic_vector_grid_pdf_with_crop_box(false, Some([20, 100, 280, 780]));
+    // The raw MediaBox-frame crop [50, 60, 210, 130] expressed in that frame.
+    let crop = [30.0_f32, 40.0, 190.0, 110.0];
+    let detected = detect_vector_grid_in_region_mem(&buf, 0, crop, 72.0)
+        .unwrap()
+        .expect("ruled vector table should be detected in the visible-box frame");
+    assert_eq!(detected.cell_bboxes.len(), 4);
+    // Cell bboxes are crop-relative pixels, so they match the CropBox-free page.
+    let first = &detected.cell_bboxes[0];
+    assert_close(first[0], 0.0);
+    assert_close(first[1], 0.0);
+    assert_close(first[2], 80.0);
+    assert_close(first[3], 30.0);
+
+    let input = TsrTableInput {
+        page: 0,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: 72.0,
+        structure_tokens: detected.structure_tokens.clone(),
+        cell_bboxes: detected.cell_bboxes.clone(),
+    };
+    let markdown = extract_tables_with_structure_mem(&buf, std::slice::from_ref(&input))
+        .unwrap()
+        .remove(0);
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(markdown.contains(tok), "expected {tok} in {markdown}");
+    }
+    // The cell fill reads the same frame the crop was given in.
+    let cells = extract_tables_with_structure_cells_mem(&buf, std::slice::from_ref(&input))
+        .unwrap()
+        .remove(0);
+    let cell_text = |row: usize, col: usize| {
+        cells
+            .iter()
+            .find(|c| c.row == row && c.col == col)
+            .map(|c| c.text.trim().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(cell_text(0, 0), "A1");
+    assert_eq!(cell_text(1, 1), "B2");
+
+    // The heuristic region path agrees.
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[20.0, 30.0, 200.0, 740.0]])]).unwrap();
+    let region = &results[0].regions[0];
+    assert!(!region.needs_ocr, "expected a table, got needs_ocr");
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(
+            region.text.contains(tok),
+            "expected {tok} in {}",
+            region.text
+        );
+    }
+}
+
+#[test]
+fn test_turned_page_positions_are_independent_of_the_box_origin() {
+    // The clockwise page of `test_clockwise_rotated_page_reads_in_order_and_regions_follow`
+    // drawn on a MediaBox whose origin is (50, 60), content shifted by the
+    // same amount: every item must report exactly the positions of its
+    // origin-0 twin — the visible-box shift is turned with the frame — and
+    // the region API must read that frame.
+    let plain_content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let shifted_content = "BT /F1 12 Tf 0 -1 1 0 350 760 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 350 715 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 320 760 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 320 704 Tm (LINE) Tj ET";
+    let plain = make_text_pdf(plain_content, "0 0 612 792");
+    let shifted = make_text_pdf(shifted_content, "50 60 662 852");
+    let (plain_items, plain_frames) =
+        extract_text_with_positions_and_rotations_mem(&plain).unwrap();
+    let (shifted_items, shifted_frames) =
+        extract_text_with_positions_and_rotations_mem(&shifted).unwrap();
+    assert_eq!(plain_frames.get(&1), Some(&PageRotation::Cw));
+    assert_eq!(shifted_frames.get(&1), Some(&PageRotation::Cw));
+    let find = |items: &[TextItem], text: &str| -> TextItem {
+        items
+            .iter()
+            .find(|i| i.text.contains(text))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {text} in {items:?}"))
+    };
+    for text in ["HELLO", "WORLD", "SECOND", "LINE"] {
+        let (a, b) = (find(&plain_items, text), find(&shifted_items, text));
+        assert_close(a.x, b.x);
+        assert_close(a.y, b.y);
+        assert_close(a.width, b.width);
+        assert_close(a.height, b.height);
+        assert_eq!(a.rotation, b.rotation);
+    }
+
+    // The top-left region around the first line selects exactly that line
+    // in both documents.
+    for buf in [&plain, &shifted] {
+        let text = region_text(buf, [290.0, 87.0, 320.0, 192.0]);
+        assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+        assert!(
+            !text.contains("SECOND") && !text.contains("LINE"),
+            "{text:?}"
+        );
+    }
+}
+
+fn clipped_run_items(content: &str) -> Vec<TextItem> {
+    extract_text_with_positions_mem(&make_text_pdf(content, "0 0 300 300")).unwrap()
+}
+
+fn clipped_field(clip: &str, x: f32, text: &str) -> String {
+    format!("q {clip} BT /F1 12 Tf 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
+}
+
+#[test]
+fn separated_rectangular_clips_preserve_independent_measured_runs() {
+    let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 25 15 re W* n", 84.0, "Beta")
+        + &clipped_field("112 98 45 15 re W n", 112.0, "Gamma");
+    let items = clipped_run_items(&content);
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "Beta", "Gamma"]
+    );
+    assert!(items.iter().all(|i| i.advance_known));
+    assert_eq!(
+        items.iter().map(|i| i.x).collect::<Vec<_>>(),
+        [50.0, 84.0, 112.0]
+    );
+}
+
+#[test]
+fn same_touching_overlapping_and_unknown_clips_keep_existing_merges() {
+    for (left, right) in [
+        ("50 98 100 15 re W n", "50 98 100 15 re W n"),
+        ("50 98 34 15 re W n", "84 98 25 15 re W n"),
+        ("50 98 36 15 re W n", "84 98 25 15 re W n"),
+        ("", ""),
+        ("50 98 31 15 re W n", ""),
+        ("", "84 98 25 15 re W n"),
+        ("50 98 31 15 re W n", "84 98 m 109 98 l 109 113 l h W n"),
+        ("50 98 31 15 re W n", "84 98 25 15 re 200 0 1 1 re W n"),
+    ] {
+        let content = clipped_field(left, 50.0, "Alpha") + &clipped_field(right, 84.0, "Beta");
+        let items = clipped_run_items(&content);
+        assert_eq!(items.len(), 1, "{left} / {right}: {items:?}");
+        assert_eq!(items[0].text, "Alpha Beta");
+    }
+    let currency = clipped_field("50 98 9 15 re W n", 50.0, "$")
+        + &clipped_field("59 98 20 15 re W n", 59.0, "60");
+    assert_eq!(clipped_run_items(&currency)[0].text, "$ 60");
+}
+
+#[test]
+fn clipping_preserves_prose_and_text_operator_fragments_within_one_clip() {
+    let prose = "q 40 90 150 40 re W n BT /F1 12 Tf 50 100 Td [(Al) (pha)] TJ ET \
+        q BT /F1 12 Tf 84 100 Td (Beta) Tj ET Q Q";
+    assert_eq!(clipped_run_items(prose)[0].text, "Alpha Beta");
+    // Each source word belongs to its own separated clip, regardless of whether
+    // downstream layout uses the words as prose or as fields.
+    let fields = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 31 15 re W n", 84.0, "Alpha");
+    assert_eq!(
+        clipped_run_items(&fields)
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Alpha"]
+    );
+}
+
+#[test]
+fn clip_sidecar_stays_aligned_across_skipped_text_and_graphics_restore() {
+    let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + "BT /F1 12 Tf 3 Tr (Hidden) Tj () TJ ET\n"
+        + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
+    let items = clipped_run_items(&content);
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "Beta"]
+    );
+}
+
+#[test]
+fn nested_clips_and_transformed_paths_preserve_only_proven_boundaries() {
+    let left = "q 0 0 200 200 re W n 50 98 31 15 re W n \
+        1 0 0 1 10 0 cm BT /F1 12 Tf 40 100 Td (Alpha) Tj ET Q\n";
+    let right = "q 2 0 0 1 0 0 cm 42 98 12.5 15 re W n \
+        0.5 0 0 1 0 0 cm BT /F1 12 Tf 84 100 Td (Beta) Tj ET Q";
+    let items = clipped_run_items(&(left.to_string() + right));
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Alpha", "Beta"]
+    );
+}
+
+#[test]
+fn partially_clipped_or_unmeasured_advances_do_not_prove_a_boundary() {
+    let content = clipped_field("50 98 15 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
+    assert_eq!(clipped_run_items(&content)[0].text, "Alpha Beta");
+    let content = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("84 98 25 15 re W n", 84.0, "Beta");
+    let bytes = make_text_pdf(&content, "0 0 300 300");
+    let unknown_font = String::from_utf8(bytes)
+        .unwrap()
+        .replace("/Helvetica", "/UnknownXX");
+    let items = extract_text_with_positions_mem(unknown_font.as_bytes()).unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(!items[0].advance_known);
+}
+
+#[test]
+fn clip_provenance_does_not_guess_form_or_actual_text_boundaries() {
+    use lopdf::{dictionary, Object, Stream};
+    let content = "q 50 98 31 15 re W n /A Do Q q 84 98 25 15 re W n /B Do Q";
+    let mut doc = lopdf::Document::load_mem(&make_text_pdf(content, "0 0 300 300")).unwrap();
+    let a = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(),0.into(),300.into(),300.into()],
+        },
+        b"BT /F1 12 Tf 50 100 Td (Alpha) Tj ET".to_vec(),
+    ));
+    let b = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(),0.into(),300.into(),300.into()],
+        },
+        b"BT /F1 12 Tf 84 100 Td (Beta) Tj ET".to_vec(),
+    ));
+    let page_id = doc.get_pages()[&1];
+    doc.get_dictionary_mut(page_id)
+        .unwrap()
+        .get_mut(b"Resources")
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set(
+            "XObject",
+            dictionary! {"A"=>Object::Reference(a),"B"=>Object::Reference(b)},
+        );
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let items = extract_text_with_positions_mem(&bytes).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text, "Alpha Beta");
+    let actual = "q 50 98 31 15 re W n BT /F1 12 Tf 50 100 Td \
+        /Span << /ActualText (Alpha) >> BDC (Alpha) Tj EMC ET Q \
+        q 84 98 25 15 re W n BT /F1 12 Tf 84 100 Td \
+        /Span << /ActualText (Beta) >> BDC (Beta) Tj EMC ET Q";
+    assert_eq!(clipped_run_items(actual)[0].text, "Alpha Beta");
+}
+
+#[test]
+fn clipping_provenance_follows_sorted_items_and_supported_show_operators() {
+    let content = "q 112 98 45 15 re W n BT /F1 12 Tf 112 100 Td (Gamma) Tj ET Q \
+        q 50 98 31 15 re W n BT /F1 12 Tf 50 100 Td [(Al) (pha)] TJ ET Q \
+        q 84 98 25 15 re W n BT /F1 12 Tf 84 112 Td 12 TL (Beta) ' ET Q";
+    assert_eq!(
+        clipped_run_items(content)
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Beta", "Gamma"]
+    );
+}
+
+/// Items of a small page whose `F1` maps the codes `A`..`D` to the first
+/// four Hebrew letters (500-unit widths), for tests of right-to-left runs
+/// built from a content stream.
+fn hebrew_items(content: &str) -> Vec<TextItem> {
+    use lopdf::{dictionary, Document, Stream};
+
+    let mut doc = Document::load_mem(&make_text_pdf(content, "0 0 300 300")).unwrap();
+    let cmap = doc.add_object(Stream::new(
+        dictionary! {},
+        b"begincmap\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+          4 beginbfchar\n<41> <05D0>\n<42> <05D1>\n<43> <05D2>\n<44> <05D3>\n\
+          endbfchar\nendcmap"
+            .to_vec(),
+    ));
+    let font = doc.get_object_mut((5, 0)).unwrap().as_dict_mut().unwrap();
+    font.set("ToUnicode", cmap);
+    font.set("FirstChar", 65);
+    font.set("LastChar", 68);
+    font.set("Widths", vec![lopdf::Object::Integer(500); 4]);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    extract_text_with_positions_mem(&bytes).unwrap()
+}
+
+fn clipped_rtl_items(left_clip: &str, right_clip: &str) -> Vec<TextItem> {
+    let field = |clip: &str, x: u32, text: &str| {
+        format!("q {clip} BT /F1 12 Tf 10 Tz 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
+    };
+    hebrew_items(&(field(left_clip, 50, "AB") + &field(right_clip, 52, "CD")))
+}
+
+/// A visible run stored in reading order is still recognised when its
+/// geometry says so: a text matrix mirrored in x paints the glyphs right
+/// to left, the run displays correctly as stored, and it is read as stored.
+#[test]
+fn visible_logical_order_runs_painted_right_to_left_stay_logical() {
+    let items = hebrew_items("BT /F1 12 Tf -1 0 0 1 100 100 Tm (ABCD) Tj ET\n");
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["\u{05D0}\u{05D1}\u{05D2}\u{05D3}"]
+    );
+}
+
+/// Visible runs of right-to-left letters painted forwards are visual
+/// storage (the logical-order convention belongs to invisible text layers,
+/// see `rtl_invisible_logical_word_layer_reads_as_stored`): the two clipped
+/// fields read back turned round, each keeping its own clip.
+#[test]
+fn separated_rtl_clips_keep_runs_in_visual_storage_order() {
+    let items = clipped_rtl_items("50 98 1.3 15 re W n", "52 98 1.3 15 re W n");
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["\u{05D1}\u{05D0}", "\u{05D3}\u{05D2}"]
+    );
+    assert_eq!(items.iter().map(|i| i.x).collect::<Vec<_>>(), [50.0, 52.0]);
+    assert!(items.iter().all(|i| i.advance_known));
+    // These narrow, measured runs would otherwise merge; their clip
+    // association must survive visual-order character correction too.
+    assert_eq!(clipped_rtl_items("", "").len(), 1);
+}
+
+#[test]
+fn rtl_clips_still_require_separation_and_contained_advances() {
+    for (left, right) in [
+        ("50 98 10 15 re W n", "50 98 10 15 re W n"),
+        ("50 98 2 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 2.2 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 1.995 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 1.1 15 re W n", "52 98 1.3 15 re W n"),
+        ("50 98 1.3 15 re W n", ""),
+        ("50 98 1.3 15 re W n", "52 98 m 54 98 l 54 110 l h W n"),
+    ] {
+        assert_eq!(clipped_rtl_items(left, right).len(), 1, "{left}; {right}");
+    }
+}
+
+#[test]
+fn clip_rounding_gaps_and_rotated_page_frames_keep_existing_output() {
+    let touching = clipped_field("50 98 31 15 re W n", 50.0, "Alpha")
+        + &clipped_field("81.005 98 28 15 re W n", 84.0, "Beta");
+    assert_eq!(clipped_run_items(&touching)[0].text, "Alpha Beta");
+    let rotated = "q 98 50 15 31 re W n BT /F1 12 Tf 0 1 -1 0 100 50 Tm (Alpha) Tj ET Q \
+        q 98 84 15 25 re W n BT /F1 12 Tf 0 1 -1 0 100 84 Tm (Beta) Tj ET Q";
+    let unclipped = rotated
+        .replace("98 50 15 31 re W n", "")
+        .replace("98 84 15 25 re W n", "");
+    let observed = clipped_run_items(rotated);
+    let control = clipped_run_items(&unclipped);
+    assert_eq!(
+        observed
+            .iter()
+            .map(|i| (&i.text, i.x, i.y, i.width))
+            .collect::<Vec<_>>(),
+        control
+            .iter()
+            .map(|i| (&i.text, i.x, i.y, i.width))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn separated_clipped_word_fragments_keep_text_when_assembled() {
+    let content = clipped_field("50 98 10.8 15 re W n", 50.0, "Al")
+        + &clipped_field("61 98 21 15 re W n", 61.0, "pha");
+    let items = clipped_run_items(&content);
+    assert_eq!(
+        items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+        ["Al", "pha"]
+    );
+    let md = process_pdf_mem(&make_text_pdf(&content, "0 0 300 300"))
+        .unwrap()
+        .markdown
+        .unwrap();
+    assert_eq!(md.trim(), "Alpha");
+}
+
+#[test]
+fn test_contents_page_without_leaders_lists_one_entry_per_line() {
+    // A contents page in the style of an edited volume: entry titles at the
+    // left, page numbers right-aligned at x = 400 with no dot leaders, and
+    // the chapter authors on their own lines between the entries. The
+    // entries must come out one per line with the page number tab-separated,
+    // not interleaved into a two-column paragraph.
+    let content = "BT /F1 14 Tf 72 720 Td (Contents) Tj ET\n\
+BT /F1 12 Tf 72 690 Td (List of figures) Tj ET\n\
+BT /F1 12 Tf 378.4 690 Td (vii) Tj ET\n\
+BT /F1 12 Tf 72 672 Td (List of tables) Tj ET\n\
+BT /F1 12 Tf 385.6 672 Td (ix) Tj ET\n\
+BT /F1 12 Tf 72 654 Td (List of contributors) Tj ET\n\
+BT /F1 12 Tf 385.6 654 Td (xi) Tj ET\n\
+BT /F1 12 Tf 72 630 Td (Introduction) Tj ET\n\
+BT /F1 12 Tf 392.8 630 Td (1) Tj ET\n\
+BT /F1 12 Tf 90 615 Td (Lise Jaillant and Claire Warwick) Tj ET\n\
+BT /F1 12 Tf 72 594 Td (1 The National Archives) Tj ET\n\
+BT /F1 12 Tf 385.6 594 Td (15) Tj ET\n\
+BT /F1 12 Tf 90 579 Td (Katherine Aske and Annalina Caputo) Tj ET\n\
+BT /F1 12 Tf 72 558 Td (2 Computer vision and cultural heritage) Tj ET\n\
+BT /F1 12 Tf 385.6 558 Td (41) Tj ET\n\
+BT /F1 12 Tf 90 543 Td (Catherine Nicole Coleman) Tj ET\n\
+BT /F1 12 Tf 72 522 Td (3 Machine learning at the National Library) Tj ET\n\
+BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    for entry in [
+        "List of figures\tvii",
+        "List of tables\tix",
+        "List of contributors\txi",
+        "Introduction\t1",
+        "1 The National Archives\t15",
+        "2 Computer vision and cultural heritage\t41",
+        "3 Machine learning at the National Library\t61",
+    ] {
+        assert!(md.contains(entry), "missing {entry:?} in {md}");
+    }
+    assert!(md.contains("Lise Jaillant and Claire Warwick"), "{md}");
+    assert!(
+        !md.contains("List of figures vii List of tables"),
+        "entries interleaved into a paragraph: {md}"
+    );
+}
+
+// =========================================================================
+// Display frame: positions and regions on the rendered page
+// =========================================================================
+
+fn display_items(buf: &[u8]) -> Vec<TextItem> {
+    extract_text_with_positions_mem_in_frame(buf, None, PositionFrame::Display).unwrap()
+}
+
+fn display_region_text(buf: &[u8], region: [f32; 4]) -> String {
+    extract_text_in_regions_mem_in_frame(buf, &[(0, vec![region])], PositionFrame::Display)
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0)
+        .text
+}
+
+/// Both extractions report the same items with the same geometry, exactly.
+fn assert_same_geometry(expected: &[TextItem], actual: &[TextItem]) {
+    assert_eq!(expected.len(), actual.len(), "{expected:#?}\n{actual:#?}");
+    for (e, a) in expected.iter().zip(actual) {
+        assert_eq!(e.text, a.text);
+        assert_eq!(e.page, a.page);
+        assert_eq!(
+            (e.x, e.y, e.width, e.height, e.rotation),
+            (a.x, a.y, a.width, a.height, a.rotation),
+            "{:?}",
+            e.text
+        );
+    }
+}
+
+#[test]
+fn test_display_frame_equals_sheet_frame_on_unrotated_pages() {
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    // The default frame is unchanged and is what `PositionFrame::Sheet` names.
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&sheet, "Anchor");
+    assert_eq!(
+        (anchor.x, anchor.y, anchor.height, anchor.rotation),
+        (72.0, 700.0, 12.0, 0.0)
+    );
+    let explicit =
+        extract_text_with_positions_mem_in_frame(&buf, None, PositionFrame::Sheet).unwrap();
+    assert_same_geometry(&sheet, &explicit);
+
+    // Without a /Rotate the rendered page is the sheet, so both frames agree
+    // for items and for regions.
+    assert_same_geometry(&sheet, &display_items(&buf));
+    let region = item_region(anchor, 792.0);
+    assert_eq!(region_text(&buf, region).trim(), "Anchor");
+    assert_eq!(display_region_text(&buf, region).trim(), "Anchor");
+
+    // The rotations variant takes the same page filter as the positions one.
+    let pages: HashSet<u32> = [1].into_iter().collect();
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&pages),
+        PositionFrame::Display,
+    )
+    .unwrap();
+    assert_same_geometry(&sheet, &items);
+    assert!(rotations.is_empty());
+    let absent: HashSet<u32> = [2].into_iter().collect();
+    let (items, _) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&absent),
+        PositionFrame::Sheet,
+    )
+    .unwrap();
+    assert!(items.is_empty());
+}
+
+#[test]
+fn test_positions_and_rotations_honour_the_page_filter() {
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let pages: HashSet<u32> = [2].into_iter().collect();
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem_in_frame(
+        &buf,
+        Some(&pages),
+        PositionFrame::Sheet,
+    )
+    .unwrap();
+    assert!(!items.is_empty());
+    assert!(items.iter().all(|item| item.page == 2));
+    assert!(rotations.is_empty());
+    let filtered =
+        pdf_inspector::extractor::extract_text_with_positions_mem_pages(&buf, Some(&pages))
+            .unwrap();
+    assert_same_geometry(&filtered, &items);
+}
+
+#[test]
+fn test_display_frame_renders_bottom_to_top_text_under_rotate_90() {
+    // Two lines reading bottom-to-top, the second 30pt to the right of the
+    // first: a page laid out sideways that `/Rotate 90` displays upright.
+    let content = "BT /F1 12 Tf 0 1 -1 0 40 420 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET";
+    let buf =
+        make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None, HELVETICA_FONT);
+
+    // The sheet frame turns the page so the runs read along +x ...
+    let (sheet, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Ccw));
+    let hello = find_item(&sheet, "HELLO");
+    assert_close(hello.x, 420.0);
+    assert_close(hello.y, -40.0);
+    assert_eq!(hello.rotation, 0.0);
+
+    // ... and the display frame puts them where a renderer draws them: on
+    // the 792 x 612 rendered page, a horizontal line starting 420pt from the
+    // left edge whose top sits 40 - 12 = 28pt below the top edge.
+    let (display, rotations) =
+        extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
+            .unwrap();
+    assert_eq!(
+        rotations.get(&1),
+        Some(&PageRotation::Ccw),
+        "the turn is still reported"
+    );
+    let hello = find_item(&display, "HELLO");
+    assert_close(hello.x, 420.0);
+    assert_close(hello.y, 612.0 - 40.0);
+    assert_close(hello.height, 12.0);
+    assert_eq!(hello.rotation, 0.0);
+    assert!(
+        hello.width > 30.0 && hello.width < 50.0,
+        "width = {}",
+        hello.width
+    );
+    let world = find_item(&display, "WORLD");
+    assert_close(world.x, 420.0);
+    assert_close(world.y, 612.0 - 70.0);
+    assert_eq!(world.rotation, 0.0);
+    assert!(hello.y > world.y, "HELLO renders above WORLD");
+
+    // Region rects on the rendered page (top-left origin) select exactly the
+    // line they cover: HELLO occupies y ∈ [28, 40], WORLD y ∈ [58, 70].
+    let hello_rect = [400.0, 20.0, 700.0, 45.0];
+    let world_rect = [400.0, 55.0, 700.0, 75.0];
+    assert_eq!(display_region_text(&buf, hello_rect).trim(), "HELLO");
+    assert_eq!(display_region_text(&buf, world_rect).trim(), "WORLD");
+    // Read in the sheet frame, the same rects land on empty paper.
+    assert_eq!(region_text(&buf, hello_rect).trim(), "");
+}
+
+#[test]
+fn test_display_frame_renders_top_to_bottom_text_under_rotate_270() {
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET";
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        Some(270),
+        None,
+        HELVETICA_FONT,
+    );
+    let (display, rotations) =
+        extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
+            .unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+
+    // Sheet box x ∈ [300, 312], y ∈ [700 - advance, 700]; `/Rotate 270`
+    // renders it as a horizontal line at x = 792 - 700 with its baseline at
+    // y = 300 on the 792 x 612 page.
+    let hello = find_item(&display, "HELLO");
+    assert_close(hello.x, 92.0);
+    assert_close(hello.y, 300.0);
+    assert_close(hello.height, 12.0);
+    assert_eq!(hello.rotation, 0.0);
+    let second = find_item(&display, "SECOND");
+    assert_close(second.x, 92.0);
+    assert_close(second.y, 270.0);
+    assert!(hello.y > second.y, "HELLO renders above SECOND");
+
+    // HELLO's band is y ∈ [300, 312] from the top, SECOND's y ∈ [330, 342].
+    assert_eq!(
+        display_region_text(&buf, [80.0, 295.0, 200.0, 315.0]).trim(),
+        "HELLO"
+    );
+    assert_eq!(
+        display_region_text(&buf, [80.0, 325.0, 200.0, 345.0]).trim(),
+        "SECOND"
+    );
+}
+
+#[test]
+fn test_display_frame_turns_upright_text_by_an_inherited_rotate() {
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
+    // `/Rotate 180` on the /Pages node only.
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        Some(180),
+        HELVETICA_FONT,
+    );
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor_sheet = find_item(&sheet, "Anchor");
+    assert_eq!((anchor_sheet.x, anchor_sheet.y), (72.0, 700.0));
+
+    let display = display_items(&buf);
+    let anchor = find_item(&display, "Anchor");
+    assert_close(anchor.x, 612.0 - 72.0 - anchor_sheet.width);
+    assert_close(anchor.y, 792.0 - 700.0 - 12.0);
+    assert_close(anchor.width, anchor_sheet.width);
+    assert_close(anchor.height, 12.0);
+    assert_eq!(anchor.rotation, 180.0);
+    let second = find_item(&display, "Second");
+    assert_close(second.y, 792.0 - 680.0 - 12.0);
+    // Anchor's band on the 612 x 792 rendered page is y ∈ [700, 712] from
+    // the top; Second sits above it at y ∈ [680, 692].
+    assert_eq!(
+        display_region_text(&buf, [400.0, 695.0, 560.0, 715.0]).trim(),
+        "Anchor"
+    );
+
+    // The page's own /Rotate wins over the inherited one.
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        Some(90),
+        Some(180),
+        HELVETICA_FONT,
+    );
+    let anchor = find_item(&display_items(&buf), "Anchor").clone();
+    assert_close(anchor.x, 700.0);
+    assert_close(anchor.y, 612.0 - 72.0 - anchor_sheet.width);
+    assert_close(anchor.width, 12.0);
+    assert_close(anchor.height, anchor_sheet.width);
+    assert_eq!(anchor.rotation, 270.0);
+
+    // A negative angle folds the way renderers fold it: -90 is 270.
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        Some(-90),
+        None,
+        HELVETICA_FONT,
+    );
+    let anchor = find_item(&display_items(&buf), "Anchor").clone();
+    assert_close(anchor.x, 792.0 - 700.0 - 12.0);
+    assert_close(anchor.y, 72.0);
+    assert_eq!(anchor.rotation, 90.0);
+}
+
+#[test]
+fn test_display_frame_with_an_offset_cropbox_under_rotate_90() {
+    // MediaBox 400 x 500 with CropBox [50 60 350 460]: a 300 x 400 visible
+    // box that `/Rotate 90` renders as a 400 x 300 page.
+    let content =
+        "BT /F1 12 Tf 120 300 Td (Visible glyph) Tj ET\nBT /F1 12 Tf 120 280 Td (Second line) Tj ET";
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 400 500",
+        Some("50 60 350 460"),
+        Some(90),
+        None,
+        HELVETICA_FONT,
+    );
+    let sheet = extract_text_with_positions_mem(&buf).unwrap();
+    let glyph_sheet = find_item(&sheet, "Visible glyph");
+    assert_close(glyph_sheet.x, 70.0);
+    assert_close(glyph_sheet.y, 240.0);
+
+    let display = display_items(&buf);
+    let glyph = find_item(&display, "Visible glyph");
+    assert_close(glyph.x, 240.0);
+    assert_close(glyph.y, 300.0 - 70.0 - glyph_sheet.width);
+    assert_close(glyph.width, 12.0);
+    assert_close(glyph.height, glyph_sheet.width);
+    assert_eq!(glyph.rotation, 270.0);
+
+    // Its own box on the 400 x 300 rendered page selects it alone.
+    let text = display_region_text(&buf, item_region(glyph, 300.0));
+    assert!(text.contains("Visible glyph"), "got {text:?}");
+    assert!(!text.contains("Second line"), "got {text:?}");
+}
+
+#[test]
+fn test_display_frame_region_tables_follow_the_rect_frame() {
+    // A small aligned grid on a page displayed sideways: the table detector
+    // sees the same items whether the region arrives in the sheet frame or,
+    // turned, in the display frame.
+    let content = "BT /F1 12 Tf 72 700 Td (Name) Tj ET\n\
+BT /F1 12 Tf 200 700 Td (Qty) Tj ET\n\
+BT /F1 12 Tf 330 700 Td (Price) Tj ET\n\
+BT /F1 12 Tf 72 680 Td (Apple) Tj ET\n\
+BT /F1 12 Tf 200 680 Td (3) Tj ET\n\
+BT /F1 12 Tf 330 680 Td (1.50) Tj ET\n\
+BT /F1 12 Tf 72 660 Td (Pear) Tj ET\n\
+BT /F1 12 Tf 200 660 Td (5) Tj ET\n\
+BT /F1 12 Tf 330 660 Td (2.25) Tj ET";
+    let buf =
+        make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None, HELVETICA_FONT);
+    let sheet_rect = [60.0, 80.0, 400.0, 137.0];
+    // The same area on the 792 x 612 rendered page.
+    let display_rect = [792.0 - 137.0, 60.0, 792.0 - 80.0, 400.0];
+
+    let from_sheet = extract_tables_in_regions_mem(&buf, &[(0, vec![sheet_rect])])
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0);
+    let from_display = extract_tables_in_regions_mem_in_frame(
+        &buf,
+        &[(0, vec![display_rect])],
+        PositionFrame::Display,
+    )
+    .unwrap()
+    .remove(0)
+    .regions
+    .remove(0);
+    assert_eq!(
+        from_display.text,
+        "|Name|Qty|Price|\n|---|---|---|\n|Apple|3|1.50|\n|Pear|5|2.25|\n"
+    );
+    assert_eq!(from_display.text, from_sheet.text);
+    assert!(!from_display.needs_ocr);
+    assert_eq!(from_display.needs_ocr, from_sheet.needs_ocr);
+
+    // Text regions agree too, and the display rect read in the sheet frame
+    // misses the grid entirely.
+    let text_from_sheet = region_text(&buf, sheet_rect);
+    assert!(text_from_sheet.contains("Apple"), "got {text_from_sheet:?}");
+    assert_eq!(display_region_text(&buf, display_rect), text_from_sheet);
+    assert_eq!(region_text(&buf, display_rect).trim(), "");
+}
+
+// =========================================================================
+// Font weight: the `font_weight` field and the `bold_from_weight` option
+// =========================================================================
+
+/// One page whose single line is set in three non-embedded faces that differ
+/// only in weight: `Face-Lt` and `Face-Md` name theirs, the third has an
+/// opaque name and says `/FontWeight 700` in its descriptor. None of them is
+/// bold by the flags or the name words the default extraction reads.
+fn synthetic_three_weights_pdf() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let mut font = |base_font: &str, font_weight: Option<i64>| {
+        let mut descriptor = dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => base_font,
+            "Flags" => 32,
+            "ItalicAngle" => 0,
+        };
+        if let Some(weight) = font_weight {
+            descriptor.set("FontWeight", weight);
+        }
+        let descriptor_id = doc.add_object(descriptor);
+        doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => base_font,
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths.clone()),
+            "FontDescriptor" => descriptor_id,
+        })
+    };
+    let light = font("ABCDEF+Face-Lt", None);
+    let medium = font("ABCDEF+Face-Md", None);
+    let heavy = font("ABCDEF+Opaque", Some(700));
+
+    let content =
+        b"BT /F1 12 Tf 72 700 Td (Light ) Tj /F2 12 Tf (Medium ) Tj /F3 12 Tf (Heavy) Tj ET\n\
+BT /F1 12 Tf 72 680 Td (Same ) Tj (weight) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => light,
+                "F2" => medium,
+                "F3" => heavy,
+            },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn text_and_style(items: &[TextItem]) -> Vec<(String, bool, Option<u16>)> {
+    items
+        .iter()
+        .map(|item| (item.text.clone(), item.is_bold, item.font_weight))
+        .collect()
+}
+
+#[test]
+fn test_font_weight_is_reported_and_bold_from_weight_is_off_by_default() {
+    let buf = synthetic_three_weights_pdf();
+
+    // Default: the three runs merge into one item as they always did, none
+    // is bold, and the item carries its first run's weight class.
+    let plain = extract_text_with_positions_mem(&buf).unwrap();
+    assert_eq!(
+        text_and_style(&plain),
+        [
+            ("Light Medium Heavy".to_string(), false, Some(300)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+
+    // Default options are the default extraction, item for item.
+    let explicit =
+        extract_text_with_positions_mem_with_options(&buf, None, PositionOptions::new()).unwrap();
+    assert_same_geometry(&plain, &explicit);
+    assert_eq!(text_and_style(&plain), text_and_style(&explicit));
+    let (rotated, rotations) = extract_text_with_positions_and_rotations_mem_with_options(
+        &buf,
+        None,
+        PositionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(text_and_style(&plain), text_and_style(&rotated));
+    assert!(rotations.is_empty());
+}
+
+#[test]
+fn test_bold_from_weight_reads_bold_from_600_and_merges_by_the_verdict() {
+    let buf = synthetic_three_weights_pdf();
+    let options = PositionOptions::new().bold_from_weight(true);
+
+    // The 700 face is bold, on the weight class's account; the 300 and 500
+    // faces are not, and agreeing, their runs merge as they do by default,
+    // while the bold run is its own item.
+    let weighted = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
+    assert_eq!(
+        text_and_style(&weighted),
+        [
+            ("Light Medium ".to_string(), false, Some(300)),
+            ("Heavy".to_string(), true, Some(700)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+    let light = find_item(&weighted, "Light Medium");
+    let heavy = find_item(&weighted, "Heavy");
+    assert_eq!(light.bold_source, None);
+    assert_eq!(heavy.bold_source, Some(BoldSource::WeightClass));
+    assert_close(light.x, 72.0);
+    assert_close(heavy.x, light.x + light.width);
+    for item in &weighted {
+        assert_close(
+            item.y,
+            if item.text.starts_with("Same") {
+                680.0
+            } else {
+                700.0
+            },
+        );
+    }
+
+    // A threshold of 500 makes the medium face bold too: the light run is
+    // then alone and the two heavier runs, agreeing, merge. A threshold of
+    // 800 makes nothing bold and the line is one item again.
+    let at_500 = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        options.bold_weight_threshold(500),
+    )
+    .unwrap();
+    assert_eq!(
+        text_and_style(&at_500),
+        [
+            ("Light ".to_string(), false, Some(300)),
+            ("Medium Heavy".to_string(), true, Some(500)),
+            ("Same weight".to_string(), false, Some(300)),
+        ]
+    );
+    assert_eq!(
+        find_item(&at_500, "Medium Heavy").bold_source,
+        Some(BoldSource::WeightClass)
+    );
+    let at_800 = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        options.bold_weight_threshold(800),
+    )
+    .unwrap();
+    assert_eq!(
+        text_and_style(&at_800),
+        text_and_style(&extract_text_with_positions_mem(&buf).unwrap())
+    );
+    assert!(at_800.iter().all(|item| item.bold_source.is_none()));
+
+    // A threshold outside the scale is clamped into it: 0 reads as 100,
+    // which every weight class reaches, and 1000 as 900, which none does.
+    let at_0 =
+        extract_text_with_positions_mem_with_options(&buf, None, options.bold_weight_threshold(0))
+            .unwrap();
+    assert_eq!(
+        text_and_style(&at_0),
+        [
+            ("Light Medium Heavy".to_string(), true, Some(300)),
+            ("Same weight".to_string(), true, Some(300)),
+        ]
+    );
+    let at_1000 = extract_text_with_positions_mem_with_options(
+        &buf,
+        None,
+        options.bold_weight_threshold(1000),
+    )
+    .unwrap();
+    assert_eq!(text_and_style(&at_1000), text_and_style(&at_800));
+
+    // The threshold is read only with the option on, and clamped whether
+    // or not it is: without the option, any threshold is the default
+    // extraction.
+    for threshold in [100, 0, 1000] {
+        let threshold_alone = extract_text_with_positions_mem_with_options(
+            &buf,
+            None,
+            PositionOptions::new().bold_weight_threshold(threshold),
+        )
+        .unwrap();
+        assert_eq!(
+            text_and_style(&threshold_alone),
+            text_and_style(&at_800),
+            "threshold {threshold} without the option"
+        );
+        assert!(threshold_alone
+            .iter()
+            .all(|item| item.bold_source.is_none()));
+    }
+
+    // The rotations variant and the page filter take the same options.
+    let pages: HashSet<u32> = [1].into_iter().collect();
+    let (items, _) =
+        extract_text_with_positions_and_rotations_mem_with_options(&buf, Some(&pages), options)
+            .unwrap();
+    assert_eq!(text_and_style(&items), text_and_style(&weighted));
+
+    // A region's text reads the same whether or not the runs were kept
+    // apart: the option changes items, not the words on the page.
+    let region = [60.0, 792.0 - 712.0, 400.0, 792.0 - 676.0];
+    let plain_region = extract_text_in_regions_mem(&buf, &[(0, vec![region])]).unwrap();
+    let weighted_region =
+        extract_text_in_regions_mem_with_options(&buf, &[(0, vec![region])], options).unwrap();
+    assert_eq!(
+        weighted_region[0].regions[0].text,
+        plain_region[0].regions[0].text
+    );
+    assert!(plain_region[0].regions[0]
+        .text
+        .contains("Light Medium Heavy"));
+}
+
+// =========================================================================
+// Font metadata faces: bold provenance, weight class and fixed pitch
+// =========================================================================
+
+/// The items of `tests/fixtures/font_metadata_faces.pdf`, two pages of text
+/// set in embedded subsets whose names, OS/2 tables, descriptor flags and
+/// width tables each make one point; see
+/// `scripts/make_font_metadata_fixtures.py` for the faces.
+fn font_metadata_items(options: PositionOptions) -> Vec<TextItem> {
+    let buf = std::fs::read("tests/fixtures/font_metadata_faces.pdf").unwrap();
+    extract_text_with_positions_mem_with_options(&buf, None, options).unwrap()
+}
+
+/// `(is_bold, bold_source, font_weight, fixed_pitch)` of the item whose
+/// text is exactly `text`.
+fn face_style(
+    items: &[TextItem],
+    text: &str,
+) -> (bool, Option<BoldSource>, Option<u16>, Option<bool>) {
+    let item = items
+        .iter()
+        .find(|item| item.text == text)
+        .unwrap_or_else(|| panic!("no item reads {text:?}"));
+    (
+        item.is_bold,
+        item.bold_source,
+        item.font_weight,
+        item.fixed_pitch,
+    )
+}
+
+/// The first page's line set in several faces, item by item.
+fn mixed_line(items: &[TextItem]) -> Vec<(String, bool, Option<BoldSource>, Option<u16>)> {
+    items
+        .iter()
+        .filter(|item| item.page == 1 && (item.y - 580.0).abs() < 0.5)
+        .map(|item| {
+            (
+                item.text.clone(),
+                item.is_bold,
+                item.bold_source,
+                item.font_weight,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_bold_source_names_where_the_default_verdict_came_from() {
+    let items = font_metadata_items(PositionOptions::new());
+    // A Demi face is bold by its name, whatever its weight class.
+    assert_eq!(
+        face_style(&items, "Demi name, weight class 600"),
+        (true, Some(BoldSource::FontName), Some(600), Some(false))
+    );
+    // Bold in the name of a regular program: the name wins, and the weight
+    // class shows the conflict.
+    assert_eq!(
+        face_style(&items, "Bold name, weight class 400"),
+        (true, Some(BoldSource::FontName), Some(400), Some(false))
+    );
+    // A heavy weight class alone is not bold by default.
+    assert_eq!(
+        face_style(&items, "Plain name, weight class 600"),
+        (false, None, Some(600), Some(false))
+    );
+    // The program's bold selection, behind a name that says nothing.
+    assert_eq!(
+        face_style(&items, "Opaque name, bold selection, weight class 700"),
+        (true, Some(BoldSource::FontFlags), Some(700), Some(false))
+    );
+    assert_eq!(
+        face_style(&items, "Extra light, weight class 200"),
+        (false, None, Some(200), Some(false))
+    );
+    // Filled and stroked text in a regular face.
+    assert_eq!(
+        face_style(&items, "Painted heavier"),
+        (true, Some(BoldSource::Painted), Some(400), Some(false))
+    );
+    // The runs that are not bold merge whatever their weight classes; the
+    // bold-named run is its own item.
+    assert_eq!(
+        mixed_line(&items),
+        [
+            ("Light regular heavier ".to_string(), false, None, Some(200)),
+            (
+                "bold".to_string(),
+                true,
+                Some(BoldSource::FontName),
+                Some(400)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_bold_from_weight_credits_the_weight_class_after_the_name_and_flags() {
+    let options = PositionOptions::new().bold_from_weight(true);
+    let items = font_metadata_items(options);
+    assert_eq!(
+        face_style(&items, "Demi name, weight class 600").1,
+        Some(BoldSource::FontName)
+    );
+    assert_eq!(
+        face_style(&items, "Bold name, weight class 400"),
+        (true, Some(BoldSource::FontName), Some(400), Some(false))
+    );
+    // The plain-named 600 face is now bold, on the weight class's account.
+    assert_eq!(
+        face_style(&items, "Plain name, weight class 600"),
+        (true, Some(BoldSource::WeightClass), Some(600), Some(false))
+    );
+    assert_eq!(
+        face_style(&items, "Opaque name, bold selection, weight class 700").1,
+        Some(BoldSource::FontFlags)
+    );
+    assert_eq!(
+        face_style(&items, "Painted heavier").1,
+        Some(BoldSource::Painted)
+    );
+    // The 600 run is bold like its bold-named neighbour, so the two merge
+    // into an item that keeps the first run's weight and source; the two
+    // lighter runs stay one item.
+    assert_eq!(
+        mixed_line(&items),
+        [
+            ("Light regular ".to_string(), false, None, Some(200)),
+            (
+                "heavier bold".to_string(),
+                true,
+                Some(BoldSource::WeightClass),
+                Some(600)
+            ),
+        ]
+    );
+
+    // A threshold of 700 puts the 600 faces back with the plain ones,
+    // except the one whose name says Demi.
+    let items = font_metadata_items(options.bold_weight_threshold(700));
+    assert_eq!(
+        face_style(&items, "Plain name, weight class 600"),
+        (false, None, Some(600), Some(false))
+    );
+    assert_eq!(
+        face_style(&items, "Demi name, weight class 600").1,
+        Some(BoldSource::FontName)
+    );
+    assert_eq!(
+        face_style(&items, "Opaque name, bold selection, weight class 700").1,
+        Some(BoldSource::FontFlags)
+    );
+    assert_eq!(
+        mixed_line(&items),
+        mixed_line(&font_metadata_items(PositionOptions::new()))
+    );
+}
+
+#[test]
+fn test_fixed_pitch_is_declared_or_measured() {
+    let items = font_metadata_items(PositionOptions::new());
+    // The program's post table says so, whatever the descriptor's Flags 4.
+    assert_eq!(
+        face_style(&items, "Mono declared by the program").3,
+        Some(true)
+    );
+    // Nothing declares it: the uniform advances of the glyphs in use do.
+    assert_eq!(
+        face_style(&items, "Mono measured from advances").3,
+        Some(true)
+    );
+    // The descriptor's FixedPitch flag, on a face with too few glyphs to
+    // measure.
+    assert_eq!(face_style(&items, "Mo").3, Some(true));
+    // A proportional face measures as such.
+    assert_eq!(
+        face_style(&items, "Proportional by advances").3,
+        Some(false)
+    );
+    // Ten tabular digits share an advance and are too few to say.
+    assert_eq!(face_style(&items, "0123456789").3, None);
+    // The verdict is the font's, not the option's: whatever the option
+    // makes of the runs, every face reports the same fixed pitch.
+    let weighted = font_metadata_items(PositionOptions::new().bold_from_weight(true));
+    let by_font = |items: &[TextItem]| -> std::collections::BTreeSet<(String, Option<bool>)> {
+        items
+            .iter()
+            .map(|item| (item.font.clone(), item.fixed_pitch))
+            .collect()
+    };
+    let faces = by_font(&items);
+    assert_eq!(faces.len(), 10, "a face reports two verdicts: {faces:?}");
+    assert_eq!(by_font(&weighted), faces);
+}
+
+// ---------------------------------------------------------------------------
+// Text painted outside its clip
+// ---------------------------------------------------------------------------
+
+/// Body text, a rectangular clip around a plot area with a legend inside it,
+/// three runs the same clip hides (below and to the right of the plot area,
+/// one of them shown with `'`), one run straddling the clip's bottom edge,
+/// and body text after the clip is restored.
+fn make_clipped_text_pdf() -> Vec<u8> {
+    make_text_pdf(
+        "BT /F1 12 Tf 72 720 Td (Body text above the plot) Tj ET\n\
+         q 72 400 300 200 re W n\n\
+         BT /F1 12 Tf 80 500 Td (Legend inside the plot) Tj ET\n\
+         BT /F1 12 Tf 80 300 Td (Hidden below the plot) Tj ET\n\
+         BT /F1 12 Tf 400 500 Td (Hidden right of the plot) Tj ET\n\
+         BT /F1 12 Tf 14 TL 80 300 Td (Hidden below via quote) ' ET\n\
+         BT /F1 12 Tf 80 395 Td (Straddles the bottom edge) Tj ET\n\
+         Q\n\
+         BT /F1 12 Tf 72 200 Td (Body text after the clip ends) Tj ET",
+        "0 0 612 792",
+    )
+}
+
+const CLIPPED_PDF_KEPT: [&str; 4] = [
+    "Body text above the plot",
+    "Legend inside the plot",
+    "Straddles the bottom edge",
+    "Body text after the clip ends",
+];
+const CLIPPED_PDF_HIDDEN: [&str; 3] = [
+    "Hidden below the plot",
+    "Hidden right of the plot",
+    "Hidden below via quote",
+];
+
+fn joined_text(items: &[TextItem]) -> String {
+    items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// A run the active rectangular clip hides entirely is invisible on the
+/// rendered page and must not be extracted; runs inside the clip, runs
+/// straddling its edge and runs shown after the clip is restored stay.
+#[test]
+fn test_text_painted_outside_its_clip_is_not_extracted() {
+    let buf = make_clipped_text_pdf();
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    for kept in CLIPPED_PDF_KEPT {
+        assert!(text.contains(kept), "{kept:?} missing from {text:?}");
+    }
+    for hidden in CLIPPED_PDF_HIDDEN {
+        assert!(
+            !text.contains(hidden),
+            "{hidden:?} is clipped away and must not be extracted, got {text:?}"
+        );
+    }
+}
+
+/// The region API sees the same page: the hidden runs neither appear in a
+/// full-page region nor in a region drawn around where they were painted,
+/// and the page's visible text keeps the invisible-layer retry from firing.
+#[test]
+fn test_region_text_omits_runs_painted_outside_their_clip() {
+    let buf = make_clipped_text_pdf();
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    for kept in CLIPPED_PDF_KEPT {
+        assert!(
+            page.text.contains(kept),
+            "{kept:?} missing from {:?}",
+            page.text
+        );
+    }
+    assert!(!page.text.contains("Hidden"), "{:?}", page.text);
+    assert!(!page.needs_ocr);
+
+    // Top-left page coordinates over the band the two hidden runs below the
+    // plot were painted in (y 286..312 from the bottom on a 792 pt page).
+    let band = [60.0, 792.0 - 320.0, 400.0, 792.0 - 280.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![band])]).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.trim().is_empty(),
+        "nothing visible is painted in the band, got {:?}",
+        region.text
+    );
+}
+
+/// Only a single axis-aligned rectangle establishes what a clip hides. A
+/// path clip and a rectangle drawn under a turned CTM say nothing about
+/// their extent, so text under them is kept even when it lies outside the
+/// path's bounds.
+#[test]
+fn test_text_under_an_unknown_clip_is_kept() {
+    let buf = make_text_pdf(
+        "q 72 400 m 372 400 l 222 600 l h W n\n\
+         BT /F1 12 Tf 80 300 Td (Under a path clip) Tj ET Q\n\
+         q 0.7071 0.7071 -0.7071 0.7071 0 0 cm 0 0 100 100 re W n\n\
+         0.7071 -0.7071 0.7071 0.7071 0 0 cm\n\
+         BT /F1 12 Tf 80 300 Td (Under a turned clip) Tj ET Q",
+        "0 0 612 792",
+    );
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    assert!(text.contains("Under a path clip"), "{text:?}");
+    assert!(text.contains("Under a turned clip"), "{text:?}");
+}
+
+/// Nested rectangles intersect and `Q` restores the outer clip: the same
+/// run is hidden under the inner clip and visible once it is restored.
+#[test]
+fn test_nested_clips_intersect_and_restore() {
+    let buf = make_text_pdf(
+        "q 72 400 300 200 re W n\n\
+         q 100 450 50 50 re W n\n\
+         BT /F1 12 Tf 80 560 Td (Hidden by the inner clip) Tj ET Q\n\
+         BT /F1 12 Tf 80 560 Td (Visible under the outer clip) Tj ET Q",
+        "0 0 612 792",
+    );
+    let text = joined_text(&extract_text_with_positions_mem(&buf).unwrap());
+    assert!(!text.contains("Hidden by the inner clip"), "{text:?}");
+    assert!(text.contains("Visible under the outer clip"), "{text:?}");
+}
+
+/// A page whose every run is clipped out of view has no text on it. Unlike
+/// an invisible (Tr 3) OCR layer, which transcribes the visible raster, the
+/// runs describe nothing that can be seen, so the region API must not adopt
+/// them through its invisible-layer retry: the region is empty and goes to
+/// OCR like an image-only page.
+#[test]
+fn test_page_with_only_clipped_away_text_reports_no_native_text() {
+    let buf = make_text_pdf(
+        "q 72 400 300 200 re W n BT /F1 12 Tf 16 TL 80 300 Td \
+         (The quick brown fox jumps over the lazy dog) Tj T* \
+         (Pack my box with five dozen liquor jugs tonight) Tj T* \
+         (Sphinx of black quartz judge my vow carefully) Tj ET Q",
+        "0 0 612 792",
+    );
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    assert!(
+        items.iter().all(|item| !item.text.contains("quick")),
+        "{:?}",
+        joined_text(&items)
+    );
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    assert!(
+        page.text.trim().is_empty(),
+        "clipped-away runs must not come back through the invisible-layer retry, got {:?}",
+        page.text
+    );
+    assert!(page.needs_ocr);
+}
+
+/// Display titles set with tracking — as a `Tc` character spacing, and as
+/// the offsets of a glyph-per-string `TJ` array, with kerning on top and a
+/// word gap a space width above the letter gaps — over a justified body
+/// line whose word gaps are `TJ` offsets between whole words, a kerned
+/// glyph-per-string body line, and a line of one-letter words a space
+/// apart.
+fn make_tracked_titles_pdf() -> Vec<u8> {
+    make_text_pdf(
+        "BT /F1 24 Tf 6 Tc 72 720 Td (VALLEY) Tj ET\n\
+         BT /F1 24 Tf 6 Tc 72 690 Td (VALLEY ROAD) Tj ET\n\
+         BT /F1 24 Tf 0 Tc 72 660 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y)] TJ ET\n\
+         BT /F1 24 Tf 72 630 Td [(A) -300 (N) -300 (N) -300 (U) -300 (A) -300 (L) -700 (R) -300 (E) -300 (P) -300 (O) -300 (R) -300 (T)] TJ ET\n\
+         BT /F1 18 Tf 72 600 Td [(V) -100 (a) -120 (l) -90 (l) -100 (e) -110 (y)] TJ ET\n\
+         BT /F1 12 Tf 72 570 Td [(The) -258 (quick) -300 (brown) -280 (f) -20 (ox) -280 (jumps)] TJ ET\n\
+         BT /F1 12 Tf 72 550 Td [(T) 20 (h) -5 (e) -278 (l) 10 (a) -3 (z) -8 (y) -278 (d) -5 (o) (g)] TJ ET\n\
+         BT /F1 12 Tf 72 530 Td [(a) -333 (b) -333 (c) -333 (d)] TJ ET",
+        "0 0 612 792",
+    )
+}
+
+/// Tracked titles come out as whole words on every API, each word with the
+/// box its glyphs span, while the word gaps of ordinary text — positioned
+/// words, kerned glyphs, one-letter words — are kept.
+#[test]
+fn test_tracked_titles_stay_whole_words() {
+    let buf = make_tracked_titles_pdf();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    for expected in [
+        "VALLEY",
+        "VALLEY ROAD",
+        "ANNUAL",
+        "REPORT",
+        "Valley",
+        "The quick brown fox jumps",
+        "The lazy dog",
+        "a b c d",
+    ] {
+        assert!(
+            texts.contains(&expected),
+            "{expected:?} missing from {texts:?}"
+        );
+    }
+    assert!(
+        !texts.iter().any(|text| text.contains("V A L")),
+        "letter-spaced title in {texts:?}"
+    );
+    // Each word of the tracked two-word title keeps its glyph box: the
+    // letters of "ANNUAL" advance 4.056 em plus five 0.3 em letter gaps at
+    // 24 pt, and "REPORT" starts a 0.7 em word gap after the last letter.
+    let annual = items.iter().find(|item| item.text == "ANNUAL").unwrap();
+    let report = items.iter().find(|item| item.text == "REPORT").unwrap();
+    assert!((annual.x - 72.0).abs() < 0.01, "{annual:?}");
+    assert!(
+        (annual.width - (4.056 + 1.5) * 24.0).abs() < 0.1,
+        "{annual:?}"
+    );
+    assert!(
+        (report.x - (annual.x + annual.width + 0.7 * 24.0)).abs() < 0.1,
+        "{report:?}"
+    );
+    assert!(
+        (report.width - (4.167 + 1.5) * 24.0).abs() < 0.1,
+        "{report:?}"
+    );
+    assert!(annual.advance_known && report.advance_known);
+
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.unwrap();
+    for expected in [
+        "VALLEY ROAD",
+        "ANNUAL REPORT",
+        "Valley",
+        "The quick brown fox jumps",
+    ] {
+        assert!(
+            markdown.contains(expected),
+            "{expected:?} missing from {markdown}"
+        );
+    }
+    assert!(!markdown.contains("V A L L E Y"), "{markdown}");
+}
+
+// ============================================================================
+// Positioned boxes of text drawn with a reflected matrix
+// ============================================================================
+
+/// One string drawn in every reflected way a producer writes it, each on
+/// its own baseline, plus an upright reference line at 12 pt. The first
+/// group renders upright and left to right from x = 72 — a negative `Tf`
+/// size cancelled by a turned text matrix, by a negative horizontal scale
+/// under a y-flipping page matrix, or by the turning `/Matrix` of the form
+/// that draws it, a negative scale cancelled by a mirrored matrix, and a
+/// `TJ` array under the turned matrix. The second group renders reflected
+/// for real: turned around by the size alone or by the matrix alone,
+/// mirrored in x only, and flipped in y only.
+fn make_reflected_text_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    let page_content = "BT /F1 12 Tf 1 0 0 1 72 720 Tm (Reflected run) Tj ET\n\
+         BT /F1 -12 Tf -1 0 0 -1 72 690 Tm (Reflected run) Tj ET\n\
+         q 1 0 0 -1 0 792 cm BT /F1 -12 Tf -100 Tz 72 132 Td (Reflected run) Tj ET Q\n\
+         BT /F1 12 Tf -100 Tz -1 0 0 1 72 630 Tm (Reflected run) Tj 100 Tz ET\n\
+         q /Fm1 Do Q\n\
+         BT /F1 -12 Tf -1 0 0 -1 72 570 Tm [(Reflected) -278 (run)] TJ ET\n\
+         BT /F1 -12 Tf 1 0 0 1 300 540 Tm (Reflected run) Tj ET\n\
+         BT /F1 12 Tf -1 0 0 -1 300 510 Tm (Reflected run) Tj ET\n\
+         BT /F1 12 Tf -1 0 0 1 300 480 Tm (Mirrored) Tj ET\n\
+         BT /F1 12 Tf 1 0 0 -1 72 450 Tm (Flipped) Tj ET";
+    // The form's matrix turns the page around: its text is drawn at a
+    // negative size from the far corner and comes out upright at (72, 600).
+    let form_content = "BT /F1 -12 Tf 540 192 Td (Reflected run) Tj ET";
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            page_content.len(),
+            page_content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Matrix [-1 0 0 -1 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+            form_content.len(),
+            form_content
+        ),
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// The item showing `text` whose box bottom is `y`.
+fn item_with_box_bottom<'a>(items: &'a [TextItem], text: &str, y: f32) -> &'a TextItem {
+    items
+        .iter()
+        .find(|item| item.text == text && (item.y - y).abs() < 0.01)
+        .unwrap_or_else(|| {
+            let found: Vec<(&str, f32, f32)> = items
+                .iter()
+                .map(|item| (item.text.as_str(), item.x, item.y))
+                .collect();
+            panic!("no {text:?} with box bottom {y} in {found:?}")
+        })
+}
+
+/// A run whose reflections cancel — a negative `Tf` size against a turned
+/// text matrix, a negative `Tz` scale under a y-flipping `cm`, a turning
+/// form `/Matrix`, a `TJ` array — renders upright from its origin, and its
+/// box is the box of the same string drawn upright: it starts at the
+/// origin, not one text width to its left.
+#[test]
+fn test_reflections_that_cancel_report_the_upright_glyph_box() {
+    let buf = make_reflected_text_pdf();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let reference = item_with_box_bottom(&items, "Reflected run", 720.0);
+    assert!((reference.x - 72.0).abs() < 0.01 && reference.rotation == 0.0);
+    assert!(
+        reference.width > 60.0 && reference.advance_known,
+        "{reference:?}"
+    );
+
+    for baseline in [690.0, 660.0, 630.0, 600.0, 570.0] {
+        let item = item_with_box_bottom(&items, "Reflected run", baseline);
+        assert!((item.x - 72.0).abs() < 0.01, "{item:?}");
+        assert!((item.width - reference.width).abs() < 0.01, "{item:?}");
+        assert!((item.height - 12.0).abs() < 0.01, "{item:?}");
+        assert_eq!(item.rotation, 0.0, "{item:?}");
+        assert!((item.font_size - 12.0).abs() < 0.01, "{item:?}");
+    }
+
+    // The positions-and-rotations API reports the same items and no page turn.
+    let (items_with_rotations, page_rotations) =
+        extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert!(page_rotations.is_empty());
+    assert_eq!(
+        items_with_rotations
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y, item.width))
+            .collect::<Vec<_>>(),
+        items
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y, item.width))
+            .collect::<Vec<_>>()
+    );
+
+    // A region drawn over the upright lines finds them; the band left of the
+    // margin, where a box shifted by a text width would have landed, is empty.
+    let band = [60.0, 792.0 - 735.0, 320.0, 792.0 - 555.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![band])]).unwrap();
+    let text = &regions[0].regions[0].text;
+    assert_eq!(text.matches("Reflected run").count(), 6, "{text:?}");
+    let left_of_margin = [0.0, 792.0 - 735.0, 70.0, 792.0 - 555.0];
+    let regions = extract_text_in_regions_mem(&buf, &[(0, vec![left_of_margin])]).unwrap();
+    assert!(
+        regions[0].regions[0].text.trim().is_empty(),
+        "{:?}",
+        regions[0].regions[0].text
+    );
+}
+
+/// A run reflected for real reports the box its glyphs occupy: turned
+/// around, by the size or by the matrix, it reads towards -x from its
+/// origin with its glyphs hanging below the baseline (rotation 180);
+/// mirrored in x it stands upright but extends to the left of its origin;
+/// flipped in y it hangs below the baseline to the right of it.
+#[test]
+fn test_real_reflections_report_the_reflected_glyph_box() {
+    let buf = make_reflected_text_pdf();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let reference = item_with_box_bottom(&items, "Reflected run", 720.0);
+
+    for baseline in [540.0, 510.0] {
+        let turned = item_with_box_bottom(&items, "Reflected run", baseline - 12.0);
+        assert!(
+            (turned.x - (300.0 - reference.width)).abs() < 0.01,
+            "{turned:?}"
+        );
+        assert!((turned.width - reference.width).abs() < 0.01, "{turned:?}");
+        assert!((turned.height - 12.0).abs() < 0.01, "{turned:?}");
+        assert_eq!(turned.rotation, 180.0, "{turned:?}");
+        assert!((turned.font_size - 12.0).abs() < 0.01, "{turned:?}");
+    }
+
+    let mirrored = item_with_box_bottom(&items, "Mirrored", 480.0);
+    assert!(mirrored.x < 300.0 && (mirrored.x + mirrored.width - 300.0).abs() < 0.01);
+    assert_eq!(mirrored.rotation, 0.0, "{mirrored:?}");
+
+    let flipped = item_with_box_bottom(&items, "Flipped", 450.0 - 12.0);
+    assert!((flipped.x - 72.0).abs() < 0.01, "{flipped:?}");
+    assert!((flipped.height - 12.0).abs() < 0.01, "{flipped:?}");
+    assert_eq!(flipped.rotation, 180.0, "{flipped:?}");
+}
+
+// ============================================================================
+// Form XObjects with a zero-area BBox
+// ============================================================================
+
+/// A page whose content is `page_content`, with a Form XObject `Fm1`
+/// declaring `form_bbox` and holding `form_content`, both with Helvetica as
+/// `F1`.
+fn make_pdf_with_form(page_content: &str, form_bbox: &str, form_content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            page_content.len(),
+            page_content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &format!(
+            "<< /Type /XObject /Subtype /Form /BBox [{form_bbox}] \
+             /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+            form_content.len(),
+            form_content
+        ),
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+const FORM_PAGE_CONTENT: &str = "q Q q 0 0 612 792 re W n /Fm1 Do Q";
+const FORM_TEXT_CONTENT: &str = "BT /F1 24 Tf 72 700 Td (Drawn through the form) Tj ET\n\
+                                 BT /F1 12 Tf 72 670 Td (Second line inside the form) Tj ET";
+
+/// A page drawn entirely through a Form XObject whose `/BBox` has no area
+/// — a re-save pattern — is a text page like any other: its text extracts
+/// where it is painted, and the page is neither empty nor routed to OCR.
+#[test]
+fn test_form_with_zero_area_bbox_is_extracted_as_a_text_page() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, "0 0 0 0", FORM_TEXT_CONTENT);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.text == "Drawn through the form")
+        .unwrap_or_else(|| panic!("{}", joined_text(&items)));
+    assert!((title.x - 72.0).abs() < 0.01 && (title.y - 700.0).abs() < 0.01);
+    assert!(items
+        .iter()
+        .any(|item| item.text == "Second line inside the form"));
+
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(result.pages_needing_ocr.is_empty(), "{:?}", result);
+    let markdown = result.markdown.unwrap();
+    assert!(markdown.contains("Drawn through the form"), "{markdown}");
+
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let page = &regions[0].regions[0];
+    assert!(page.text.contains("Second line inside the form"));
+    assert!(!page.needs_ocr);
+}
+
+/// ±(DBL_MAX / 2) written out in full, as a re-save writes an unbounded
+/// form box: 308-digit numerals no integer parser holds.
+fn unbounded_form_bbox() -> String {
+    let digits = format!("8988465674311578{}", "0".repeat(292));
+    format!("-{digits} -{digits} {digits} {digits}")
+}
+
+/// A Form XObject whose `/BBox` numerals no integer parser holds used to
+/// drop out of the document, and the page drawn through it came out empty
+/// and was routed to OCR. The numerals are saturated in the file's bytes
+/// before it is read, so the page is a text page like any other, and the
+/// repaired bytes hand a renderer a form with a finite box.
+#[test]
+fn test_form_with_overlong_bbox_numerals_is_extracted_as_a_text_page() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, &unbounded_form_bbox(), FORM_TEXT_CONTENT);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.text == "Drawn through the form")
+        .unwrap_or_else(|| panic!("{}", joined_text(&items)));
+    assert!((title.x - 72.0).abs() < 0.01 && (title.y - 700.0).abs() < 0.01);
+
+    let result = process_pdf_mem(&buf).unwrap();
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert!(result.pages_needing_ocr.is_empty(), "{:?}", result);
+    assert!(result
+        .markdown
+        .unwrap()
+        .contains("Second line inside the form"));
+
+    let repaired = widen_degenerate_form_bboxes_mem(&buf)
+        .unwrap()
+        .expect("the numerals are saturated");
+    let doc = lopdf::Document::load_mem(&repaired).unwrap();
+    let bbox: Vec<i64> = doc
+        .objects
+        .values()
+        .find_map(|object| match object {
+            lopdf::Object::Stream(stream)
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|s| s.as_name().ok())
+                    == Some(b"Form") =>
+            {
+                stream.dict.get(b"BBox").ok()
+            }
+            _ => None,
+        })
+        .and_then(|bbox| bbox.as_array().ok())
+        .expect("the form survives the round trip")
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert_eq!(bbox, vec![-1_000_000, -1_000_000, 1_000_000, 1_000_000]);
+}
+
+/// `widen_degenerate_form_bboxes_mem` hands renderers the repaired
+/// document: the zero-area box is widened, the text extracts the same from
+/// the repaired bytes, and a form with a real box is left alone.
+#[test]
+fn test_widen_degenerate_form_bboxes_mem_repairs_only_zero_area_boxes() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, "0 0 0 0", FORM_TEXT_CONTENT);
+    let repaired = widen_degenerate_form_bboxes_mem(&buf)
+        .unwrap()
+        .expect("a zero-area form box needs the repair");
+    let doc = lopdf::Document::load_mem(&repaired).unwrap();
+    let form = doc
+        .objects
+        .values()
+        .find_map(|object| match object {
+            lopdf::Object::Stream(stream)
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|s| s.as_name().ok())
+                    == Some(b"Form") =>
+            {
+                Some(stream)
+            }
+            _ => None,
+        })
+        .expect("the form survives the round trip");
+    let bbox: Vec<f32> = form
+        .dict
+        .get(b"BBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_float().unwrap())
+        .collect();
+    assert!(bbox[0] < -10_000.0 && bbox[1] < -10_000.0, "{bbox:?}");
+    assert!(bbox[2] > 10_000.0 && bbox[3] > 10_000.0, "{bbox:?}");
+
+    let original_items = extract_text_with_positions_mem(&buf).unwrap();
+    let repaired_items = extract_text_with_positions_mem(&repaired).unwrap();
+    assert_eq!(
+        repaired_items
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y))
+            .collect::<Vec<_>>(),
+        original_items
+            .iter()
+            .map(|item| (item.text.clone(), item.x, item.y))
+            .collect::<Vec<_>>()
+    );
+
+    let proper = make_pdf_with_form("q /Fm1 Do Q", "0 690 612 792", FORM_TEXT_CONTENT);
+    assert!(widen_degenerate_form_bboxes_mem(&proper).unwrap().is_none());
+    assert!(widen_degenerate_form_bboxes_mem(&make_minimal_text_pdf())
+        .unwrap()
+        .is_none());
+}
+
+/// A minimal TrueType font program — `head`, `hhea`, `maxp`, `hmtx`, `loca`
+/// and `glyf`, no `cmap` — with `glyph_count` glyphs of one square outline
+/// after `.notdef`, as a CID-keyed subset embeds it.
+fn minimal_truetype_subset(glyph_count: usize) -> Vec<u8> {
+    minimal_truetype_subset_with(glyph_count, &[], &[])
+}
+
+/// [`minimal_truetype_subset`] with a `post` table naming the glyphs in
+/// `names` (`(glyph index, name)`) when there are any, the rest `.notdef`,
+/// and the glyphs in `blank` left without an outline (their advance kept).
+fn minimal_truetype_subset_with(
+    glyph_count: usize,
+    names: &[(u16, &str)],
+    blank: &[u16],
+) -> Vec<u8> {
+    let square: Vec<u8> = {
+        let mut g = Vec::new();
+        g.extend(1i16.to_be_bytes()); // one contour
+        for v in [0i16, 0, 500, 700] {
+            g.extend(v.to_be_bytes()); // bbox
+        }
+        g.extend(2u16.to_be_bytes()); // endPtsOfContours
+        g.extend(0u16.to_be_bytes()); // no instructions
+        g.extend([1u8, 1, 1]); // on-curve, i16 coordinates
+        for v in [0i16, 500, 0, 0, 0, 700] {
+            g.extend(v.to_be_bytes());
+        }
+        g
+    };
+    let num_glyphs = glyph_count as u16 + 1;
+    let mut glyf = Vec::new();
+    let mut loca = Vec::new();
+    for gid in 0..num_glyphs {
+        loca.extend((glyf.len() as u32).to_be_bytes());
+        if !blank.contains(&gid) {
+            glyf.extend(&square);
+        }
+    }
+    loca.extend((glyf.len() as u32).to_be_bytes());
+    let mut head = vec![0u8; 54];
+    head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
+    head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
+    head[50..52].copy_from_slice(&1i16.to_be_bytes()); // long loca offsets
+    let mut hhea = vec![0u8; 36];
+    hhea[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    hhea[34..36].copy_from_slice(&num_glyphs.to_be_bytes());
+    let mut maxp = vec![0u8; 32];
+    maxp[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    maxp[4..6].copy_from_slice(&num_glyphs.to_be_bytes());
+    let mut hmtx = Vec::new();
+    for _ in 0..num_glyphs {
+        hmtx.extend(600u16.to_be_bytes());
+        hmtx.extend(0i16.to_be_bytes());
+    }
+    let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
+        (b"glyf", glyf),
+        (b"head", head),
+        (b"hhea", hhea),
+        (b"hmtx", hmtx),
+        (b"loca", loca),
+        (b"maxp", maxp),
+    ];
+    if !names.is_empty() {
+        // post format 2: an index per glyph, 0 for `.notdef`, 258 onwards
+        // for the names that follow as Pascal strings.
+        let mut post = Vec::new();
+        post.extend(0x0002_0000u32.to_be_bytes());
+        post.extend([0u8; 28]);
+        post.extend(num_glyphs.to_be_bytes());
+        for gid in 0..num_glyphs {
+            let index = names
+                .iter()
+                .position(|&(named, _)| named == gid)
+                .map_or(0, |i| 258 + i as u16);
+            post.extend(index.to_be_bytes());
+        }
+        for &(_, name) in names {
+            post.push(name.len() as u8);
+            post.extend(name.as_bytes());
+        }
+        tables.push((b"post", post));
+    }
+    let mut font = Vec::new();
+    font.extend(0x0001_0000u32.to_be_bytes());
+    font.extend((tables.len() as u16).to_be_bytes());
+    font.extend([0u8; 6]); // searchRange, entrySelector, rangeShift
+    let mut offset = 12 + 16 * tables.len();
+    let mut body = Vec::new();
+    for (tag, data) in &tables {
+        font.extend(*tag);
+        font.extend(0u32.to_be_bytes()); // checksum, unchecked
+        font.extend((offset as u32).to_be_bytes());
+        font.extend((data.len() as u32).to_be_bytes());
+        let padded = data.len().div_ceil(4) * 4;
+        body.extend(data);
+        body.extend(std::iter::repeat_n(0u8, padded - data.len()));
+        offset += padded;
+    }
+    font.extend(body);
+    font
+}
+
+/// Three lines that together show forty distinct letters, digits and
+/// spaces.
+const CID_TEXT_LINES: [&str; 3] = [
+    "The quick brown fox jumps over the lazy dog",
+    "Pack my box with five dozen liquor jugs 0123456789",
+    "Sphinx of black quartz judge my vow",
+];
+
+/// A page of `paths` small filled triangles — the operator count of a
+/// vector illustration — and `lines` of text shown as two-byte codes
+/// through a Type0 font: an embedded TrueType subset under Identity-H whose
+/// glyph `i` is the `i`th distinct character of the lines, with a ToUnicode
+/// CMap saying so. None of the codes' bytes is an ASCII letter or digit.
+/// With `in_form` the text is drawn by a Form XObject the page invokes.
+fn make_cid_text_over_vector_art_pdf(lines: &[&str], paths: usize, in_form: bool) -> Vec<u8> {
+    let mut alphabet: Vec<char> = lines.iter().flat_map(|line| line.chars()).collect();
+    alphabet.sort_unstable();
+    alphabet.dedup();
+    let code_of = |c: char| alphabet.iter().position(|&a| a == c).unwrap() as u16 + 1;
+
+    let mut cmap = String::from(CID_CMAP_HEAD);
+    cmap.push_str(&format!("{} beginbfchar\n", alphabet.len()));
+    for &c in &alphabet {
+        cmap.push_str(&format!("<{:04X}> <{:04X}>\n", code_of(c), c as u32));
+    }
+    cmap.push_str(CID_CMAP_TAIL);
+
+    let mut art = String::new();
+    for i in 0..paths {
+        let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
+        art.push_str(&format!(
+            "{x} {y} m {} {} l {} {y} l h f\n",
+            x + 5,
+            y + 8,
+            x + 10
+        ));
+    }
+    let mut text = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let hex: String = line
+            .chars()
+            .map(|c| format!("{:04X}", code_of(c)))
+            .collect();
+        text.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+    }
+    make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset(alphabet.len()),
+        &art,
+        &text,
+        in_form,
+    )
+}
+
+/// The ToUnicode CMap of [`make_embedded_cid_font_pdf`] up to its `bfchar` section,
+/// and after it.
+const CID_CMAP_HEAD: &str = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+     /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+     /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+     1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n";
+const CID_CMAP_TAIL: &str =
+    "endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
+
+/// A page drawing `art` then `text` (content-stream operators showing
+/// two-byte codes through the font `F1`): a Type0 font under Identity-H
+/// whose embedded TrueType subset is `font_file` and whose ToUnicode CMap
+/// is `cmap`. With `in_form` the text is drawn by a Form XObject the page
+/// invokes.
+fn make_embedded_cid_font_pdf(
+    cmap: &str,
+    font_file: Vec<u8>,
+    art: &str,
+    text: &str,
+    in_form: bool,
+) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let font_file_id = doc.add_object(Stream::new(
+        dictionary! { "Length1" => font_file.len() as i64 },
+        font_file,
+    ));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+        "FontFile2" => font_file_id,
+    });
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Subset",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 600,
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.as_bytes().to_vec()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Subset",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    });
+
+    let mut resources = dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    };
+    let content = if in_form {
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            },
+            text.as_bytes().to_vec(),
+        ));
+        resources.set("XObject", dictionary! { "Fm1" => form_id });
+        format!("{art}q /Fm1 Do Q\n")
+    } else {
+        format!("{art}{text}")
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => resources,
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// A page of paths whose only text is one short caption in a simple font:
+/// vector-outlined text with a stray label, which goes to OCR.
+fn make_vector_art_with_caption_pdf() -> Vec<u8> {
+    let mut content = String::new();
+    for i in 0..400 {
+        let (x, y) = (50 + (i % 40) * 12, 100 + (i / 40) * 20);
+        content.push_str(&format!(
+            "{x} {y} m {} {} l {} {y} l h f\n",
+            x + 5,
+            y + 8,
+            x + 10
+        ));
+    }
+    content.push_str("BT /F1 10 Tf 72 40 Td (7) Tj ET");
+    make_text_pdf(&content, "0 0 612 792")
+}
+
+fn vector_text_reasons(result: &pdf_inspector::PdfProcessResult) -> Vec<u32> {
+    result
+        .ocr_reasons_by_page
+        .iter()
+        .filter(|page| page.reasons.iter().any(|reason| reason == "vector_text"))
+        .map(|page| page.page)
+        .collect()
+}
+
+/// Text shown through a CID-keyed font with a ToUnicode CMap next to a
+/// vector illustration is text: the page extracts, and is neither flagged
+/// as vector text nor routed to OCR. A page of paths with a caption's worth
+/// of text still is, whatever the font, and so is a page whose diverse text
+/// is a header over a mass of outlined text.
+#[test]
+fn test_cid_text_next_to_vector_art_is_extracted_not_routed_to_ocr() {
+    for in_form in [false, true] {
+        let buf = make_cid_text_over_vector_art_pdf(&CID_TEXT_LINES, 400, in_form);
+        let result = process_pdf_mem(&buf).unwrap();
+        assert_eq!(result.pdf_type, PdfType::TextBased, "in_form={in_form}");
+        assert!(
+            result.pages_needing_ocr.is_empty(),
+            "in_form={in_form}: {:?}",
+            result.ocr_reasons_by_page
+        );
+        assert!(vector_text_reasons(&result).is_empty());
+        let markdown = result.markdown.unwrap();
+        assert!(markdown.contains("quick brown fox"), "{markdown}");
+        assert!(markdown.contains("liquor jugs 0123456789"), "{markdown}");
+
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert!(!pages.pages[0].needs_ocr, "{:?}", pages.pages[0]);
+        assert!(pages.pages[0].markdown.contains("Sphinx of black quartz"));
+        assert!(pages.pages_needing_ocr.is_empty());
+    }
+
+    let caption =
+        process_pdf_mem(&make_cid_text_over_vector_art_pdf(&["Fig 3"], 400, false)).unwrap();
+    assert_eq!(caption.pages_needing_ocr, vec![1]);
+    assert_eq!(vector_text_reasons(&caption), vec![1]);
+
+    // The same three lines are a header next to forty thousand path
+    // operators of outlined text.
+    let header = process_pdf_mem(&make_cid_text_over_vector_art_pdf(
+        &CID_TEXT_LINES,
+        8_000,
+        true,
+    ))
+    .unwrap();
+    assert_eq!(header.pages_needing_ocr, vec![1]);
+    assert_eq!(vector_text_reasons(&header), vec![1]);
+
+    let soup = process_pdf_mem(&make_vector_art_with_caption_pdf()).unwrap();
+    assert_eq!(soup.pages_needing_ocr, vec![1]);
+    assert_eq!(vector_text_reasons(&soup), vec![1]);
+}
+
+const MAC_ROMAN_HELVETICA: &str =
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>";
+
+/// An accented letter set as three text objects: the run up to the letter,
+/// one glyph of a spacing accent (`macron`, code 0xF8 of MacRomanEncoding)
+/// placed by its own text matrix over the letter, and the run from the
+/// letter on. The accent's origin lies a fraction of a point right of the
+/// run it decorates and a little above its baseline; sorted along the
+/// baseline it would come out after that run as a stray "¯". The letter
+/// reads composed instead, in the positioned items and in the Markdown.
+#[test]
+fn detached_spacing_accent_composes_with_the_letter_under_it() {
+    // Helvetica at 10 pt: "The T" runs from x 72 to 98.12, so the rest of
+    // the word starts there; the macron (advance 3.33) is centred over the
+    // "o" (advance 5.56).
+    let content = "BT /F1 10 Tf 1 0 0 1 72 700 Tm (The T) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 99.24 700.14 Tm (\\370) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 98.12 700 Tm (ohoku region) Tj ET";
+    let pdf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        None,
+        MAC_ROMAN_HELVETICA,
+    );
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"The T\u{014D}hoku region"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|text| text.contains('\u{00AF}')),
+        "{texts:?}"
+    );
+
+    let markdown = process_pdf_mem(&pdf)
+        .expect("convert PDF to markdown")
+        .markdown
+        .expect("markdown output");
+    assert!(markdown.contains("The T\u{014D}hoku region"), "{markdown}");
+    assert!(!markdown.contains('\u{00AF}'), "{markdown}");
+}
+
+/// A spacing accent that stands over no letter is text of its own and stays
+/// as shown: a grave (code 0x60 of MacRomanEncoding) whose advance follows
+/// an "a" exactly and precedes a "b", and one a word gap away from both.
+/// Neither turns its neighbour into "à".
+#[test]
+fn spacing_accent_beside_letters_stays_as_shown() {
+    let content = "BT /F1 10 Tf 1 0 0 1 72 700 Tm (a) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 77.56 700 Tm (\\140) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 80.89 700 Tm (b) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 72 680 Tm (x = a) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 96.5 680 Tm (\\140) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 102.5 680 Tm (b) Tj ET";
+    let pdf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        None,
+        MAC_ROMAN_HELVETICA,
+    );
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"a\u{0060}b"), "{texts:?}");
+    assert!(texts.contains(&"x = a \u{0060} b"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|text| text.contains('\u{00E0}')),
+        "{texts:?}"
+    );
+}
+
+/// A run whose text is a producer's ActualText replacement carries no
+/// glyph-by-glyph text: an accent over its first painted glyph is left as
+/// shown rather than composed with the replacement's first character.
+#[test]
+fn spacing_accent_over_a_replacement_text_span_stays_as_shown() {
+    // `Real` replaces the painted `Fake`; the acute (code 0xAB of
+    // MacRomanEncoding) is centred over the painted F.
+    let content =
+        "BT /F1 10 Tf 1 0 0 1 72 700 Tm /Span << /ActualText (Real) >> BDC (Fake) Tj EMC ET\n\
+                   BT /F1 10 Tf 1 0 0 1 73.39 700.14 Tm (\\253) Tj ET";
+    let pdf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        None,
+        MAC_ROMAN_HELVETICA,
+    );
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"Real"), "{texts:?}");
+    assert!(
+        texts.iter().any(|text| text.contains('\u{00B4}')),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.contains('\u{0154}')),
+        "{texts:?}"
+    );
+}
+
+/// The six glyphs CIDs 1 to 6 of [`make_zero_advance_sign_pdf`] decode to:
+/// a word of a script whose subscript letters and vowel signs have zero
+/// advance.
+const SIGNED_WORD: &str = "\u{1789}\u{17D2}\u{1789}\u{179C}\u{178F}\u{17D2}\u{1790}\u{17BB}";
+
+/// A page showing `text` through `F1`, a Type0/Identity-H font without a
+/// program whose `/W` gives CIDs 1 to 7 the advances 958, 0, 344, 825, 0, 0
+/// and 276 — CIDs 2, 5 and 6 are a subscript letter and two vowel signs of
+/// a script whose signs have zero advance — with a ToUnicode CMap that maps
+/// CIDs 1 and 4 to a letter plus the sign that makes the letter after it a
+/// subscript. With `in_form` a Form XObject the page invokes shows the text.
+fn make_zero_advance_sign_pdf(text: &str, in_form: bool) -> Vec<u8> {
+    make_cid_font_pdf(
+        &[958, 0, 344, 825, 0, 0, 276],
+        &[
+            (1, "178917D2"),
+            (2, "1789"),
+            (3, "179C"),
+            (4, "178F17D2"),
+            (5, "1790"),
+            (6, "17BB"),
+        ],
+        text,
+        in_form,
+    )
+}
+
+/// A page showing `content` through `F1`, a Type0/Identity-H font without
+/// a program whose `/W` gives CIDs from 1 the advances in `widths` and
+/// whose ToUnicode CMap maps each CID of `cmap_entries` to the code points
+/// given as hex. With `in_form` a Form XObject the page invokes shows the
+/// content.
+fn make_cid_font_pdf(
+    widths: &[i64],
+    cmap_entries: &[(u16, &str)],
+    content: &str,
+    in_form: bool,
+) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfchar\n", cmap_entries.len()));
+    for (cid, code_points) in cmap_entries {
+        cmap.push_str(&format!("<{cid:04X}> <{code_points}>\n"));
+    }
+    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    let text = content;
+
+    let mut doc = Document::with_version("1.5");
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Signs",
+        "Flags" => 4,
+        "FontBBox" => vec![Object::Integer(-100), Object::Integer(-300), 1000.into(), 900.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 900,
+        "Descent" => Object::Integer(-300),
+        "CapHeight" => 700,
+        "StemV" => 80,
+    });
+    let widths: Vec<Object> = widths.iter().map(|&width| Object::Integer(width)).collect();
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Signs",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 1000,
+        "W" => vec![1.into(), Object::Array(widths)],
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Signs",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    });
+    let mut resources = dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    };
+    let content = if in_form {
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            },
+            text.as_bytes().to_vec(),
+        ));
+        resources.set("XObject", dictionary! { "Fm1" => form_id });
+        "q /Fm1 Do Q\n".to_string()
+    } else {
+        text.to_string()
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => resources,
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// A dependent sign that its font gives no advance, placed over the glyph
+/// before it with a backward `TJ` offset and the pen returned with a
+/// forward one, is no word gap: the return only brings the pen back to
+/// where it had been. Nor does such a sign open a gap when every glyph is
+/// shown from its own `Tm`. A forward offset from the pen's farthest point,
+/// and the part of a return that carries past it, are word gaps as ever.
+#[test]
+fn test_zero_advance_signs_placed_behind_the_pen_open_no_word_gaps() {
+    const TJ_WORD: &str = "BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET";
+    let glyph_per_op: String = [20.0, 30.28, 33.41, 38.23, 46.33, 49.78]
+        .iter()
+        .enumerate()
+        .map(|(index, x)| {
+            format!(
+                "BT /F1 14 Tf 1 0 0 1 {x} 700 Tm <{:04X}> Tj ET\n",
+                index + 1
+            )
+        })
+        .collect();
+    for in_form in [false, true] {
+        for content in [TJ_WORD, glyph_per_op.as_str()] {
+            let pdf = make_zero_advance_sign_pdf(content, in_form);
+            let items = extract_text_with_positions_mem(&pdf).unwrap();
+            let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+            assert_eq!(texts, [SIGNED_WORD], "in_form={in_form}: {content}");
+            let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+            let markdown = &pages.pages[0].markdown;
+            assert!(
+                markdown.contains(SIGNED_WORD),
+                "in_form={in_form}: {content}: {markdown:?}"
+            );
+        }
+    }
+
+    for (content, expected) in [
+        (
+            "BT /F1 14 Tf 20 700 Td [<0002> -600 <0003>] TJ ET",
+            "\u{1789} \u{179C}",
+        ),
+        (
+            "BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -621 <0003>] TJ ET",
+            "\u{1789}\u{17D2}\u{1789} \u{179C}",
+        ),
+    ] {
+        let pdf = make_zero_advance_sign_pdf(content, false);
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        let markdown = &pages.pages[0].markdown;
+        assert!(markdown.contains(expected), "{content}: {markdown:?}");
+    }
+}
+
+/// A vowel sign that its font gives no advance, on a right-to-left line.
+/// Placed by a backward `TJ` offset behind the pen inside a word painted
+/// in visual order, it opens no word gap and stays on its letter once the
+/// line is read back into logical order; shown as a glyph of its own by a
+/// producer walking the line right to left, it follows its letter in the
+/// reading instead of the letter read before it, and the word gap after
+/// its word is measured from the letter, not from the sign.
+#[test]
+fn test_zero_advance_sign_on_a_right_to_left_line_stays_on_its_letter() {
+    const POINTED_LINE: &str = "\u{05D1}\u{05D0}\u{05B8}\u{05DC} \u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+    // Two words in visual order, painted left to right: the second word's
+    // display, then the first's, with the sign placed 0.3 em back over the
+    // second letter and the pen returned.
+    let visual_words = "BT /F1 12 Tf 100 700 Td [<0007> <0006> <0004> <0005>] TJ ET\n\
+                        BT /F1 12 Tf 129 700 Td [<0004> <0002> 300 <0003> -300 <0001>] TJ ET\n";
+    // The same line one glyph per operator, walked right to left.
+    let glyph_per_op: String = [
+        (1, 141.0),
+        (2, 135.0),
+        (3, 137.4),
+        (4, 129.0),
+        (5, 118.0),
+        (4, 112.0),
+        (6, 106.0),
+        (7, 100.0),
+    ]
+    .iter()
+    .map(|(cid, x)| format!("BT /F1 12 Tf 1 0 0 1 {x} 700 Tm <{cid:04X}> Tj ET\n"))
+    .collect();
+    for content in [visual_words, glyph_per_op.as_str()] {
+        let pdf = make_cid_font_pdf(
+            &[500, 500, 0, 500, 500, 500, 500],
+            &[
+                (1, "05D1"),
+                (2, "05D0"),
+                (3, "05B8"),
+                (4, "05DC"),
+                (5, "05E9"),
+                (6, "05D5"),
+                (7, "05DD"),
+            ],
+            content,
+            false,
+        );
+        let items = extract_text_with_positions_mem(&pdf).unwrap();
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [POINTED_LINE], "{content}");
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        let markdown = &pages.pages[0].markdown;
+        assert!(markdown.contains(POINTED_LINE), "{content}: {markdown:?}");
+    }
+}
+
+/// The word "coffee" shown through [`make_embedded_cid_font_pdf`] as codes 1–4 —
+/// c, o, the ff ligature, e — with the ligature's code mapped by
+/// `ligature_entry`, the program's glyphs named `names` and the glyphs in
+/// `blank` left without an outline. The CMap maps eight more codes the
+/// page does not show, as a subset's CMap lists every glyph it kept —
+/// unless `sparse`, when it maps the four shown and no more.
+fn make_ligature_index_pdf(
+    ligature_entry: &str,
+    names: &[(u16, &str)],
+    blank: &[u16],
+    sparse: bool,
+) -> Vec<u8> {
+    let more = if sparse {
+        ""
+    } else {
+        "<0005> <0074>\n<0006> <0061>\n<0007> <0062>\n<0008> <006C>\n<0009> <0073>\n\
+         <000A> <0075>\n<000B> <006E>\n<000C> <0064>\n"
+    };
+    // The header declares the entries the CMap holds: four when sparse,
+    // twelve otherwise.
+    let count = if sparse { 4 } else { 12 };
+    let cmap = format!(
+        "{CID_CMAP_HEAD}{count} beginbfchar\n<0001> <0063>\n<0002> <006F>\n\
+         <0003> {ligature_entry}\n<0004> <0065>\n{more}{CID_CMAP_TAIL}"
+    );
+    make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset_with(12, names, blank),
+        "",
+        "BT /F1 12 Tf 72 700 Td <00010002000300040004> Tj ET\n",
+        false,
+    )
+}
+
+/// A ToUnicode entry whose destination is a control character — here the
+/// ligature glyph's own index, `<0003>`, written in place of its character
+/// — maps its code to no text: the code reads as U+FFFD in its place and
+/// the document reports an encoding issue, where the word used to read
+/// "coee" and pass as clean. The program's glyph name reads the glyph when
+/// it has one — also when the CMap is sparse and the program's reading
+/// takes its place, the CMap staying as the alternative — and a glyph
+/// with no outline but an advance reads as the space it paints. An entry
+/// mapping to TAB reads as the tab it always did, and an ordinary entry
+/// as its letters.
+#[test]
+fn a_control_destination_in_a_tounicode_cmap_marks_its_code() {
+    let marked = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[], false)).unwrap();
+    let markdown = marked.markdown.unwrap();
+    assert!(markdown.contains("co\u{FFFD}ee"), "{markdown}");
+    assert!(marked.has_encoding_issues);
+
+    let named = process_pdf_mem(&make_ligature_index_pdf(
+        "<0003>",
+        &[(3, "f_f")],
+        &[],
+        false,
+    ))
+    .unwrap();
+    let markdown = named.markdown.unwrap();
+    assert!(markdown.contains("coffee"), "{markdown}");
+    assert!(!named.has_encoding_issues);
+
+    let sparse =
+        process_pdf_mem(&make_ligature_index_pdf("<0003>", &[(3, "f_f")], &[], true)).unwrap();
+    let markdown = sparse.markdown.unwrap();
+    assert!(markdown.contains("coffee"), "{markdown}");
+    assert!(!sparse.has_encoding_issues);
+
+    let blank = process_pdf_mem(&make_ligature_index_pdf("<0003>", &[], &[3], false)).unwrap();
+    let markdown = blank.markdown.unwrap();
+    assert!(markdown.contains("co ee"), "{markdown}");
+    assert!(!blank.has_encoding_issues);
+
+    let tab = process_pdf_mem(&make_ligature_index_pdf("<0009>", &[], &[], false)).unwrap();
+    let markdown = tab.markdown.unwrap();
+    assert!(markdown.contains("co\tee"), "{markdown:?}");
+    assert!(!tab.has_encoding_issues);
+
+    let ordinary =
+        process_pdf_mem(&make_ligature_index_pdf("<00660066>", &[], &[], false)).unwrap();
+    let markdown = ordinary.markdown.unwrap();
+    assert!(markdown.contains("coffee"), "{markdown}");
+    assert!(!ordinary.has_encoding_issues);
+}
+
+/// A page showing the bytes `21 22 23 24 24` through the simple TrueType
+/// font `F1` — no embedded program, the given ToUnicode `bfchar` lines and,
+/// when given, an encoding dictionary whose `/Differences` name code 0x22
+/// `o` and code 0x23 `differences_name` (a Differences naming only codes it
+/// cannot read is set aside as a whole, by design; the readable name keeps
+/// it).
+fn make_simple_font_pdf(bfchar: &str, differences_name: Option<&str>) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.4");
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+         12 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+         CMapName currentdict /CMap defineresource pop\nend\nend"
+    );
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "ABCDEF+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+    });
+    let mut font = dictionary! {
+        "Type" => "Font",
+        "Subtype" => "TrueType",
+        "BaseFont" => "ABCDEF+Subset",
+        "FirstChar" => 0x21,
+        "LastChar" => 0x2C,
+        "Widths" => vec![Object::Integer(600); 12],
+        "FontDescriptor" => descriptor_id,
+        "ToUnicode" => cmap_id,
+    };
+    if let Some(name) = differences_name {
+        font.set(
+            "Encoding",
+            dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![
+                    0x22.into(),
+                    Object::Name(b"o".to_vec()),
+                    Object::Name(name.as_bytes().to_vec()),
+                ],
+            },
+        );
+    }
+    let font_id = doc.add_object(font);
+    let content_id = doc.add_object(Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 72 700 Td <2122232424> Tj ET\n".to_vec(),
+    ));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// The same defect in a simple font whose `/Differences` name the code by
+/// a name that cannot be read: the code reads as the marker and the
+/// document reports its encoding issue, where the unreadable name alone,
+/// on a code the CMap does not map, reads as nothing and reports none.
+#[test]
+fn a_control_destination_under_an_unreadable_differences_name_is_marked() {
+    const CODES: &str = "<21> <0063>\n<22> <006F>\n<23> <0003>\n<24> <0065>\n<25> <0074>\n\
+         <26> <0061>\n<27> <0062>\n<28> <006C>\n<29> <0073>\n<2A> <0075>\n<2B> <006E>\n\
+         <2C> <0064>";
+    let marked = process_pdf_mem(&make_simple_font_pdf(CODES, Some("f_zzz"))).unwrap();
+    let markdown = marked.markdown.unwrap();
+    assert!(markdown.contains("co\u{FFFD}ee"), "{markdown}");
+    assert!(marked.has_encoding_issues);
+
+    let nameless = process_pdf_mem(&make_simple_font_pdf(
+        &CODES.replace("<23> <0003>\n", ""),
+        Some("f_zzz"),
+    ))
+    .unwrap();
+    let markdown = nameless.markdown.unwrap();
+    assert!(markdown.contains("coee"), "{markdown}");
+    assert!(!nameless.has_encoding_issues);
+}
+
+/// A string of one letter and three control destinations reads as the
+/// letter and three markers, never as the letter alone or as control
+/// characters: the markers are the CMap's own reading of those codes, so
+/// the string is not abandoned to the readings tried after a failed CMap.
+/// The document reports the encoding issue, and the three codes as unmapped.
+#[test]
+fn a_string_of_mostly_control_destinations_keeps_its_markers_end_to_end() {
+    let cmap = format!(
+        "{CID_CMAP_HEAD}4 beginbfchar\n<0001> <0063>\n<0002> <0002>\n<0003> <0003>\n\
+         <0004> <0004>\n{CID_CMAP_TAIL}"
+    );
+    let pdf = make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset_with(12, &[], &[]),
+        "",
+        "BT /F1 12 Tf 72 700 Td <0001000200030004> Tj ET\n",
+        false,
+    );
+    let result = process_pdf_mem(&pdf).unwrap();
+    let markdown = result.markdown.clone().unwrap_or_default();
+    assert!(
+        markdown.contains("c\u{FFFD}\u{FFFD}\u{FFFD}"),
+        "{markdown:?}"
+    );
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 4,
+            interpolated: 0,
+            unmapped: 3,
+        }]
+    );
+}
+
+/// An odd-length string through a Type0 font none of whose bytes any CMap
+/// reads: the bytes are counted once as the font's codes, all unmapped, and
+/// the document reports the gap — not the one-and-a-half codes of the
+/// two-byte reading tried over the same bytes afterwards.
+#[test]
+fn an_odd_length_string_no_cmap_reads_counts_its_bytes_once() {
+    let cmap = format!(
+        "{CID_CMAP_HEAD}4 beginbfchar\n<0001> <0063>\n<0002> <006F>\n<0003> <0066>\n\
+         <0004> <0065>\n{CID_CMAP_TAIL}"
+    );
+    let pdf = make_embedded_cid_font_pdf(
+        &cmap,
+        minimal_truetype_subset_with(12, &[], &[]),
+        "",
+        "BT /F1 12 Tf 72 700 Td <808182> Tj ET\n",
+        false,
+    );
+    let result = process_pdf_mem(&pdf).unwrap();
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 3,
+            interpolated: 0,
+            unmapped: 3,
+        }]
+    );
+}
+
+// =========================================================================
+// Text paint and document information
+// =========================================================================
+
+/// One page showing a run in the default black, a red run, a run shown
+/// under a `3 Tr` set before its text object, a run hidden by `3 Tr` inside
+/// its own text object, a line shown with `"`, a Form XObject's text under
+/// the page's blue fill and a run after the form. The information dictionary
+/// holds every text entry, in PDFDocEncoding and UTF-16BE.
+fn synthetic_paint_and_info_pdf() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+    let utf16 = |text: &str| {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        Object::String(bytes, StringFormat::Hexadecimal)
+    };
+    let mut doc = Document::with_version("1.7");
+    let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "FirstChar" => 0,
+        "LastChar" => 255,
+        "Widths" => Object::Array(widths),
+    });
+    let form = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        },
+        b"BT /F1 12 Tf 72 580 Td (Form text) Tj ET".to_vec(),
+    ));
+    let content = b"BT /F1 12 Tf 72 720 Td (Body text) Tj ET
+0.8 0.1 0.1 rg BT /F1 12 Tf 72 700 Td (Red text) Tj ET
+0 g 3 Tr BT /F1 12 Tf 72 680 Td (Invisible text) Tj ET
+0 Tr BT /F1 12 Tf 72 660 Td 3 Tr (Layer text) Tj 0 Tr ET
+BT /F1 12 Tf 14 TL 72 654 Td 2 0.5 (Quoted line) \" ET
+0 0 1 rg q /X1 Do Q
+BT /F1 12 Tf 72 560 Td (After form) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.to_vec()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font },
+            "XObject" => dictionary! { "X1" => form },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let info = doc.add_object(dictionary! {
+        "Title" => utf16("Quarterly Report – Q3"),
+        "Author" => Object::String(b"Jos\xE9 Mart\xEDnez".to_vec(), StringFormat::Literal),
+        "Subject" => Object::string_literal("Paint and render modes"),
+        "Keywords" => Object::string_literal("colour, visibility"),
+        "Creator" => Object::string_literal("Test Writer"),
+        "Producer" => utf16("Test Library 1.0"),
+        "CreationDate" => Object::string_literal("D:20240115103000+01'00'"),
+        "ModDate" => Object::string_literal("D:20240116090000Z"),
+    });
+    doc.trailer.set("Info", info);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn text_items_report_their_fill_colour_and_render_mode() {
+    let pdf = synthetic_paint_and_info_pdf();
+    let items = extract_text_with_positions_mem(&pdf).unwrap();
+    let paint = |text: &str| {
+        let item = items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| panic!("no item {text:?} in {items:?}"));
+        (item.fill_color, item.stroke_color, item.render_mode)
+    };
+    let black = Some([0, 0, 0]);
+    // The default paint, and a fill colour set before the text object.
+    assert_eq!(paint("Body text"), (black, black, Some(0)));
+    assert_eq!(paint("Red text"), (Some([204, 26, 26]), black, Some(0)));
+    // A run shown under a `3 Tr` set before its text object is extracted as
+    // it always was, and says it paints nothing; a run hidden inside its own
+    // text object is still left out of the positioned text.
+    assert_eq!(paint("Invisible text"), (black, black, Some(3)));
+    assert!(!items.iter().any(|item| item.text.contains("Layer text")));
+    // `"` moves to the next line (the leading below the `Td`) and shows its
+    // string, painted like any other run.
+    let quoted = items
+        .iter()
+        .find(|item| item.text == "Quoted line")
+        .unwrap();
+    assert!((quoted.y - 640.0).abs() < 0.1, "{quoted:?}");
+    assert_eq!(paint("Quoted line"), (black, black, Some(0)));
+    // The form's text is painted with the fill in force where the page
+    // invoked it, and the page keeps that fill after the form.
+    let blue = Some([0, 0, 255]);
+    assert_eq!(paint("Form text"), (blue, black, Some(0)));
+    assert_eq!(paint("After form"), (blue, black, Some(0)));
+}
+
+#[test]
+fn markdown_keeps_invisible_and_quoted_text_as_the_extraction_reads_it() {
+    let result = process_pdf_mem(&synthetic_paint_and_info_pdf()).unwrap();
+    let markdown = result.markdown.unwrap();
+    for text in [
+        "Body text",
+        "Red text",
+        "Invisible text",
+        "Quoted line",
+        "Form text",
+        "After form",
+    ] {
+        assert!(
+            markdown.contains(text),
+            "{text:?} missing from {markdown:?}"
+        );
+    }
+    assert!(!markdown.contains("Layer text"), "{markdown:?}");
+}
+
+#[test]
+fn document_information_entries_are_decoded_in_every_result() {
+    let pdf = synthetic_paint_and_info_pdf();
+    let expected = [
+        Some("Quarterly Report – Q3"),
+        Some("José Martínez"),
+        Some("Paint and render modes"),
+        Some("colour, visibility"),
+        Some("Test Writer"),
+        Some("Test Library 1.0"),
+        Some("D:20240115103000+01'00'"),
+        Some("D:20240116090000Z"),
+    ];
+    let processed = process_pdf_mem(&pdf).unwrap();
+    assert_eq!(
+        [
+            processed.title.as_deref(),
+            processed.author.as_deref(),
+            processed.subject.as_deref(),
+            processed.keywords.as_deref(),
+            processed.creator.as_deref(),
+            processed.producer.as_deref(),
+            processed.creation_date.as_deref(),
+            processed.mod_date.as_deref(),
+        ],
+        expected
+    );
+    let detected = detect_pdf_type_mem(&pdf).unwrap();
+    assert_eq!(
+        [
+            detected.title.as_deref(),
+            detected.author.as_deref(),
+            detected.subject.as_deref(),
+            detected.keywords.as_deref(),
+            detected.creator.as_deref(),
+            detected.producer.as_deref(),
+            detected.creation_date.as_deref(),
+            detected.mod_date.as_deref(),
+        ],
+        expected
+    );
+    // Detection alone reads them too.
+    let detect_only = process_pdf_mem_with_options(&pdf, PdfOptions::detect_only()).unwrap();
+    assert_eq!(detect_only.producer.as_deref(), Some("Test Library 1.0"));
+    assert_eq!(detect_only.author.as_deref(), Some("José Martínez"));
+}
+
+/// A ToUnicode CMap declaring the two-byte codespace `<0000> <FFFF>` over
+/// one-byte `bfchar` entries, plus `wide` entries written with four hex
+/// digits — the shape some producers give a simple font's CMap.
+fn wide_codespace_cmap(entries: &[(u16, char)], wide: &[(u16, char)]) -> String {
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfchar\n", entries.len() + wide.len()));
+    for &(code, ch) in entries {
+        cmap.push_str(&format!("<{code:02X}> <{:04X}>\n", ch as u32));
+    }
+    for &(code, ch) in wide {
+        cmap.push_str(&format!("<{code:04X}> <{:04X}>\n", ch as u32));
+    }
+    cmap.push_str("endbfchar\nendcmap\n");
+    cmap.push_str("CMapName currentdict /CMap defineresource pop\nend\nend\n");
+    cmap
+}
+
+/// The codes of "Income Statement" under `wide_codespace_cmap`.
+const WIDE_CODESPACE_ENTRIES: [(u16, char); 10] = [
+    (0x01, 'I'),
+    (0x04, ' '),
+    (0x08, 'o'),
+    (0x0A, 'n'),
+    (0x0F, 't'),
+    (0x12, 'e'),
+    (0x13, 'm'),
+    (0x14, 'a'),
+    (0x82, 'c'),
+    (0x8E, 'S'),
+];
+
+#[test]
+fn test_simple_font_reads_one_byte_per_code_under_a_two_byte_codespace_cmap() {
+    use lopdf::{dictionary, Stream};
+
+    // A base-14 face (widths from its metrics), and a subset face with no
+    // width table at all: both are simple fonts, whatever their widths.
+    for base_font in ["Helvetica", "ABCDEF+SubsetFace"] {
+        let mut doc = lopdf::Document::with_version("1.5");
+        let cmap_id = doc.add_object(Stream::new(
+            dictionary! {},
+            wide_codespace_cmap(&WIDE_CODESPACE_ENTRIES, &[(0x0020, ' ')]).into_bytes(),
+        ));
+        // The Differences name the codes by glyph index, which says nothing
+        // without the program: the CMap is the only reading of these codes.
+        let mut differences: Vec<lopdf::Object> = Vec::new();
+        for (index, &(code, _)) in WIDE_CODESPACE_ENTRIES.iter().enumerate() {
+            differences.push(i64::from(code).into());
+            differences.push(lopdf::Object::Name(
+                format!("gid{:05}", index + 1).into_bytes(),
+            ));
+        }
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => base_font,
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "BaseEncoding" => "WinAnsiEncoding",
+                "Differences" => differences,
+            },
+            "ToUnicode" => cmap_id,
+        });
+        // One TJ of one-, two- and three-byte strings, as kerned text is shown.
+        let content =
+            "BT /F1 12 Tf 72 700 Td [(\\001) (\\012\\202) (\\010\\023\\022) (\\004\\216) \
+                       (\\017) (\\024) (\\017) (\\022) (\\023\\022) (\\012) (\\017)] TJ ET\n";
+        let pages_id = doc.new_object_id();
+        let page_id = add_page(
+            &mut doc,
+            pages_id,
+            content,
+            LETTER_BOX,
+            None,
+            &[("F1", font_id)],
+        );
+        let pdf = finish_document(doc, pages_id, vec![page_id]);
+
+        let text: String = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert_eq!(
+            text, "Income Statement",
+            "{base_font}: every string of the simple font is read one byte per code"
+        );
+    }
+}
+
+#[test]
+fn test_type0_font_keeps_reading_two_byte_codes_under_the_same_cmap_shape() {
+    // The same CMap shape on a Type0 font, with a two-byte entry `<0A82>`
+    // whose bytes read as `n` and `c` one by one: the font's codes stay two
+    // bytes wide, so the code reads as its own entry.
+    let mut doc = lopdf::Document::with_version("1.5");
+    let cmap = wide_codespace_cmap(&WIDE_CODESPACE_ENTRIES, &[(0x0020, ' '), (0x0A82, 'X')]);
+    let font_id = add_type0_font_with_tounicode_cmap(&mut doc, cmap, 0x0A82);
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        "BT /F1 12 Tf 72 700 Td <0A820008> Tj ET\n",
+        LETTER_BOX,
+        None,
+        &[("F1", font_id)],
+    );
+    let pdf = finish_document(doc, pages_id, vec![page_id]);
+    let text: String = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, "Xo");
+}
+
+/// A Type 1 font program whose cleartext part declares `encoding`, with
+/// bytes standing in for its encrypted part.
+fn type1_program(encoding: &str) -> Vec<u8> {
+    let mut program = format!(
+        "%!PS-AdobeFont-1.0: TeXFace 1.0\n11 dict begin\n/FontName /TeXFace def\n\
+         /PaintType 0 def\n/FontType 1 def\n/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+         {encoding}\n/FontBBox {{-40 -250 1009 750}} readonly def\ncurrentdict end\n\
+         currentfile eexec\n"
+    )
+    .into_bytes();
+    program.extend_from_slice(&[0xd9, 0xd6, 0x6f, 0x63, 0x3b, 0x84, 0x6a, 0x98]);
+    program
+}
+
+/// The encoding array of a text face laid out the way TeX's are: letters
+/// and digits where ASCII has them, the ligatures below the space, curly
+/// quotes and dashes where ASCII has straight quotes, a backslash and
+/// braces, a glyph whose name no glyph list reads, an old-style zero,
+/// which the glyph list reads as a private code point, and a wide accent
+/// and an arrow accent, which read as combining marks.
+fn tex_text_encoding() -> String {
+    let mut entry = String::from("/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\n");
+    for (code, name) in [
+        (11, "ff"),
+        (12, "fi"),
+        (13, "fl"),
+        (14, "ffi"),
+        (15, "ffl"),
+        (34, "quotedblright"),
+        (48, "zerooldstyle"),
+        (49, "one"),
+        (50, "two"),
+        (88, "negationslash"),
+        (92, "quotedblleft"),
+        (94, "hatwide"),
+        (123, "endash"),
+        (124, "emdash"),
+        (126, "uni20D7"),
+    ] {
+        entry.push_str(&format!("dup {code} /{name} put\n"));
+    }
+    for letter in b'a'..=b'z' {
+        entry.push_str(&format!("dup {letter} /{} put\n", letter as char));
+    }
+    entry.push_str("readonly def");
+    entry
+}
+
+/// A subset Type 1 font embedding `program`, with the `/Encoding` and
+/// `/ToUnicode` entries given.
+fn add_embedded_type1_font(
+    doc: &mut lopdf::Document,
+    program: Vec<u8>,
+    encoding: Option<lopdf::Object>,
+    to_unicode: Option<lopdf::ObjectId>,
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Stream};
+
+    let length1 = program.windows(5).position(|w| w == b"eexec").unwrap() + 6;
+    let length2 = program.len() - length1;
+    let font_file = doc.add_object(Stream::new(
+        dictionary! {
+            "Length1" => length1 as i64,
+            "Length2" => length2 as i64,
+            "Length3" => 0,
+        },
+        program,
+    ));
+    let descriptor = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "ABCDEF+TeXFace",
+        "Flags" => 4,
+        "FontBBox" => vec![(-40).into(), (-250).into(), 1009.into(), 750.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 694,
+        "Descent" => -194,
+        "CapHeight" => 683,
+        "StemV" => 65,
+        "FontFile" => font_file,
+    });
+    let mut font = dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "ABCDEF+TeXFace",
+        "FontDescriptor" => descriptor,
+    };
+    if let Some(encoding) = encoding {
+        font.set("Encoding", encoding);
+    }
+    if let Some(cmap) = to_unicode {
+        font.set("ToUnicode", cmap);
+    }
+    doc.add_object(font)
+}
+
+/// The text of each line of `strings`, each shown on a line of its own in
+/// the font `add_font` adds.
+fn embedded_type1_lines(
+    add_font: impl FnOnce(&mut lopdf::Document) -> lopdf::ObjectId,
+    strings: &[&str],
+) -> Vec<String> {
+    let mut doc = lopdf::Document::with_version("1.5");
+    let font_id = add_font(&mut doc);
+    let content: String = strings
+        .iter()
+        .enumerate()
+        .map(|(line, string)| {
+            format!(
+                "BT /F1 12 Tf 72 {} Td ({string}) Tj ET\n",
+                700 - 40 * line as i64
+            )
+        })
+        .collect();
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        LETTER_BOX,
+        None,
+        &[("F1", font_id)],
+    );
+    let pdf = finish_document(doc, pages_id, vec![page_id]);
+    let result = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf).unwrap();
+    let mut lines: Vec<(i64, String)> = Vec::new();
+    for item in result {
+        let y = item.y.round() as i64;
+        match lines.iter_mut().find(|(line_y, _)| *line_y == y) {
+            Some((_, text)) => text.push_str(&item.text),
+            None => lines.push((y, item.text)),
+        }
+    }
+    lines.sort_by_key(|(y, _)| -y);
+    lines.into_iter().map(|(_, text)| text).collect()
+}
+
+/// Ligatures, curly quotes and a dash, as TeX's text faces show them, and
+/// the glyph whose name does not read, the old-style zero, the accents, a
+/// code the program leaves at `.notdef` between two letters, and the word
+/// space, which the program leaves at `.notdef` too.
+const TEX_STRINGS: [&str; 10] = [
+    "\\014nd",
+    "e\\013ect",
+    "\\134quoted\\042",
+    "1\\1732",
+    "\\130",
+    "\\0601",
+    "\\136",
+    "\\176",
+    "x\\041y",
+    "x y",
+];
+
+#[test]
+fn test_type1_font_without_an_encoding_reads_through_its_programs_encoding() {
+    // No /Encoding and no ToUnicode: the embedded program's encoding is the
+    // font's, so the codes below the space and the ones where TeX's layout
+    // parts from ASCII read as the glyphs it names. A name no glyph list
+    // reads, one it reads as a private code point and one it reads as a
+    // lone combining mark leave their codes as they were read before; a
+    // code the program leaves at `.notdef` has no glyph and reads as
+    // nothing, but the word space, which PDF spaces words by, still reads
+    // as a space.
+    let lines = embedded_type1_lines(
+        |doc| add_embedded_type1_font(doc, type1_program(&tex_text_encoding()), None, None),
+        &TEX_STRINGS,
+    );
+    assert_eq!(
+        lines,
+        [
+            "find",
+            "effect",
+            "\u{201C}quoted\u{201D}",
+            "1\u{2013}2",
+            "X",
+            "01",
+            "^",
+            "~",
+            "xy",
+            "x y"
+        ]
+    );
+}
+
+#[test]
+fn test_type1_programs_encoding_yields_to_the_fonts_own_readings() {
+    use lopdf::{dictionary, Object, Stream};
+
+    // A ToUnicode CMap reads the codes it maps; the program reads the rest.
+    let lines = embedded_type1_lines(
+        |doc| {
+            let cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+                        /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+                        1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                        1 beginbfchar\n<0C> <0046>\nendbfchar\nendcmap\n\
+                        CMapName currentdict /CMap defineresource pop\nend\nend\n";
+            let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.as_bytes().to_vec()));
+            add_embedded_type1_font(
+                doc,
+                type1_program(&tex_text_encoding()),
+                None,
+                Some(cmap_id),
+            )
+        },
+        &TEX_STRINGS[..2],
+    );
+    assert_eq!(lines, ["Fnd", "effect"], "ToUnicode");
+
+    // The Differences name their codes; the program is their base.
+    let lines = embedded_type1_lines(
+        |doc| {
+            let encoding = dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![12.into(), Object::Name(b"A".to_vec())],
+            };
+            add_embedded_type1_font(
+                doc,
+                type1_program(&tex_text_encoding()),
+                Some(encoding.into()),
+                None,
+            )
+        },
+        &TEX_STRINGS[..2],
+    );
+    assert_eq!(lines, ["And", "effect"], "Differences");
+
+    // A base the font names, in its encoding dictionary or outright, is the
+    // font's base: the program is not read, and the codes read as before.
+    for encoding in [
+        Object::from(dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => "WinAnsiEncoding",
+        }),
+        Object::Name(b"WinAnsiEncoding".to_vec()),
+    ] {
+        let lines = embedded_type1_lines(
+            |doc| {
+                add_embedded_type1_font(
+                    doc,
+                    type1_program(&tex_text_encoding()),
+                    Some(encoding.clone()),
+                    None,
+                )
+            },
+            &[TEX_STRINGS[0], TEX_STRINGS[3]],
+        );
+        assert_eq!(lines, ["nd", "1{2"], "{encoding:?}");
+    }
+
+    // Differences whose names none reads (glyphs named by the character
+    // itself) keep the font without an encoding, whatever its program says:
+    // the codes read as the single-byte characters they are.
+    for program in [
+        type1_program(&tex_text_encoding()),
+        type1_program("/Encoding StandardEncoding def"),
+    ] {
+        let lines = embedded_type1_lines(
+            |doc| {
+                let encoding = dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => vec![
+                        0x3D.into(),
+                        Object::Name(b"=".to_vec()),
+                        0x3B.into(),
+                        Object::Name(b";".to_vec()),
+                    ],
+                };
+                add_embedded_type1_font(doc, program.clone(), Some(encoding.into()), None)
+            },
+            &["a=b;"],
+        );
+        assert_eq!(lines, ["a=b;"], "names that do not read");
+    }
+
+    // A program whose encoding cannot be read leaves the font as it was.
+    let lines = embedded_type1_lines(
+        |doc| {
+            add_embedded_type1_font(
+                doc,
+                type1_program("/Encoding ISOLatin1Encoding def"),
+                None,
+                None,
+            )
+        },
+        &[TEX_STRINGS[0], TEX_STRINGS[3]],
+    );
+    assert_eq!(lines, ["nd", "1{2"], "unreadable program");
+}
+
+#[test]
+fn test_type1_program_declaring_standard_encoding_is_the_base_under_differences() {
+    use lopdf::{dictionary, Object};
+
+    // An encoding dictionary with Differences only: the codes it leaves
+    // read through StandardEncoding, the program's, where they read through
+    // the single-byte fallback before (`fi` at 0xAE, not `®`; a curly
+    // apostrophe at 0x27).
+    let lines = embedded_type1_lines(
+        |doc| {
+            let encoding = dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![65.into(), Object::Name(b"B".to_vec())],
+            };
+            add_embedded_type1_font(
+                doc,
+                type1_program("/Encoding StandardEncoding def"),
+                Some(encoding.into()),
+                None,
+            )
+        },
+        &["A\\256", "it\\047s"],
+    );
+    assert_eq!(lines, ["Bfi", "it\u{2019}s"]);
+}
+
+/// A subset Type0 font (Identity-H over a TrueType CID font, no program
+/// embedded) whose ToUnicode CMap maps `entries`, code to character, with
+/// the CID font's `/CIDToGIDMap` (the name `Identity` when `cid_to_gid` is
+/// `None`, else a stream of each CID's glyph index) and `/W` array.
+fn add_identity_h_subset_font(
+    doc: &mut lopdf::Document,
+    entries: &[(u16, char)],
+    cid_to_gid: Option<&[u16]>,
+    widths: Vec<lopdf::Object>,
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfchar\n", entries.len()));
+    for &(code, ch) in entries {
+        cmap.push_str(&format!("<{code:04X}> <{:04X}>\n", ch as u32));
+    }
+    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let cid_to_gid: Object = match cid_to_gid {
+        None => "Identity".into(),
+        Some(gids) => doc
+            .add_object(Stream::new(
+                dictionary! {},
+                gids.iter().flat_map(|gid| gid.to_be_bytes()).collect(),
+            ))
+            .into(),
+    };
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Subset",
+        "Flags" => 32,
+        "FontBBox" => vec![0.into(), (-200).into(), 1000.into(), 800.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 800,
+        "Descent" => -200,
+        "CapHeight" => 700,
+        "StemV" => 80,
+    });
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Subset",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 500,
+        "W" => widths,
+        "CIDToGIDMap" => cid_to_gid,
+    });
+    doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Subset",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    })
+}
+
+/// The text of each line of a one-page document showing `lines` in the
+/// font `add_font` adds: each line a TJ of strings, each string its
+/// two-byte codes (one code per string, as some producers write every
+/// glyph, or pieces of words, as kerning splits them).
+fn identity_h_lines(
+    add_font: impl FnOnce(&mut lopdf::Document) -> lopdf::ObjectId,
+    lines: &[Vec<Vec<u16>>],
+) -> Vec<String> {
+    let mut doc = lopdf::Document::with_version("1.5");
+    let font_id = add_font(&mut doc);
+    let content: String = lines
+        .iter()
+        .enumerate()
+        .map(|(line, strings)| {
+            let strings: Vec<String> = strings
+                .iter()
+                .map(|codes| {
+                    let hex: String = codes.iter().map(|code| format!("{code:04X}")).collect();
+                    format!("<{hex}>")
+                })
+                .collect();
+            format!(
+                "BT /F1 12 Tf 72 {} Td [{}] TJ ET\n",
+                700 - 30 * line as i64,
+                strings.join(" ")
+            )
+        })
+        .collect();
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        LETTER_BOX,
+        None,
+        &[("F1", font_id)],
+    );
+    let pdf = finish_document(doc, pages_id, vec![page_id]);
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf).unwrap();
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for item in items {
+        let y = item.y.round() as i64;
+        match rows.iter_mut().find(|(row_y, _)| *row_y == y) {
+            Some((_, text)) => text.push_str(&item.text),
+            None => rows.push((y, item.text)),
+        }
+    }
+    rows.sort_by_key(|(y, _)| -y);
+    rows.into_iter().map(|(_, text)| text).collect()
+}
+
+/// A `/W` array covering the CIDs the `/CIDToGIDMap` fixtures show
+/// (0x0100 onwards), so none of them looks like a renumbered subset.
+fn cid_widths() -> Vec<lopdf::Object> {
+    vec![
+        0x0100.into(),
+        vec![lopdf::Object::Integer(500); 0x80].into(),
+    ]
+}
+
+/// Each glyph of `text` as a string of its own, through `code`.
+fn glyph_strings(text: &str, code: impl Fn(char) -> u16) -> Vec<Vec<u16>> {
+    text.chars().map(|ch| vec![code(ch)]).collect()
+}
+
+#[test]
+fn test_cid_keyed_cmap_keeps_its_reading_where_a_repair_reads_a_lone_common_word() {
+    // A ToUnicode CMap keyed by CID, right as it is, beside a CIDToGIDMap
+    // stream that sends the CID of `m` to the glyph index that is the CID of
+    // `a`. Read through the map, the repaired CMap agrees with the CMap
+    // everywhere but there. Each glyph is a string of its own, so each is
+    // read before the font's decision: the `m` stays an `m`, though the
+    // repair's `a` is a common word.
+    let text = "Stakeholder engagement";
+    let cid = |ch: char| 0x0100 + ch as u16;
+    let mut entries: Vec<(u16, char)> = text.chars().map(|ch| (cid(ch), ch)).collect();
+    entries.sort();
+    entries.dedup();
+    let mut gids: Vec<u16> = (0..=cid('z')).collect();
+    gids[usize::from(cid('m'))] = cid('a');
+    let lines = identity_h_lines(
+        |doc| add_identity_h_subset_font(doc, &entries, Some(&gids), cid_widths()),
+        &[glyph_strings(text, cid)],
+    );
+    assert_eq!(lines, [text]);
+}
+
+#[test]
+fn test_cid_keyed_cmap_keeps_its_reading_where_a_repair_reads_a_short_common_word() {
+    // The same shape, with a map that sends the CIDs of `r` and `e` to
+    // those of `a` and `T`, and words shown in pieces, as kerning splits
+    // them: the piece `re` reads through the repair as `aT`, a common word
+    // lowercased, and stays `re`.
+    let cid = |ch: char| 0x0100 + ch as u16;
+    let pieces: [&[&str]; 3] = [&["Th", "re", "e"], &["Inte", "re", "st"], &["a", "re"]];
+    let text: String = pieces.iter().flat_map(|p| p.iter().copied()).collect();
+    let mut entries: Vec<(u16, char)> = text.chars().map(|ch| (cid(ch), ch)).collect();
+    entries.sort();
+    entries.dedup();
+    let mut gids: Vec<u16> = (0..=cid('z')).collect();
+    gids[usize::from(cid('r'))] = cid('a');
+    gids[usize::from(cid('e'))] = cid('T');
+    let lines: Vec<Vec<Vec<u16>>> = pieces
+        .iter()
+        .map(|pieces| {
+            pieces
+                .iter()
+                .map(|piece| piece.chars().map(cid).collect())
+                .collect()
+        })
+        .collect();
+    let lines = identity_h_lines(
+        |doc| add_identity_h_subset_font(doc, &entries, Some(&gids), cid_widths()),
+        &lines,
+    );
+    assert_eq!(lines, ["Three", "Interest", "are"]);
+}
+
+#[test]
+fn test_a_repair_reads_a_lone_glyph_the_cmap_reads_as_a_control() {
+    // A CMap that maps the CID of `m` to a control character, which reads as
+    // a replacement character, and a CIDToGIDMap that sends that CID to a
+    // glyph index the CMap maps to `m`: the lone glyph's letter over the
+    // CMap's replacement character is evidence, and the repair reads it.
+    let text = "Stakeholder engagement";
+    let cid = |ch: char| 0x0100 + ch as u16;
+    let mut entries: Vec<(u16, char)> = text
+        .chars()
+        .map(|ch| (cid(ch), if ch == 'm' { '\u{0001}' } else { ch }))
+        .collect();
+    entries.push((0x0300, 'm'));
+    entries.sort();
+    entries.dedup();
+    let mut gids: Vec<u16> = (0..=0x0300).collect();
+    gids[usize::from(cid('m'))] = 0x0300;
+    let lines = identity_h_lines(
+        |doc| add_identity_h_subset_font(doc, &entries, Some(&gids), cid_widths()),
+        &[glyph_strings(text, cid)],
+    );
+    assert_eq!(lines, [text]);
+}
+
+#[test]
+fn test_subset_fonts_whose_cmap_misses_their_codes_still_read_through_the_repair() {
+    let text = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Pack my box with five dozen liquor jugs.",
+        "How vexingly quick daft zebras jump.",
+    ];
+    let mut chars: Vec<char> = text.concat().chars().collect();
+    chars.sort();
+    chars.dedup();
+    let index = |ch: char| chars.iter().position(|&c| c == ch).unwrap() as u16;
+
+    // A ToUnicode CMap keyed by glyph index, shown by CIDs the font's
+    // CIDToGIDMap sends to those glyphs: the CMap has no entry at any CID,
+    // and the repair reads every one.
+    let cid = |ch: char| 0x0100 + ch as u16;
+    let entries: Vec<(u16, char)> = chars.iter().map(|&ch| (3 + index(ch), ch)).collect();
+    let mut gids = vec![0u16; usize::from(cid('z')) + 1];
+    for &ch in &chars {
+        gids[usize::from(cid(ch))] = 3 + index(ch);
+    }
+    let lines: Vec<Vec<Vec<u16>>> = text.iter().map(|line| glyph_strings(line, cid)).collect();
+    let read = identity_h_lines(
+        |doc| add_identity_h_subset_font(doc, &entries, Some(&gids), cid_widths()),
+        &lines,
+    );
+    assert_eq!(read, text, "CIDToGIDMap repair");
+
+    // A subset renumbered its glyphs 1, 2, 3, … and kept the ToUnicode
+    // CMap of the whole font, keyed by the glyphs' old indexes: the width
+    // array covers the new glyphs only, and the codes read through the CMap
+    // renumbered in order.
+    let entries: Vec<(u16, char)> = chars.iter().map(|&ch| (0x0200 + index(ch), ch)).collect();
+    let sequential = |ch: char| 1 + index(ch);
+    let lines: Vec<Vec<Vec<u16>>> = text
+        .iter()
+        .map(|line| glyph_strings(line, sequential))
+        .collect();
+    let widths = vec![
+        0.into(),
+        vec![lopdf::Object::Integer(500); chars.len() + 1].into(),
+    ];
+    let read = identity_h_lines(
+        |doc| add_identity_h_subset_font(doc, &entries, None, widths),
+        &lines,
+    );
+    assert_eq!(read, text, "sequential remap");
+}
+
+#[test]
+fn test_renumbered_subset_whose_stale_cmap_collides_reads_common_words_through_the_repair() {
+    // A subset renumbered its glyphs and kept the whole font's ToUnicode
+    // CMap, whose old glyph indexes (3 onwards) overlap the new codes (1
+    // onwards): the stale CMap reads each new code as a letter two places
+    // back, as many letters as the repair reads, and the codes of `a` and
+    // `b` not at all. Each word is a string of its own, too few bytes for
+    // the font's decision, so each is read on its own: the repair's common
+    // words of three letters or more are evidence, and every word reads
+    // through the repair.
+    let words = [
+        "the", "and", "that", "for", "with", "from", "this", "are", "not", "our",
+    ];
+    let entries: Vec<(u16, char)> = ('a'..='z')
+        .map(|ch| (3 + (ch as u16 - 'a' as u16), ch))
+        .collect();
+    let code = |ch: char| 1 + (ch as u16 - 'a' as u16);
+    let lines: Vec<Vec<Vec<u16>>> = words
+        .iter()
+        .map(|word| vec![word.chars().map(code).collect()])
+        .collect();
+    let read = identity_h_lines(
+        |doc| {
+            add_identity_h_subset_font(
+                doc,
+                &entries,
+                None,
+                vec![0.into(), vec![lopdf::Object::Integer(500); 27].into()],
+            )
+        },
+        &lines,
+    );
+    assert_eq!(read, words);
+}
+
+#[test]
+fn test_renumbered_subset_collision_reads_short_common_words_of_longer_strings_through_the_repair()
+{
+    // The same renumbered subset, its stale CMap reading the space as `y`,
+    // over three lines of Italian, each a string of its own and too few
+    // bytes for the font's choice: a line is long enough for its short
+    // common words to count, and every line reads through the repair.
+    let line = "in un giorno di sole";
+    let mut entries: Vec<(u16, char)> = ('a'..='z')
+        .map(|ch| (3 + (ch as u16 - 'a' as u16), ch))
+        .collect();
+    entries.push((29, ' '));
+    let code = |ch: char| match ch {
+        ' ' => 27,
+        ch => 1 + (ch as u16 - 'a' as u16),
+    };
+    let lines: Vec<Vec<Vec<u16>>> = (0..3)
+        .map(|_| vec![line.chars().map(code).collect()])
+        .collect();
+    let read = identity_h_lines(
+        |doc| {
+            add_identity_h_subset_font(
+                doc,
+                &entries,
+                None,
+                vec![0.into(), vec![lopdf::Object::Integer(500); 28].into()],
+            )
+        },
+        &lines,
+    );
+    assert_eq!(read, [line; 3]);
+}
+
+#[test]
+fn test_renumbered_subset_collision_keeps_the_stale_reading_of_short_words_before_the_font_choice()
+{
+    // The price of not trusting short words: in the colliding renumbered
+    // subset, a word of one or two letters shown as a string of its own is
+    // no evidence for the repair, so `of`, `to`, `in` and `is` keep the
+    // stale CMap's letters until the font's choice (never made here, on so
+    // few bytes).
+    let words = ["of", "to", "in", "is"];
+    let entries: Vec<(u16, char)> = ('a'..='z')
+        .map(|ch| (3 + (ch as u16 - 'a' as u16), ch))
+        .collect();
+    let code = |ch: char| 1 + (ch as u16 - 'a' as u16);
+    let lines: Vec<Vec<Vec<u16>>> = words
+        .iter()
+        .map(|word| vec![word.chars().map(code).collect()])
+        .collect();
+    let read = identity_h_lines(
+        |doc| {
+            add_identity_h_subset_font(
+                doc,
+                &entries,
+                None,
+                vec![0.into(), vec![lopdf::Object::Integer(500); 27].into()],
+            )
+        },
+        &lines,
+    );
+    assert_eq!(read, ["md", "rm", "gl", "gq"]);
+}
+
+/// [`add_identity_h_subset_font`] with `program` embedded as the CID
+/// font's TrueType program (`/FontFile2`).
+fn add_identity_h_subset_font_with_program(
+    doc: &mut lopdf::Document,
+    entries: &[(u16, char)],
+    cid_to_gid: Option<&[u16]>,
+    widths: Vec<lopdf::Object>,
+    program: Vec<u8>,
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Stream};
+
+    let font_id = add_identity_h_subset_font(doc, entries, cid_to_gid, widths);
+    let program_id = doc.add_object(Stream::new(
+        dictionary! { "Length1" => program.len() as i64 },
+        program,
+    ));
+    let cid_font_id = doc
+        .get_dictionary(font_id)
+        .unwrap()
+        .get(b"DescendantFonts")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .as_reference()
+        .unwrap();
+    let descriptor_id = doc
+        .get_dictionary(cid_font_id)
+        .unwrap()
+        .get(b"FontDescriptor")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.get_dictionary_mut(descriptor_id)
+        .unwrap()
+        .set("FontFile2", program_id);
+    font_id
+}
+
+#[test]
+fn test_cid_keyed_cmap_under_a_renumbering_cid_to_gid_map_is_not_repaired() {
+    // A Latin subset as some producers write it: CIDs are the characters
+    // less 28 (the space at 4, `a` at 0x45), typographic punctuation sits
+    // at high CIDs, the ToUnicode CMap is keyed by CID, right as it is, and
+    // the CIDToGIDMap numbers the glyphs 1, 2, 3, … in CID order. The glyph
+    // indexes fall among the CMap's CIDs, so the CMap read through the map
+    // reads each code as another character. No program is embedded. Each
+    // quoted word is a string of its own, read before the font's choice,
+    // and read through the map it spells letters that outscore the
+    // quotation marks (`“me”` as `yaYz`).
+    let mut entries: Vec<(u16, char)> = Vec::new();
+    for (first, last, ch) in [
+        (0x04, 0x04, ' '),
+        (0x08, 0x1F, '$'),
+        (0x22, 0x22, '>'),
+        (0x24, 0x3F, '@'),
+        (0x41, 0x41, ']'),
+        (0x43, 0x43, '_'),
+        (0x45, 0x5E, 'a'),
+        (0x60, 0x60, '|'),
+        (0x62, 0x62, '~'),
+        (0x63, 0x63, '\u{00A0}'),
+        (0x6C, 0x6C, '©'),
+        (0x71, 0x71, '®'),
+        (0x73, 0x73, '°'),
+        (0x164, 0x165, '–'),
+        (0x166, 0x167, '‘'),
+        (0x169, 0x16A, '“'),
+        (0x16E, 0x16E, '•'),
+        (0x177, 0x177, '™'),
+    ] {
+        for (cid, ch) in (first..=last).zip(ch as u32..) {
+            entries.push((cid, char::from_u32(ch).unwrap()));
+        }
+    }
+    let mut gids = vec![0u16; 0x178];
+    for (glyph, &(cid, _)) in (1..).zip(&entries) {
+        gids[usize::from(cid)] = glyph;
+    }
+    let cid = |ch: char| entries.iter().find(|&&(_, c)| c == ch).unwrap().0;
+    let words = ["“me”", "“so”.", "“up”."];
+    let lines: Vec<Vec<Vec<u16>>> = words
+        .iter()
+        .map(|word| vec![word.chars().map(cid).collect()])
+        .collect();
+    let read = identity_h_lines(
+        |doc| {
+            add_identity_h_subset_font(
+                doc,
+                &entries,
+                Some(&gids),
+                vec![0.into(), vec![lopdf::Object::Integer(500); 0x178].into()],
+            )
+        },
+        &lines,
+    );
+    assert_eq!(read, words);
+}
+
+/// The ToUnicode entries of [`test_renumbering_look_alike_whose_program_reads_the_cmap_as_written_keeps_it`]
+/// and [`test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped`]:
+/// parentheses and digits from code 3, as a subset that kept its glyph
+/// indexes has them.
+const PARENTHESES_AND_DIGITS: [(u16, char, &str); 12] = [
+    (3, '(', "parenleft"),
+    (4, ')', "parenright"),
+    (5, '0', "zero"),
+    (6, '1', "one"),
+    (7, '2', "two"),
+    (8, '3', "three"),
+    (9, '4', "four"),
+    (10, '5', "five"),
+    (11, '6', "six"),
+    (12, '7', "seven"),
+    (13, '8', "eight"),
+    (14, '9', "nine"),
+];
+
+#[test]
+fn test_renumbering_look_alike_whose_program_reads_the_cmap_as_written_keeps_it() {
+    // A subset that kept its glyph indexes, under an Identity CIDToGIDMap,
+    // with a ToUnicode CMap from code 3 and a W array that gives glyphs 0
+    // to 2 their widths and leaves the rest to the default: the shape a
+    // subset that renumbered its glyphs and kept a stale CMap leaves. Its
+    // program names each glyph as the CMap reads its code, so the CMap is
+    // right and is not renumbered. Renumbered, `(2)(4)` would read as the
+    // digits `041061` and outscore the parentheses.
+    let entries: Vec<(u16, char)> = PARENTHESES_AND_DIGITS
+        .iter()
+        .map(|&(code, ch, _)| (code, ch))
+        .collect();
+    let names: Vec<(u16, &str)> = PARENTHESES_AND_DIGITS
+        .iter()
+        .map(|&(code, _, name)| (code, name))
+        .collect();
+    let code = |ch: char| entries.iter().find(|&&(_, c)| c == ch).unwrap().0;
+    let lines = vec![vec!["(2)(4)".chars().map(code).collect::<Vec<u16>>()]];
+    let read = identity_h_lines(
+        |doc| {
+            add_identity_h_subset_font_with_program(
+                doc,
+                &entries,
+                None,
+                vec![0.into(), vec![lopdf::Object::Integer(500); 3].into()],
+                minimal_truetype_subset_with(14, &names, &[]),
+            )
+        },
+        &lines,
+    );
+    assert_eq!(read, ["(2)(4)"]);
+}
+
+#[test]
+fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped() {
+    // The same stale CMap in a subset that did renumber its glyphs 1, 2,
+    // 3, … in the order of their old indexes: its program names glyph 1
+    // `(`, glyph 3 `0`, and the codes read through the renumbered CMap.
+    let entries: Vec<(u16, char)> = PARENTHESES_AND_DIGITS
+        .iter()
+        .map(|&(code, ch, _)| (code, ch))
+        .collect();
+    let names: Vec<(u16, &str)> = (1..)
+        .zip(&PARENTHESES_AND_DIGITS)
+        .map(|(glyph, &(_, _, name))| (glyph, name))
+        .collect();
+    let code = |ch: char| {
+        1 + PARENTHESES_AND_DIGITS
+            .iter()
+            .position(|&(_, c, _)| c == ch)
+            .unwrap() as u16
+    };
+    let lines = vec![vec!["(2)(4)".chars().map(code).collect::<Vec<u16>>()]];
+    let read = identity_h_lines(
+        |doc| {
+            add_identity_h_subset_font_with_program(
+                doc,
+                &entries,
+                None,
+                vec![0.into(), vec![lopdf::Object::Integer(500); 3].into()],
+                minimal_truetype_subset_with(12, &names, &[]),
+            )
+        },
+        &lines,
+    );
+    assert_eq!(read, ["(2)(4)"]);
 }
