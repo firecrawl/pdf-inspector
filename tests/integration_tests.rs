@@ -3283,6 +3283,72 @@ fn test_id_name_is_not_inline_image_data() {
     assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
 }
 
+#[test]
+fn lightweight_classification_preserves_ocr_routing() {
+    let scanned = GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let blank = GlyphLayerPage {
+        covering_image: false,
+        ..scanned
+    };
+    let text = GlyphLayerPage {
+        body_lines: 4,
+        ..blank
+    };
+    // Twelve pages exceed the default Sample(8). The mixed document has
+    // four text pages in the sample; the remaining sampled pages are scans.
+    for (name, pages, expected_type) in [
+        ("text", vec![text; 12], PdfType::TextBased),
+        ("scanned", vec![scanned; 12], PdfType::Scanned),
+        (
+            "hidden text",
+            vec![SCAN_WITH_INVISIBLE_LAYER; 12],
+            PdfType::ImageBased,
+        ),
+        (
+            "mixed",
+            (0..12)
+                .map(|i| if i < 4 { text } else { scanned })
+                .collect(),
+            PdfType::Mixed,
+        ),
+        ("blank", vec![blank; 12], PdfType::Scanned),
+    ] {
+        let buf = make_pdf_with_glyph_layer(&pages);
+        let lightweight = pdf_inspector::classify_pdf_mem(&buf).unwrap();
+        let detailed = detect_pdf_type_mem(&buf).unwrap();
+        assert_eq!(detailed.pdf_type, expected_type, "{name}");
+        assert_eq!(lightweight.pdf_type, detailed.pdf_type, "{name}");
+        assert_eq!(lightweight.page_count, detailed.page_count, "{name}");
+        assert_eq!(lightweight.confidence, detailed.confidence, "{name}");
+        assert_eq!(
+            lightweight.pages_needing_ocr,
+            detailed
+                .pages_needing_ocr
+                .iter()
+                .map(|page| page - 1)
+                .collect::<Vec<_>>(),
+            "{name}"
+        );
+        assert!(detailed.pages_sampled < detailed.page_count, "{name}");
+        for page in &detailed.pages_needing_ocr {
+            assert!(
+                !detailed.ocr_reasons_by_page[page].is_empty(),
+                "{name}: page {page}"
+            );
+            if name == "hidden text" {
+                assert_eq!(
+                    detailed.ocr_reasons_by_page[page],
+                    [OCR_REASON_INVISIBLE_TEXT_LAYER],
+                    "page {page}"
+                );
+            }
+        }
+    }
+}
+
 /// A document longer than classification's sample, whose one page with a
 /// hidden layer lies outside the sample: that page still reports
 /// `invisible_text_layer`, the other pages `scanned`.
