@@ -704,9 +704,10 @@ pub(super) fn merge_continuation_tables(
 /// The trimmed cells of one markdown table row, for comparing rows whose
 /// padding differs.
 fn table_row_cells(line: &str) -> Vec<String> {
-    line.trim()
-        .trim_matches('|')
-        .split('|')
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    line.split('|')
         .map(|cell| cell.trim().to_string())
         .collect()
 }
@@ -1766,6 +1767,9 @@ mod tests {
         merge_continuation_tables(&mut page_tables, &HashSet::from([1, 2, 3]));
 
         assert_eq!(page_tables.len(), 1);
+        // An empty edge cell is a cell, so `|| Region |` is not `| Region |`.
+        assert_eq!(table_row_cells("|| Region |"), ["", "Region"]);
+        assert_eq!(table_row_cells("| Region ||"), ["Region", ""]);
         assert_eq!(
             page_tables[&1][0].markdown,
             "| Item | Region |\n| --- | --- |\n| Widget 0 | XX |\n\
