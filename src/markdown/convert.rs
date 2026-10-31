@@ -664,15 +664,21 @@ pub(super) fn merge_continuation_tables(
         if !continuation_pages.is_empty() {
             // Collect data rows from continuation pages
             let mut extra_rows = String::new();
+            let first_header = first_tables[0].markdown.lines().next().map(table_row_cells);
             for &cont_page in &continuation_pages {
                 if let Some(tables) = page_tables.get(&cont_page) {
                     let table_md = &tables[0].markdown;
-                    // Skip header row (line 1) and separator row (line 2), keep the rest
+                    // Line 1 is the separator row and always goes. Line 0 goes
+                    // only when it repeats the first page's header: a page
+                    // without a repeated header starts with a data row.
                     for (line_idx, line) in table_md.lines().enumerate() {
-                        if line_idx >= 2 {
-                            extra_rows.push_str(line);
-                            extra_rows.push('\n');
+                        let repeated_header =
+                            line_idx == 0 && first_header.as_ref() == Some(&table_row_cells(line));
+                        if line_idx == 1 || repeated_header {
+                            continue;
                         }
+                        extra_rows.push_str(line);
+                        extra_rows.push('\n');
                     }
                 }
             }
@@ -693,6 +699,16 @@ pub(super) fn merge_continuation_tables(
             i += 1;
         }
     }
+}
+
+/// The trimmed cells of one markdown table row, for comparing rows whose
+/// padding differs.
+fn table_row_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
 }
 
 /// Count the number of columns in a markdown table by counting `|` in the separator row.
@@ -1720,6 +1736,42 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
 #[cfg(test)]
 mod tests {
+
+    fn table_page(markdown: &str) -> Vec<PositionedMarkdown> {
+        vec![PositionedMarkdown::new(
+            700.0,
+            72.0,
+            markdown.to_string(),
+            None,
+        )]
+    }
+
+    #[test]
+    fn continuation_table_keeps_its_first_row_unless_it_repeats_the_header() {
+        let mut page_tables = HashMap::new();
+        page_tables.insert(
+            1,
+            table_page("| Item | Region |\n| --- | --- |\n| Widget 0 | XX |\n"),
+        );
+        // No repeated header: the first line is data.
+        page_tables.insert(
+            2,
+            table_page("| Widget 1 | XX |\n| --- | --- |\n| Widget 2 | XX |\n"),
+        );
+        // Repeated header, padded differently.
+        page_tables.insert(
+            3,
+            table_page("|Item|  Region |\n| --- | --- |\n| Widget 3 | XX |\n"),
+        );
+        merge_continuation_tables(&mut page_tables, &HashSet::from([1, 2, 3]));
+
+        assert_eq!(page_tables.len(), 1);
+        assert_eq!(
+            page_tables[&1][0].markdown,
+            "| Item | Region |\n| --- | --- |\n| Widget 0 | XX |\n\
+             | Widget 1 | XX |\n| Widget 2 | XX |\n| Widget 3 | XX |\n"
+        );
+    }
 
     #[test]
     fn section_number_prefix_detection() {
