@@ -767,7 +767,9 @@ fn extract_positioned_text_impl(
                     !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
                 })
             });
-            let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            let coherent = (off.len() >= 10 || (off.len() >= 3 && wordy_chars >= 20))
+                && wordy_chars * 2 >= total_chars.max(1)
+                && !straddles;
             if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
                 let before = items.len();
                 items.retain(|it| !outside(it));
