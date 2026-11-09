@@ -1535,7 +1535,11 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
                     .get_object(ff_ref)
                     .and_then(Object::as_stream)
                     .ok()
-                    .and_then(|stream| stream.decompressed_content().ok())
+                    .and_then(|stream| {
+                        stream
+                            .decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
+                            .ok()
+                    })
                     .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
             {
                 return true;
@@ -1553,7 +1557,7 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content() {
+    let data = match stream.decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES) {
         Ok(d) => d,
         Err(_) => return false,
     };
@@ -1808,9 +1812,12 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    let Some(content) = content_resources::decoded_within(
+                        stream,
+                        crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES,
+                    ) else {
+                        continue;
+                    };
                     // Collect raw font names from this XObject's content stream.
                     // Every form bound is counted here, invoked or not, as
                     // the text and font tallies always have been; what the

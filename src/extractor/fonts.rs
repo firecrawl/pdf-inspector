@@ -2439,11 +2439,13 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
         .get_object(ff_ref)
         .and_then(lopdf::Object::as_stream)
         .ok()?;
-    Some(
-        stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone()),
-    )
+    let limit = crate::MAX_STREAM_DECOMPRESSED_BYTES;
+    match stream.decompressed_content_with_limit(limit) {
+        Ok(data) => Some(data),
+        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => None,
+        Err(_) if stream.content.len() > limit => None,
+        Err(_) => Some(stream.content.clone()),
+    }
 }
 
 /// One reading of a string through a two-byte CMap: the text, the number
