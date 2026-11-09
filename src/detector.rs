@@ -908,6 +908,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // and resolve font names per-XObject scope.
     if let Some((resource_dict, resource_ids)) = page_resources {
         let mut visited = HashSet::new();
+        let mut remaining_bytes = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
             counts.add(scan_xobjects_in_resources(
@@ -917,6 +918,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
+                &mut remaining_bytes,
             ));
         }
         for resource_id in resource_ids {
@@ -929,6 +931,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
+                    &mut remaining_bytes,
                 ));
             }
         }
@@ -1536,9 +1539,10 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
                     .and_then(Object::as_stream)
                     .ok()
                     .and_then(|stream| {
-                        stream
-                            .decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
-                            .ok()
+                        crate::extractor::content_decode::decompressed_within(
+                            stream,
+                            crate::MAX_STREAM_DECOMPRESSED_BYTES,
+                        )
                     })
                     .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
             {
@@ -1557,9 +1561,12 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let data = match crate::extractor::content_decode::decompressed_within(
+        stream,
+        crate::MAX_STREAM_DECOMPRESSED_BYTES,
+    ) {
+        Some(d) => d,
+        None => return false,
     };
     let face = match ttf_parser::Face::parse(&data, 0) {
         Ok(f) => f,
@@ -1785,6 +1792,7 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
+    remaining_bytes: &mut usize,
 ) -> ContentCounts {
     let mut counts = ContentCounts::default();
 
@@ -1812,12 +1820,11 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let Some(content) = content_resources::decoded_within(
-                        stream,
-                        crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES,
-                    ) else {
+                    let Some(content) = content_resources::decoded_within(stream, *remaining_bytes)
+                    else {
                         continue;
                     };
+                    *remaining_bytes = remaining_bytes.saturating_sub(content.len());
                     // Collect raw font names from this XObject's content stream.
                     // Every form bound is counted here, invoked or not, as
                     // the text and font tallies always have been; what the
@@ -1863,6 +1870,7 @@ fn scan_xobjects_in_resources(
                             unique_chars,
                             used_font_ids,
                             font_map,
+                            remaining_bytes,
                         ));
                     }
                 }

@@ -1905,12 +1905,14 @@ fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Opti
         Object::Name(n) if n.as_slice() == b"Identity" => None,
         Object::Reference(r) => match doc.get_object(*r) {
             Ok(Object::Stream(s)) => {
-                parse_cid_to_gid_stream(&s.decompressed_content_with_limit(limit).ok()?)
+                let data = crate::extractor::content_decode::decompressed_within(s, limit)?;
+                parse_cid_to_gid_stream(&data)
             }
             _ => None,
         },
         Object::Stream(s) => {
-            parse_cid_to_gid_stream(&s.decompressed_content_with_limit(limit).ok()?)
+            let data = crate::extractor::content_decode::decompressed_within(s, limit)?;
+            parse_cid_to_gid_stream(&data)
         }
         _ => None,
     }
@@ -2740,10 +2742,12 @@ fn build_encoding_cmap_from_font(
             let obj = doc.get_object(*r).ok()?;
             parse_encoding_cmap_object(obj, doc)
         }
-        Object::Stream(s) => parse_encoding_cmap_stream(
-            &s.decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
-                .ok()?,
-        ),
+        Object::Stream(s) => {
+            parse_encoding_cmap_stream(&crate::extractor::content_decode::decompressed_within(
+                s,
+                crate::MAX_STREAM_DECOMPRESSED_BYTES,
+            )?)
+        }
         Object::Dictionary(_) => None,
         _ => None,
     }
@@ -2751,10 +2755,12 @@ fn build_encoding_cmap_from_font(
 
 fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCMap> {
     match obj {
-        Object::Stream(s) => parse_encoding_cmap_stream(
-            &s.decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
-                .ok()?,
-        ),
+        Object::Stream(s) => {
+            parse_encoding_cmap_stream(&crate::extractor::content_decode::decompressed_within(
+                s,
+                crate::MAX_STREAM_DECOMPRESSED_BYTES,
+            )?)
+        }
         Object::Reference(r) => {
             let obj = doc.get_object(*r).ok()?;
             parse_encoding_cmap_object(obj, doc)
@@ -3338,15 +3344,8 @@ impl FontCMaps {
                 Err(_) => continue,
             };
             let limit = crate::MAX_STREAM_DECOMPRESSED_BYTES;
-            let data = match stream.decompressed_content_with_limit(limit) {
-                Ok(d) => d,
-                Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
-                    ..
-                })) => continue,
-                Err(_) if stream.content.len() > limit => continue,
-                Err(_) => stream.content.clone(),
-            };
-            if let Some(cmap) = ToUnicodeCMap::parse(&data) {
+            let data = crate::extractor::content_decode::decompressed_within(stream, limit);
+            if let Some(cmap) = data.as_deref().and_then(ToUnicodeCMap::parse) {
                 debug!(
                     "CMap obj={:<6} code_byte_length={} char_map={} ranges={}",
                     obj_num,
@@ -3497,14 +3496,7 @@ impl FontCMaps {
             let font_data = font_file_ref.and_then(|ff_ref| {
                 let stream = doc.get_object(ff_ref).and_then(Object::as_stream).ok()?;
                 let limit = crate::MAX_STREAM_DECOMPRESSED_BYTES;
-                match stream.decompressed_content_with_limit(limit) {
-                    Ok(d) => Some(d),
-                    Err(lopdf::Error::Decompress(
-                        lopdf::DecompressError::MemoryLimitExceeded { .. },
-                    )) => None,
-                    Err(_) if stream.content.len() > limit => None,
-                    Err(_) => Some(stream.content.clone()),
-                }
+                crate::extractor::content_decode::decompressed_within(stream, limit)
             });
             if let Some(data) = font_data.as_deref() {
                 if let Some(cmap) = build_cmap_from_truetype(data) {
@@ -3656,9 +3648,10 @@ impl FontCMaps {
                 continue;
             }
             if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-                if let Ok(data) =
-                    stream.decompressed_content_with_limit(crate::MAX_STREAM_DECOMPRESSED_BYTES)
-                {
+                if let Some(data) = crate::extractor::content_decode::decompressed_within(
+                    stream,
+                    crate::MAX_STREAM_DECOMPRESSED_BYTES,
+                ) {
                     if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
                         debug!(
                             "Simple font cmap obj={:<6} (embedded font) char_map={}",

@@ -4370,15 +4370,18 @@ fn finish_loaded_document(
 /// Per-stream decompression budget applied while loading (object streams and
 /// xref streams), and the bound within which the detector reads a font's
 /// ToUnicode CMap (`detector::font_decoder`), object streams are read again
-/// for overlong numerals (`overlong_numerals`), and a CID font's embedded
+/// for overlong numerals (`overlong_numerals`), a CID font's embedded
 /// program is read to tell whether its subset was renumbered
-/// (`tounicode::try_remap_subset_cmap`): none of those streams costs more
-/// than a stream the loader materializes, and changing the bound changes
-/// them all. Some tagged PDFs pack their structure tree into object
-/// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
-/// materializes every object stream eagerly at load, so without a bound one
-/// such document exhausts memory before any of our code runs. lopdf skips an
-/// object stream that would exceed the bound (its objects resolve as
+/// (`tounicode::try_remap_subset_cmap`), and font/CMap streams are read
+/// across `tounicode` (CIDToGIDMap, encoding CMaps, and `FontCMaps`),
+/// `detector` (Mac glyph order and `embedded_font_has_cmap`), and
+/// `extractor` (`fonts::font_file_data`, inline ToUnicode): none of those
+/// streams costs more than a stream the loader materializes, and changing
+/// the bound changes them all. Some tagged PDFs pack their structure tree
+/// into object streams that inflate to hundreds of MB each from a ~20MB file;
+/// lopdf materializes every object stream eagerly at load, so without a bound
+/// one such document exhausts memory before any of our code runs. lopdf skips
+/// an object stream that would exceed the bound (its objects resolve as
 /// not-found), which the zero-page check in `load_document_from_mem_with_password`
 /// turns into a load error instead of a silently wrong answer.
 pub(crate) const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;

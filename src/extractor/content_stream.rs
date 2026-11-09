@@ -543,15 +543,9 @@ pub(crate) fn extract_page_text_items_with_options(
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
                     let limit = crate::MAX_STREAM_DECOMPRESSED_BYTES;
-                    let data = match s.decompressed_content_with_limit(limit) {
-                        Ok(data) => Some(data),
-                        Err(lopdf::Error::Decompress(
-                            lopdf::DecompressError::MemoryLimitExceeded { .. },
-                        )) => None,
-                        Err(_) if s.content.len() > limit => None,
-                        Err(_) => Some(s.content.clone()),
-                    };
-                    if let Some(data) = data {
+                    if let Some(data) =
+                        crate::extractor::content_decode::decompressed_within(s, limit)
+                    {
                         if let Some(entry) =
                             crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                         {

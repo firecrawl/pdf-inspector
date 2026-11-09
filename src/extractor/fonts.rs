@@ -2440,12 +2440,7 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
         .and_then(lopdf::Object::as_stream)
         .ok()?;
     let limit = crate::MAX_STREAM_DECOMPRESSED_BYTES;
-    match stream.decompressed_content_with_limit(limit) {
-        Ok(data) => Some(data),
-        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => None,
-        Err(_) if stream.content.len() > limit => None,
-        Err(_) => Some(stream.content.clone()),
-    }
+    super::content_decode::decompressed_within(stream, limit)
 }
 
 /// One reading of a string through a two-byte CMap: the text, the number
