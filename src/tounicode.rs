@@ -1897,6 +1897,13 @@ fn w_array_lookup(
     None
 }
 
+fn cid_to_gid_stream_data(stream: &lopdf::Stream, limit: usize) -> Option<Vec<u8>> {
+    if stream.dict.get(b"Filter").is_err() {
+        return (stream.content.len() <= limit).then(|| stream.content.clone());
+    }
+    stream.decompressed_content_with_limit(limit).ok()
+}
+
 /// Extract CIDToGIDMap as a vector of GIDs (u16) indexed by CID.
 fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u16>> {
     let obj = cid_font_dict.get(b"CIDToGIDMap").ok()?;
@@ -1905,13 +1912,13 @@ fn get_cid_to_gid_map(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> Opti
         Object::Name(n) if n.as_slice() == b"Identity" => None,
         Object::Reference(r) => match doc.get_object(*r) {
             Ok(Object::Stream(s)) => {
-                let data = crate::extractor::content_decode::decompressed_within(s, limit)?;
+                let data = cid_to_gid_stream_data(s, limit)?;
                 parse_cid_to_gid_stream(&data)
             }
             _ => None,
         },
         Object::Stream(s) => {
-            let data = crate::extractor::content_decode::decompressed_within(s, limit)?;
+            let data = cid_to_gid_stream_data(s, limit)?;
             parse_cid_to_gid_stream(&data)
         }
         _ => None,
@@ -5465,6 +5472,33 @@ endbfrange
         let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 791, || None);
         assert!(remapped.is_none());
         assert_eq!(primary.lookup(0x45), Some("a".to_string()));
+    }
+
+    #[test]
+    fn cidtogidmap_with_failed_filter_decompression_returns_none() {
+        let mut doc = Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Filter", lopdf::Object::Name(b"FlateDecode".to_vec()));
+        let corrupted_bytes = vec![0x12, 0x34, 0x56, 0x78];
+        let stream_id = doc.add_object(lopdf::Stream::new(dict, corrupted_bytes));
+
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("CIDToGIDMap", lopdf::Object::Reference(stream_id));
+
+        assert!(get_cid_to_gid_map(&cid_font, &doc).is_none());
+    }
+
+    #[test]
+    fn cidtogidmap_without_filter_reads_raw_bytes() {
+        let mut doc = Document::new();
+        let dict = lopdf::Dictionary::new();
+        let raw_bytes = vec![0x00, 0x01, 0x00, 0x02];
+        let stream_id = doc.add_object(lopdf::Stream::new(dict, raw_bytes));
+
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("CIDToGIDMap", lopdf::Object::Reference(stream_id));
+
+        assert_eq!(get_cid_to_gid_map(&cid_font, &doc), Some(vec![1, 2]));
     }
 
     #[test]
