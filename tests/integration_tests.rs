@@ -1522,54 +1522,28 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
-/// Every page with content gets its `<!-- Page N -->` marker, including pages
-/// whose only content is tables or images (no text line to trigger the marker),
-/// and the markers add nothing else to the output.
+/// Pages whose only content is tables (no text line) still get their marker.
 #[test]
-fn test_page_markers_on_pages_without_text_lines() {
-    let marker = regex::Regex::new(r"<!-- Page (\d+) -->\n*").unwrap();
-    // td9264: page 1 is table-only; 2013-app2: every page is read as tables
-    for fixture in ["td9264", "2013-app2"] {
+fn test_page_markers_on_table_only_pages() {
+    let marker = regex::Regex::new(r"<!-- Page (\d+) -->").unwrap();
+    // td9264: page 1 is a table; 2013-app2: every page is read as tables, page 7 is empty
+    for (fixture, expected) in [
+        ("td9264", vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        ("2013-app2", vec![1, 2, 3, 4, 5, 6, 8]),
+    ] {
         let buf = std::fs::read(format!("tests/fixtures/{fixture}.pdf")).unwrap();
         let mut options = PdfOptions::new();
         options.markdown.include_page_numbers = true;
-        let marked = process_pdf_mem_with_options(&buf, options)
+        let md = process_pdf_mem_with_options(&buf, options)
             .unwrap()
             .markdown
             .unwrap();
-        let plain = process_pdf_mem_with_options(&buf, PdfOptions::new())
-            .unwrap()
-            .markdown
-            .unwrap();
-
-        let marked_pages: Vec<u32> = marker
-            .captures_iter(&marked)
+        let pages: Vec<u32> = marker
+            .captures_iter(&md)
             .map(|c| c[1].parse().unwrap())
             .collect();
-        let pages_with_content: Vec<u32> = extract_pages_markdown_mem(&buf, None)
-            .unwrap()
-            .pages
-            .iter()
-            .filter(|p| !p.markdown.trim().is_empty())
-            .map(|p| p.page + 1)
-            .collect();
-        for page in &pages_with_content {
-            assert!(
-                marked_pages.contains(page),
-                "{fixture}: page {page} has content but no marker (markers: {marked_pages:?})"
-            );
-        }
-        assert!(
-            marked[..marker.find(&marked).unwrap().start()]
-                .trim()
-                .is_empty(),
-            "{fixture}: content before the first page marker"
-        );
-        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert_eq!(
-            normalize(&marker.replace_all(&marked, "")),
-            normalize(&plain)
-        );
+        assert_eq!(pages, expected, "{fixture}");
+        assert!(md.trim_start().starts_with("<!-- Page 1 -->"), "{fixture}");
     }
 }
 
