@@ -1544,6 +1544,11 @@ fn test_page_markers_on_table_only_pages() {
             .collect();
         assert_eq!(pages, expected, "{fixture}");
         assert!(md.trim_start().starts_with("<!-- Page 1 -->"), "{fixture}");
+        // A marker written after its page's content would leave the last section empty
+        assert!(
+            marker.split(&md).skip(1).all(|s| !s.trim().is_empty()),
+            "{fixture}: empty page section"
+        );
     }
 }
 
