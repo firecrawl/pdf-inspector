@@ -11,6 +11,12 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- A page or Form XObject over the 1,000,000-operator cap is read again
+  without its path construction, painting and clipping operators, and its
+  text is extracted when that brings it under the cap. A CAD sheet drawn
+  from a million line segments returned no text at all. Such a page loses
+  its rectangles, lines and clipping; a stream still over the cap without
+  its paths is skipped as before.
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
   read through the Windows variant of the standard glyph order. That

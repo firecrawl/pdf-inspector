@@ -4625,6 +4625,18 @@ end"#;
         );
     }
 
+    #[test]
+    fn text_over_a_drawing_past_the_operator_cap_is_extracted() {
+        let segments = super::super::content_decode::MAX_PAGE_OPERATIONS / 3 + 1;
+        let mut content = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET\n".to_vec();
+        for _ in 0..segments {
+            content.extend_from_slice(b"0 0 m 10 10 l S\n");
+        }
+        let items = extract_simple_items(&content);
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["Hello"]);
+    }
+
     // ── Rotated-run geometry ─────────────────────────────────────────────
 
     const UPRIGHT_BODY: &str = "BT /F1 12 Tf 72 700 Td (Body line one) Tj ET

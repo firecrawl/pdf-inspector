@@ -3,7 +3,8 @@
 //! `lopdf::content::Content::decode` materializes every operator before any
 //! caller can apply a limit. A compact page of `q Q` pairs can therefore
 //! allocate hundreds of megabytes and abort. Count operators first (without
-//! allocating `Operation` objects) and skip decode when the cap is exceeded.
+//! allocating `Operation` objects) and skip decode when the cap is exceeded,
+//! after trying the stream without its path operators.
 
 use crate::PdfError;
 use lopdf::content::Content;
@@ -19,20 +20,41 @@ pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
 /// runs a few MB at most; the bound is deliberately far above that.
 pub(crate) const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Path construction, painting and clipping operators (ISO 32000-1, tables
+/// 59 to 61). Text is placed, coloured and shown without any of them.
+const PATH_OPERATORS: [&[u8]; 19] = [
+    b"m", b"l", b"c", b"v", b"y", b"h", b"re", b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b",
+    b"b*", b"n", b"W", b"W*",
+];
+
 /// Decode `data` unless it contains more than `max_operations` operators.
 ///
-/// Returns `Ok(None)` when the stream exceeds the cap, so callers can skip
-/// extraction without first allocating the operation vector.
+/// A stream over the cap is decoded without its path operators when that
+/// brings it under the cap: the drawing of a CAD sheet or a map can run to
+/// millions of line segments, and its text is read from the operators that
+/// are left. Its rectangles and lines are lost, and so is its clipping.
+///
+/// Returns `Ok(None)` when the stream exceeds the cap even so, so callers
+/// can skip extraction without first allocating the operation vector.
 pub(crate) fn decode_content_bounded(
     data: &[u8],
     max_operations: usize,
 ) -> Result<Option<Content>, PdfError> {
-    if content_exceeds_operation_limit(data, max_operations) {
+    if !content_exceeds_operation_limit(data, max_operations) {
+        return decode(data).map(Some);
+    }
+    let without_paths = strip_path_operators(data);
+    if content_exceeds_operation_limit(&without_paths, max_operations) {
         return Ok(None);
     }
-    Content::decode(data)
-        .map(Some)
-        .map_err(|e| PdfError::Parse(e.to_string()))
+    log::warn!(
+        "content stream exceeds {max_operations} operations; reading it without its path operators"
+    );
+    decode(&without_paths).map(Some)
+}
+
+fn decode(data: &[u8]) -> Result<Content, PdfError> {
+    Content::decode(data).map_err(|e| PdfError::Parse(e.to_string()))
 }
 
 fn content_exceeds_operation_limit(data: &[u8], max_operations: usize) -> bool {
@@ -44,53 +66,74 @@ fn content_exceeds_operation_limit(data: &[u8], max_operations: usize) -> bool {
 fn count_content_operators(data: &[u8], limit: usize) -> usize {
     let mut i = 0;
     let mut count = 0;
-    while i < data.len() && count < limit {
-        skip_content_space(data, &mut i);
-        if i >= data.len() {
+    while count < limit && next_operator(data, &mut i).is_some() {
+        count += 1;
+    }
+    count
+}
+
+/// `data` without its path operators and their operands.
+fn strip_path_operators(data: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(data.len());
+    let mut start = 0;
+    let mut i = 0;
+    while let Some(operator) = next_operator(data, &mut i) {
+        if !PATH_OPERATORS.contains(&operator) {
+            kept.extend_from_slice(&data[start..i]);
+            kept.push(b'\n');
+        }
+        start = i;
+    }
+    kept
+}
+
+/// Move `i` past the next operator, its operands and, for `BI`, its inline
+/// image, and return the operator; `None` once `data` has no more.
+fn next_operator<'a>(data: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    while *i < data.len() {
+        skip_content_space(data, i);
+        if *i >= data.len() {
             break;
         }
-        if data[i] == b'%' {
-            skip_comment(data, &mut i);
-            continue;
-        }
-        match data[i] {
-            b'(' => i = skip_literal_string(data, i),
+        match data[*i] {
+            b'%' => skip_comment(data, i),
+            b'(' => *i = skip_literal_string(data, *i),
             b'<' => {
-                if data.get(i + 1) == Some(&b'<') {
-                    i += 2;
+                if data.get(*i + 1) == Some(&b'<') {
+                    *i += 2;
                 } else {
-                    i = skip_hex_string(data, i);
+                    *i = skip_hex_string(data, *i);
                 }
             }
             b'>' => {
-                i += 1;
-                if data.get(i) == Some(&b'>') {
-                    i += 1;
+                *i += 1;
+                if data.get(*i) == Some(&b'>') {
+                    *i += 1;
                 }
             }
-            b'[' | b']' => i += 1,
-            b'/' => skip_name(data, &mut i),
-            b'+' | b'-' | b'.' => skip_number(data, &mut i),
-            b if b.is_ascii_digit() => skip_number(data, &mut i),
+            b'[' | b']' => *i += 1,
+            b'/' => skip_name(data, i),
+            b'+' | b'-' | b'.' => skip_number(data, i),
+            b if b.is_ascii_digit() => skip_number(data, i),
             b if is_operator_byte(b) => {
-                let start = i;
-                i += 1;
-                while i < data.len() && is_operator_byte(data[i]) {
-                    i += 1;
+                let start = *i;
+                *i += 1;
+                while *i < data.len() && is_operator_byte(data[*i]) {
+                    *i += 1;
                 }
-                let token = &data[start..i];
+                let token = &data[start..*i];
                 if token == b"true" || token == b"false" || token == b"null" {
                     continue;
                 }
-                count += 1;
-                if token == b"BI" && (i >= data.len() || is_content_space(data[i])) {
-                    i = skip_inline_image_after_bi(data, i);
+                if token == b"BI" && (*i >= data.len() || is_content_space(data[*i])) {
+                    *i = skip_inline_image_after_bi(data, *i);
                 }
+                return Some(token);
             }
-            _ => i += 1,
+            _ => *i += 1,
         }
     }
-    count
+    None
 }
 
 fn is_content_space(b: u8) -> bool {
@@ -287,6 +330,46 @@ mod tests {
         assert!(decode_content_bounded(&data, 10).unwrap().is_none());
         let decoded = decode_content_bounded(&data, 50).unwrap().unwrap();
         assert_eq!(decoded.operations.len(), 40);
+    }
+
+    fn operator_names(content: &Content) -> Vec<&str> {
+        content
+            .operations
+            .iter()
+            .map(|op| op.operator.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn path_operators_are_stripped_with_their_operands() {
+        let data = b"q 1 0 0 1 10 10 cm 0 0 m 10 10 l 5 5 15 15 20 20 c h S \
+            0 0 5 5 re W n 1 0 0 rg 0 0 5 5 re f* \
+            BT /F1 12 Tf 72 720 Td (m l re S) Tj ET \
+            BI /W 1 /H 1 ID \xff EI Q";
+        let stripped = Content::decode(&strip_path_operators(data)).unwrap();
+        assert_eq!(
+            operator_names(&stripped),
+            ["q", "cm", "rg", "BT", "Tf", "Td", "Tj", "ET", "BI", "Q"]
+        );
+        assert_eq!(
+            stripped.operations[6].operands[0].as_str().unwrap(),
+            b"m l re S"
+        );
+        assert_eq!(stripped.operations[1].operands.len(), 6);
+    }
+
+    #[test]
+    fn drawing_over_the_cap_is_decoded_without_its_paths() {
+        let mut data = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET\n".to_vec();
+        for _ in 0..20 {
+            data.extend_from_slice(b"0 0 m 10 10 l S\n");
+        }
+        let decoded = decode_content_bounded(&data, 10).unwrap().unwrap();
+        assert_eq!(operator_names(&decoded), ["BT", "Tf", "Td", "Tj", "ET"]);
+
+        // Text and state alone over the cap are still skipped.
+        data.extend_from_slice(b"q Q q Q q Q\n");
+        assert!(decode_content_bounded(&data, 10).unwrap().is_none());
     }
 
     #[test]
