@@ -341,11 +341,31 @@ pub fn extract_text_with_positions_and_rotations_mem_with_options(
 ) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
-    let font_cmaps = FontCMaps::from_doc(&doc);
+    positions_and_rotations_from_doc(&doc, page_filter, options)
+}
+
+/// [`extract_text_with_positions_mem_with_options`] on a document loaded
+/// with [`load_document_mem`](crate::load_document_mem), for a caller that
+/// also reads the document itself (its outline, its page boxes) or runs
+/// detection on it, and so parses the file once.
+pub fn extract_text_with_positions_from_doc(
+    doc: &Document,
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<Vec<TextItem>, PdfError> {
+    positions_and_rotations_from_doc(doc, page_filter, options).map(|(items, _)| items)
+}
+
+fn positions_and_rotations_from_doc(
+    doc: &Document,
+    page_filter: Option<&HashSet<u32>>,
+    options: PositionOptions,
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
+    let font_cmaps = FontCMaps::from_doc(doc);
     let ((mut items, _rects, _lines), _thresholds, _gid_pages, page_rotations, _cmap_coverage) =
-        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter, options)?;
+        extract_positioned_text_from_doc_in_page_box(doc, &font_cmaps, page_filter, options)?;
     if options.frame == PositionFrame::Display {
-        display_frame::document_items_to_display_frame(&doc, &mut items, &page_rotations);
+        display_frame::document_items_to_display_frame(doc, &mut items, &page_rotations);
     }
     Ok((items, page_rotations))
 }

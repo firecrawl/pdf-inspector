@@ -11060,3 +11060,60 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
     );
     assert_eq!(read, ["(2)(4)"]);
 }
+
+#[test]
+fn test_from_doc_functions_read_a_loaded_document_like_the_mem_functions() {
+    use pdf_inspector::{
+        detect_pdf_type_from_doc, extract_text_with_positions_from_doc, load_document_mem,
+    };
+
+    let buf = make_text_pdf("BT /F1 12 Tf 72 700 Td (Parsed once) Tj ET", "0 0 612 792");
+    let doc = load_document_mem(&buf, None).unwrap();
+
+    let options = PositionOptions::new().frame(PositionFrame::Display);
+    assert_same_geometry(
+        &extract_text_with_positions_mem_with_options(&buf, None, options).unwrap(),
+        &extract_text_with_positions_from_doc(&doc, None, options).unwrap(),
+    );
+
+    let config = DetectionConfig {
+        strategy: ScanStrategy::Full,
+        ..DetectionConfig::default()
+    };
+    let from_mem = detect_pdf_type_mem_with_config(&buf, config.clone()).unwrap();
+    let from_doc = detect_pdf_type_from_doc(&doc, config).unwrap();
+    assert_eq!(
+        (
+            from_doc.pdf_type,
+            from_doc.page_count,
+            from_doc.pages_needing_ocr
+        ),
+        (
+            from_mem.pdf_type,
+            from_mem.page_count,
+            from_mem.pages_needing_ocr
+        )
+    );
+
+    // The document stays the caller's to read, through the re-exported lopdf.
+    let pages: std::collections::BTreeMap<u32, pdf_inspector::lopdf::ObjectId> = doc.get_pages();
+    assert_eq!(pages.len(), 1);
+}
+
+#[test]
+fn test_load_document_mem_checks_the_header_and_decrypts() {
+    use pdf_inspector::{extract_text_with_positions_from_doc, load_document_mem};
+
+    assert!(matches!(
+        load_document_mem(b"plain text, not a PDF", None),
+        Err(PdfError::NotAPdf(_))
+    ));
+    let encrypted = std::fs::read("tests/fixtures/encrypted-secret123.pdf").unwrap();
+    assert!(matches!(
+        load_document_mem(&encrypted, None),
+        Err(PdfError::Encrypted)
+    ));
+    let doc = load_document_mem(&encrypted, Some("secret123")).unwrap();
+    let items = extract_text_with_positions_from_doc(&doc, None, PositionOptions::new()).unwrap();
+    assert!(items.iter().any(|item| !item.text.trim().is_empty()));
+}

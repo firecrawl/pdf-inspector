@@ -52,18 +52,23 @@ pub mod vision;
 mod xref_repair;
 
 pub use detector::{
-    detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
-    detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
+    detect_pdf_type, detect_pdf_type_from_doc, detect_pdf_type_mem,
+    detect_pdf_type_mem_with_config, detect_pdf_type_with_config, DetectionConfig, PdfType,
+    PdfTypeResult, ScanStrategy,
 };
 pub use extractor::geometry::PageRotation;
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rotations_mem,
     extract_text_with_positions_and_rotations_mem_in_frame,
-    extract_text_with_positions_and_rotations_mem_with_options, extract_text_with_positions_mem,
+    extract_text_with_positions_and_rotations_mem_with_options,
+    extract_text_with_positions_from_doc, extract_text_with_positions_mem,
     extract_text_with_positions_mem_in_frame, extract_text_with_positions_mem_with_options,
     extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
     PositionFrame, PositionOptions,
 };
+/// The `lopdf` the `_from_doc` functions take their [`Document`] from, so a
+/// caller reads the document with the same version.
+pub use lopdf;
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
@@ -4187,6 +4192,15 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
     let item_height = (item_y_max - item_y_min).max(0.1);
 
     x_overlap / item_width >= 0.6 && y_overlap / item_height >= 0.6
+}
+
+/// Load a PDF from memory the way the `_mem` functions do (the header check,
+/// the container and object repairs, decryption with `password` or the empty
+/// one), for the `_from_doc` functions and for a caller that reads the
+/// document itself.
+pub fn load_document_mem(buffer: &[u8], password: Option<&str>) -> Result<Document, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    load_document_from_mem_with_password(buffer, password).map(|(doc, _)| doc)
 }
 
 // =========================================================================
