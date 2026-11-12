@@ -9,6 +9,13 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `PositionOptions::include_invisible` keeps invisible (render mode 3)
+  text in the positioned-text and region functions, such as the OCR layer
+  a scanner writes behind a page image. Its items carry `render_mode`
+  `Some(3)`. Off by default, so the output is unchanged without it.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that

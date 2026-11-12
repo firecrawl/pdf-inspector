@@ -8077,6 +8077,51 @@ fn test_bold_from_weight_reads_bold_from_600_and_merges_by_the_verdict() {
         .contains("Light Medium Heavy"));
 }
 
+#[test]
+fn test_include_invisible_keeps_a_hidden_layer_and_is_off_by_default() {
+    // A visible line over a hidden one, as an OCR tool writes a scan's text
+    // layer under a line the page also shows.
+    let buf = make_text_pdf(
+        "BT /F1 12 Tf 72 700 Td (Visible line) Tj ET\n\
+         BT 3 Tr /F1 12 Tf 72 680 Td (Hidden layer) Tj ET",
+        "0 0 612 792",
+    );
+    let texts = |items: &[TextItem]| -> Vec<(String, Option<u8>)> {
+        items
+            .iter()
+            .map(|item| (item.text.trim().to_string(), item.render_mode))
+            .collect()
+    };
+
+    let plain = extract_text_with_positions_mem(&buf).unwrap();
+    assert_eq!(texts(&plain), [("Visible line".to_string(), Some(0))]);
+    let defaults =
+        extract_text_with_positions_mem_with_options(&buf, None, PositionOptions::new()).unwrap();
+    assert_eq!(texts(&defaults), texts(&plain));
+
+    let options = PositionOptions::new().include_invisible(true);
+    let with_layer = extract_text_with_positions_mem_with_options(&buf, None, options).unwrap();
+    assert_eq!(
+        texts(&with_layer),
+        [
+            ("Visible line".to_string(), Some(0)),
+            ("Hidden layer".to_string(), Some(3)),
+        ]
+    );
+    let (rotated, _) =
+        extract_text_with_positions_and_rotations_mem_with_options(&buf, None, options).unwrap();
+    assert_eq!(texts(&rotated), texts(&with_layer));
+
+    // The region functions read the layer only on a page without visible
+    // text by default, and on every page with the option.
+    let region = [60.0, 792.0 - 692.0, 400.0, 792.0 - 676.0];
+    let plain_region = extract_text_in_regions_mem(&buf, &[(0, vec![region])]).unwrap();
+    assert_eq!(plain_region[0].regions[0].text.trim(), "");
+    let layer_region =
+        extract_text_in_regions_mem_with_options(&buf, &[(0, vec![region])], options).unwrap();
+    assert_eq!(layer_region[0].regions[0].text.trim(), "Hidden layer");
+}
+
 // =========================================================================
 // Font metadata faces: bold provenance, weight class and fixed pitch
 // =========================================================================

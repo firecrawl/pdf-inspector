@@ -1288,7 +1288,7 @@ pub fn extract_text_in_regions_mem_with_options(
             page_id,
             *page_num,
             &font_cmaps,
-            options.text_extraction(false),
+            options.text_extraction(),
             &mut style_cache,
             &mut form_budget,
         )?;
@@ -1323,7 +1323,7 @@ pub fn extract_text_in_regions_mem_with_options(
                 page_id,
                 *page_num,
                 &font_cmaps,
-                options.text_extraction(true),
+                options.include_invisible(true).text_extraction(),
                 &mut style_cache,
                 &mut form_budget,
             ) {
@@ -1537,7 +1537,7 @@ pub fn extract_tables_in_regions_mem_with_options(
             page_id,
             *page_num,
             &font_cmaps,
-            options.text_extraction(false),
+            options.text_extraction(),
             &mut style_cache,
             &mut extractor::FormWalkBudget::new(),
         )?;
