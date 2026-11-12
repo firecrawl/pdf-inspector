@@ -155,6 +155,17 @@ pub fn detect_pdf_type_mem_with_config(
     detect_from_document(&doc, page_count, &config)
 }
 
+/// Detect PDF type on a document loaded with
+/// [`load_document_mem`](crate::load_document_mem), for a caller that also
+/// reads the document itself or extracts from it and so parses the file
+/// once.
+pub fn detect_pdf_type_from_doc(
+    doc: &Document,
+    config: DetectionConfig,
+) -> Result<PdfTypeResult, PdfError> {
+    detect_from_document(doc, doc.get_pages().len() as u32, &config)
+}
+
 /// Heuristic page-count fallback for malformed PDFs that cannot be parsed.
 ///
 /// This scans raw bytes for page dictionaries (`/Type /Page`) while excluding

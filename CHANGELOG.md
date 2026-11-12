@@ -9,6 +9,14 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- `load_document_mem`, `extract_text_with_positions_from_doc` and
+  `detect_pdf_type_from_doc` (Rust only) let a caller that also reads the
+  `lopdf::Document` itself, such as its outline or page boxes, parse the
+  file once instead of once per function. `pdf_inspector::lopdf`
+  re-exports the `lopdf` the document comes from.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
