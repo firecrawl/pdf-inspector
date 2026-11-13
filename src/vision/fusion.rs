@@ -830,7 +830,18 @@ fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) 
     let native_page_key = ComparisonKey::new(native);
     let mut addition_keys = Vec::new();
     let mut additions: Vec<String> = Vec::new();
-    for block in markdown_blocks(ocr) {
+    for block in markdown_blocks(ocr).flat_map(|block| {
+        if block.lines().any(is_markdown_table_line)
+            || block.trim_start().starts_with("```")
+            || block.trim_start().starts_with("~~~")
+            || block.starts_with("    ")
+            || block.starts_with('\t')
+        {
+            vec![block]
+        } else {
+            block.lines().collect()
+        }
+    }) {
         let key = ComparisonKey::new(block);
         if key.is_empty()
             || key.is_fragment_of(&native_page_key)
