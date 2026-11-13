@@ -906,7 +906,10 @@ fn suppress_table_underlines(
     lines: &[PdfLine],
     page: u32,
 ) {
-    if !items.iter().any(|item| item.is_underline) {
+    if !items
+        .iter()
+        .any(|item| item.is_underline || item.layout_strikeout)
+    {
         return;
     }
 
@@ -3383,6 +3386,14 @@ mod tests {
         assert!(items.iter().all(|item| !item.is_underline));
         assert!(items.iter().all(|item| item.is_strikeout));
         assert!(items.iter().all(|item| !item.layout_strikeout));
+
+        for item in &mut items {
+            item.layout_strikeout = true;
+        }
+        suppress_table_underlines(&mut items, &[], &lines, 1);
+        assert!(items
+            .iter()
+            .all(|item| item.is_strikeout && !item.layout_strikeout));
     }
 
     #[test]
