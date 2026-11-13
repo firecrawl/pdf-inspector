@@ -416,7 +416,8 @@ fn fuse_ocr_pages_impl(
                         false,
                     )
                 } else {
-                    let (markdown, source) = merge_native_and_ocr(&native.markdown, &ocr_markdown);
+                    let (markdown, source) =
+                        merge_native_and_ocr(&native.markdown, &ocr_markdown, !geometry.is_empty());
                     (markdown, source, false)
                 };
                 let weak_ocr = local
@@ -549,7 +550,7 @@ fn choose_adaptive_content(
         };
     }
 
-    let (markdown, source) = merge_native_and_ocr(native.markdown(), ocr);
+    let (markdown, source) = merge_native_and_ocr(native.markdown(), ocr, false);
     let warning = match source {
         PageContentSource::Native => format!(
             "kept trustworthy {} because OCR duplicated its content",
@@ -980,7 +981,11 @@ fn items_inside_regions(items: Vec<TextItem>, regions: &[PdfRect]) -> Vec<TextIt
         .collect()
 }
 
-fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) {
+fn merge_native_and_ocr(
+    native: &str,
+    ocr: &str,
+    preserve_ocr_context: bool,
+) -> (String, PageContentSource) {
     let native_keys = comparison_units(native);
     let native_page_key = ComparisonKey::new(native);
     let mut addition_keys = Vec::new();
@@ -1008,9 +1013,11 @@ fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) 
             continue;
         }
 
-        let addition = if let Some(native) = best_partial_overlap(&key, &native_keys)
-            .filter(|native| token_overlap(&key.numbers, &native.numbers) == key.numbers.len())
-        {
+        let addition = if let Some(native) =
+            best_partial_overlap(&key, &native_keys).filter(|native| {
+                !preserve_ocr_context
+                    && token_overlap(&key.numbers, &native.numbers) == key.numbers.len()
+            }) {
             let Some(novel) = novel_fragments(block, native) else {
                 continue;
             };
@@ -1906,14 +1913,14 @@ mod tests {
 
     #[test]
     fn force_mode_preserves_punctuation_and_short_distinct_blocks() {
-        let (markdown, source) = merge_native_and_ocr("Figure 1\n", "1\n\n***");
+        let (markdown, source) = merge_native_and_ocr("Figure 1\n", "1\n\n***", false);
         assert_eq!(source, PageContentSource::Fused);
         assert_eq!(markdown, "Figure 1\n\n1\n\n***\n");
     }
 
     #[test]
     fn force_mode_extracts_only_novel_tokens_from_overlapping_blocks() {
-        let (markdown, source) = merge_native_and_ocr("A C\n", "## A B C");
+        let (markdown, source) = merge_native_and_ocr("A C\n", "## A B C", false);
         assert_eq!(source, PageContentSource::Fused);
         assert_eq!(markdown, "A C\n\nB\n");
         assert_eq!(markdown.matches('A').count(), 1);
