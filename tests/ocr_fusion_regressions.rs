@@ -182,4 +182,9 @@ fn fusion_regression_deduplicates_partial_rows_with_unchanged_numeric_values() {
         fuse(native, "1. Scope applies to all work during 60 days.").markdown,
         native
     );
+    let native = "# Conditions\n\n1. Scope applies during 60 days.\n\n\
+        2. Site access requires 15 m of parking.\n\n3. Fees are 250 euros.\n";
+    let recognized = "1. Scope applies during 60 days.\n\
+        2. Site access requires 15 m of parking.\n3. Fees are 250 euros.";
+    assert_eq!(fuse(native, recognized).markdown, native);
 }
