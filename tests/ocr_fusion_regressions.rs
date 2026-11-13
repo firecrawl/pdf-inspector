@@ -198,6 +198,27 @@ fn fusion_regression_spatial_ignores_invalid_and_other_page_geometry() {
 }
 
 #[test]
+fn fusion_regression_spatial_does_not_borrow_amounts_from_adjacent_rows() {
+    let native = "Tax 10\nFee 20\n";
+    let items = [
+        native_item("Fee 20", 975.0, ItemType::Text),
+        native_item("Tax 10", 966.0, ItemType::Text),
+    ];
+    let page = fuse_with_items(native, "Fee 10", &items, 0.99);
+    assert!(page.markdown.starts_with(native));
+    assert!(
+        page.markdown.contains("Fee 10"),
+        "adjacent row hid a numerical conflict: {}",
+        page.markdown
+    );
+    assert!(page
+        .provenance
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("numerical conflicts")));
+}
+
+#[test]
 fn fusion_regression_discards_fragments_already_inside_native_paragraphs_and_tables() {
     let native = "Thermal Projection SA Customer Name Belgique\n\n\
         | Description | Quantité | Prix unitaire | TVA |\n\
