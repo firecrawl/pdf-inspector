@@ -780,8 +780,8 @@ fn native_ocr_decision(
             in_image |=
                 (right - left).max(0.0) * (top - bottom).max(0.0) >= ocr.width * ocr.height * 0.8;
         } else {
-            let tolerance = ocr.height.min(native.height) * 0.3;
-            if right > left && top - bottom + tolerance >= ocr.height.min(native.height) * 0.5 {
+            let center_distance = (ocr.y + ocr.height * 0.5 - native.y - native.height * 0.5).abs();
+            if right > left && center_distance <= ocr.height.min(native.height) * 0.5 {
                 intervals.push((left, right));
                 local_text.push(native.text.as_str());
             }
