@@ -169,6 +169,35 @@ fn fusion_regression_spatial_preserves_numeric_conflicts_and_scanned_pages() {
 }
 
 #[test]
+fn fusion_regression_spatial_keeps_image_addition_context_and_negation() {
+    let native = "Payment received\n";
+    let items = [
+        native_item("", 975.0, ItemType::Image),
+        native_item(native, 600.0, ItemType::Text),
+    ];
+    let page = fuse_with_items(native, "Payment not received", &items, 0.99);
+    assert!(page.markdown.starts_with(native));
+    assert!(
+        page.markdown.contains("Payment not received"),
+        "image context lost: {}",
+        page.markdown
+    );
+}
+
+#[test]
+fn fusion_regression_spatial_ignores_invalid_and_other_page_geometry() {
+    let native = "Native text\n";
+    let mut item = native_item(native, 975.0, ItemType::Text);
+    item.x = f32::INFINITY;
+    let page = fuse_with_items(native, "Independent content", &[item], 0.99);
+    assert!(page.markdown.contains("Independent content"));
+    let mut item = native_item(native, 975.0, ItemType::Text);
+    item.page = 2;
+    let page = fuse_with_items(native, "Independent content", &[item], 0.99);
+    assert!(page.markdown.contains("Independent content"));
+}
+
+#[test]
 fn fusion_regression_discards_fragments_already_inside_native_paragraphs_and_tables() {
     let native = "Thermal Projection SA Customer Name Belgique\n\n\
         | Description | Quantité | Prix unitaire | TVA |\n\
