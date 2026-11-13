@@ -842,8 +842,8 @@ fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) 
             continue;
         }
 
-        let addition = if let Some(native) =
-            best_partial_overlap(&key, &native_keys).filter(|native| native.numbers == key.numbers)
+        let addition = if let Some(native) = best_partial_overlap(&key, &native_keys)
+            .filter(|native| token_overlap(&key.numbers, &native.numbers) == key.numbers.len())
         {
             let Some(novel) = novel_fragments(block, native) else {
                 continue;
