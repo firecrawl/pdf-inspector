@@ -1,13 +1,23 @@
 #![cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 
+use pdf_inspector::types::{ItemType, TextItem};
 use pdf_inspector::vision::{
-    fuse_ocr_pages, FusedPageMarkdown, ImagePoint, ImageQuad, ModelIdentity, OcrFusionOptions,
-    OcrPage, OcrRun, OcrSpan, PageContentSource, PageTransform, RenderPixelFormat, RenderedPage,
-    RoutedOcrPage,
+    fuse_ocr_pages, fuse_ocr_pages_with_native_text, FusedPageMarkdown, ImagePoint, ImageQuad,
+    ModelIdentity, OcrFusionOptions, OcrPage, OcrRun, OcrSpan, PageContentSource, PageTransform,
+    RenderPixelFormat, RenderedPage, RoutedOcrPage,
 };
 use pdf_inspector::PageMarkdown;
 
 fn fuse(native: &str, recognized: &str) -> FusedPageMarkdown {
+    fuse_with_items(native, recognized, &[], 0.99)
+}
+
+fn fuse_with_items(
+    native: &str,
+    recognized: &str,
+    native_items: &[TextItem],
+    confidence: f32,
+) -> FusedPageMarkdown {
     let transform =
         PageTransform::from_corners(800, 1000, (0.0, 1000.0), (800.0, 1000.0), (0.0, 0.0)).unwrap();
     let rendered = RenderedPage::new(
@@ -37,7 +47,7 @@ fn fuse(native: &str, recognized: &str) -> FusedPageMarkdown {
                         ImagePoint::new(780.0, top + 15.0),
                         ImagePoint::new(10.0, top + 15.0),
                     ]),
-                    confidence: 0.99,
+                    confidence,
                     orientation_degrees: None,
                 }
             })
@@ -58,10 +68,104 @@ fn fuse(native: &str, recognized: &str) -> FusedPageMarkdown {
         render_time_ms: 1,
         ocr_time_ms: 1,
     };
-    fuse_ocr_pages(&native_pages, &run, 1, &OcrFusionOptions::new())
-        .unwrap()
-        .pages
-        .remove(0)
+    let result = if native_items.is_empty() {
+        fuse_ocr_pages(&native_pages, &run, 1, &OcrFusionOptions::new())
+    } else {
+        fuse_ocr_pages_with_native_text(
+            &native_pages,
+            native_items,
+            &run,
+            1,
+            &OcrFusionOptions::new(),
+        )
+    };
+    result.unwrap().pages.remove(0)
+}
+
+fn native_item(text: &str, y: f32, item_type: ItemType) -> TextItem {
+    TextItem {
+        text: text.into(),
+        x: 10.0,
+        y,
+        width: 770.0,
+        height: 15.0,
+        font: "Helvetica".into(),
+        font_tag: String::new(),
+        legacy_symbol_rewrite: false,
+        font_size: 15.0,
+        page: 1,
+        is_bold: false,
+        is_italic: false,
+        font_weight: None,
+        bold_source: None,
+        fixed_pitch: None,
+        fill_color: None,
+        stroke_color: None,
+        render_mode: None,
+        is_underline: false,
+        is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
+        item_type,
+        mcid: None,
+        baseline_shift: 0.0,
+    }
+}
+
+#[test]
+fn fusion_regression_spatial_native_text_owns_damaged_ocr() {
+    let native = "Les travaux sont fournis au consommateur final. L'habitation est utilisée exclusivement comme logement privé.\n";
+    let items = [native_item(native, 975.0, ItemType::Text)];
+    let page = fuse_with_items(
+        native,
+        "reco ation vaux, l'habit on exclusiv ent, co ateur m nal endo présume",
+        &items,
+        0.99,
+    );
+    assert_eq!(page.markdown, native);
+    assert_eq!(page.provenance.source, PageContentSource::Native);
+    assert!(!page.provenance.warnings.is_empty());
+}
+
+#[test]
+fn fusion_regression_spatial_defers_unanchored_headers_instead_of_appending_them() {
+    let native = "Acompte 1 865,20\n";
+    let items = [native_item(native, 600.0, ItemType::Text)];
+    let page = fuse_with_items(
+        native,
+        "Description Quantité Unité Prix TVA Total\nunitaire",
+        &items,
+        0.99,
+    );
+    assert_eq!(page.markdown, native);
+    assert!(!page.provenance.warnings.is_empty());
+}
+
+#[test]
+fn fusion_regression_spatial_rejects_uncertain_image_ocr_but_keeps_readable_stamps() {
+    let native = "Invoice total 420.00\n";
+    let items = [
+        native_item("", 975.0, ItemType::Image),
+        native_item(native, 600.0, ItemType::Text),
+    ];
+    let page = fuse_with_items(native, "isen", &items, 0.85);
+    assert_eq!(page.markdown, native);
+    assert!(!page.provenance.warnings.is_empty());
+    let page = fuse_with_items(native, "Image-only stamp", &items, 0.99);
+    assert!(page.markdown.starts_with(native));
+    assert!(page.markdown.contains("Image-only stamp"));
+    assert_eq!(page.provenance.source, PageContentSource::Fused);
+}
+
+#[test]
+fn fusion_regression_spatial_preserves_numeric_conflicts_and_scanned_pages() {
+    let native = "Total 420.00\n";
+    let items = [native_item(native, 975.0, ItemType::Text)];
+    let page = fuse_with_items(native, "Total -420.00", &items, 0.99);
+    assert!(page.markdown.starts_with(native));
+    assert!(page.markdown.contains("Total -420.00"));
+    let page = fuse_with_items("", "Scanned invoice total 420.00", &items, 0.85);
+    assert!(page.markdown.contains("420.00"));
 }
 
 #[test]
