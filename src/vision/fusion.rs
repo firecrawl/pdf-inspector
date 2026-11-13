@@ -1,8 +1,10 @@
 //! Geometry-aware OCR Markdown assembly and native-text fusion.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 use std::time::Instant;
 
+use regex::Regex;
 use thiserror::Error;
 
 use crate::markdown::{
@@ -363,6 +365,17 @@ fn fuse_ocr_pages_impl(
                     (choice.markdown, choice.source, choice.recommend_hosted)
                 } else if native.markdown.trim().is_empty() || native.needs_ocr {
                     (ocr_markdown, PageContentSource::Ocr, false)
+                } else if ocr_markdown.chars().any(char::is_alphanumeric)
+                    && assess_text_candidate(&ocr_markdown).is_none()
+                {
+                    warnings.push(
+                        "discarded unusable OCR; kept trustworthy native content".to_string(),
+                    );
+                    (
+                        ensure_trailing_newline(&native.markdown),
+                        PageContentSource::Native,
+                        false,
+                    )
                 } else {
                     let (markdown, source) = merge_native_and_ocr(&native.markdown, &ocr_markdown);
                     (markdown, source, false)
@@ -814,11 +827,13 @@ fn items_inside_regions(items: Vec<TextItem>, regions: &[PdfRect]) -> Vec<TextIt
 
 fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) {
     let native_keys = comparison_units(native);
+    let native_page_key = ComparisonKey::new(native);
     let mut addition_keys = Vec::new();
     let mut additions: Vec<String> = Vec::new();
     for block in markdown_blocks(ocr) {
         let key = ComparisonKey::new(block);
         if key.is_empty()
+            || key.is_fragment_of(&native_page_key)
             || native_keys.iter().any(|native| native.same_content(&key))
             || addition_keys
                 .iter()
@@ -827,7 +842,9 @@ fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) 
             continue;
         }
 
-        let addition = if let Some(native) = best_partial_overlap(&key, &native_keys) {
+        let addition = if let Some(native) =
+            best_partial_overlap(&key, &native_keys).filter(|native| native.numbers == key.numbers)
+        {
             let Some(novel) = novel_fragments(block, native) else {
                 continue;
             };
@@ -837,6 +854,7 @@ fn merge_native_and_ocr(native: &str, ocr: &str) -> (String, PageContentSource) 
         };
         let addition_key = ComparisonKey::new(&addition);
         if addition_key.is_empty()
+            || addition_key.is_fragment_of(&native_page_key)
             || native_keys
                 .iter()
                 .any(|native| native.same_content(&addition_key))
@@ -874,6 +892,9 @@ fn markdown_blocks(markdown: &str) -> impl Iterator<Item = &str> {
 struct ComparisonKey {
     tokens: Vec<String>,
     punctuation: String,
+    joined: String,
+    boundaries: Vec<usize>,
+    numbers: Vec<String>,
 }
 
 impl ComparisonKey {
@@ -896,9 +917,36 @@ impl ComparisonKey {
         if !token.is_empty() {
             tokens.push(token);
         }
+        static UNITS: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?:[+\-−]\s*)?\p{N}+(?:[.,]\p{N}+)*|[\p{L}\p{M}]+")
+                .expect("valid comparison unit pattern")
+        });
+        let mut joined = String::new();
+        let mut boundaries = vec![0];
+        let mut numbers = Vec::new();
+        for matched in UNITS.find_iter(text) {
+            let unit = matched.as_str();
+            if unit.chars().any(char::is_numeric) {
+                let number: String = unit
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect();
+                joined.push('\0');
+                joined.push_str(&number);
+                joined.push('\0');
+                numbers.push(number);
+            } else {
+                joined.extend(unit.chars().flat_map(char::to_lowercase));
+            }
+            boundaries.push(joined.len());
+        }
+        numbers.sort();
         Self {
             tokens,
             punctuation,
+            joined,
+            boundaries,
+            numbers,
         }
     }
 
@@ -912,8 +960,27 @@ impl ComparisonKey {
                 && other.tokens.is_empty()
                 && self.punctuation == other.punctuation
         } else {
-            token_counts(&self.tokens) == token_counts(&other.tokens)
+            self.numbers == other.numbers
+                && token_counts(&self.tokens) == token_counts(&other.tokens)
         }
+    }
+
+    fn is_fragment_of(&self, native: &Self) -> bool {
+        !self.joined.is_empty()
+            && self
+                .tokens
+                .iter()
+                .any(|token| token.chars().any(char::is_alphabetic))
+            && native
+                .joined
+                .match_indices(&self.joined)
+                .any(|(start, matched)| {
+                    native.boundaries.binary_search(&start).is_ok()
+                        && native
+                            .boundaries
+                            .binary_search(&(start + matched.len()))
+                            .is_ok()
+                })
     }
 }
 
