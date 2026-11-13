@@ -192,6 +192,9 @@ fn fusion_regression_deduplicates_partial_rows_with_unchanged_numeric_values() {
     let native = "# Conditions\n\n1. Scope applies during 60 days.\n\n\
         2. Site access requires 15 m of parking.\n\n3. Fees are 250 euros.\n";
     let recognized = "1. Scope applies during 60 days.\n\
-        2. Site access requires 15 m of parking.\n3. Fees are 250 euros.";
-    assert_eq!(fuse(native, recognized).markdown, native);
+        2. Site access requires 15 m of parking.\n3. Fees are 250 euros.\nImage-only stamp";
+    let page = fuse(native, recognized);
+    assert!(page.markdown.starts_with(native));
+    assert!(page.markdown.contains("Image-only stamp"));
+    assert_eq!(page.markdown.matches("Scope applies").count(), 1);
 }
