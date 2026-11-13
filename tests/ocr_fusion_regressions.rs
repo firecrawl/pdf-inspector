@@ -164,3 +164,22 @@ fn fusion_regression_does_not_mix_different_table_rows_or_join_numeric_fields() 
         assert!(page.markdown.starts_with(native));
     }
 }
+
+#[test]
+fn fusion_regression_deduplicates_partial_rows_with_unchanged_numeric_values() {
+    let native = "ASPIRATION SUPPORT AVANT PROJECTION 70 m² prix 1,50 TVA 6% total 105,00\n";
+    assert_eq!(
+        fuse(
+            native,
+            "ASPIRATION SUPPORT AVANT PROJECTION70 m² total 105,00"
+        )
+        .markdown,
+        native
+    );
+    let native = "# Conditions\n\n1. Scope applies to all work during 60 days.\n\n\
+        2. Site access requires 15 m of parking and costs 250 euros.\n";
+    assert_eq!(
+        fuse(native, "1. Scope applies to all work during 60 days.").markdown,
+        native
+    );
+}
