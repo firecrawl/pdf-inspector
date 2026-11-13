@@ -39,8 +39,8 @@ pub use contracts::{
 pub use download::{HttpModelDownloadError, HttpModelDownloader, DEFAULT_MODEL_DOWNLOAD_TIMEOUT};
 #[cfg(all(feature = "vision", not(target_arch = "wasm32")))]
 pub use fusion::{
-    fuse_ocr_pages, ocr_page_to_markdown, FusedPageMarkdown, FusedPages, OcrFusionError,
-    OcrFusionOptions,
+    fuse_ocr_pages, fuse_ocr_pages_with_native_text, ocr_page_to_markdown, FusedPageMarkdown,
+    FusedPages, OcrFusionError, OcrFusionOptions,
 };
 #[cfg(all(feature = "model-cache", not(target_arch = "wasm32")))]
 pub use models::{

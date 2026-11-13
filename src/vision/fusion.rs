@@ -219,6 +219,16 @@ pub fn fuse_ocr_pages(
     )
 }
 
+pub fn fuse_ocr_pages_with_native_text(
+    native_pages: &[PageMarkdown],
+    _native_items: &[TextItem],
+    ocr_run: &OcrRun,
+    document_page_count: u32,
+    options: &OcrFusionOptions,
+) -> Result<FusedPages, OcrFusionError> {
+    fuse_ocr_pages(native_pages, ocr_run, document_page_count, options)
+}
+
 /// OCR-pipeline fusion with trustworthy partial native candidates.
 #[cfg(test)]
 pub(crate) fn fuse_ocr_pages_adaptive(
