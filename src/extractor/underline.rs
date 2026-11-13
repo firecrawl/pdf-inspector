@@ -70,6 +70,9 @@ struct Rule {
     x1: f32,
     x2: f32,
     y: f32,
+    /// Kept by the repeated-ruling filter only because it snugly strikes
+    /// through one row. Its strikes are emitted but are not layout evidence.
+    strike_rescued: bool,
 }
 
 impl Rule {
@@ -96,6 +99,7 @@ fn rules_from_graphics(rects: &[PdfRect], lines: &[UnderlineLine], page: u32) ->
                     x1,
                     x2,
                     y: (l.y1 + l.y2) / 2.0,
+                    strike_rescued: false,
                 });
             }
         }
@@ -119,6 +123,7 @@ fn rules_from_graphics(rects: &[PdfRect], lines: &[UnderlineLine], page: u32) ->
                 x1,
                 x2,
                 y: r.y + r.height / 2.0,
+                strike_rescued: false,
             });
         }
     }
@@ -149,7 +154,7 @@ fn discard_repeated_ruling_rules(
         // those checks compare against, so a rule near text is judged
         // exactly as before.
         .filter(|rule| may_decorate_text(rule, items))
-        .filter(|rule| {
+        .filter_map(|rule| {
             // A rule snugly owned by one text line is an underline even when
             // span-similar rules repeat down the page — documents that
             // underline many full-width lines (dense CJK business docs) look
@@ -161,12 +166,29 @@ fn discard_repeated_ruling_rules(
             // Same-row segmented rules (column-header separators) are
             // always rulings — each segment snugly owns its column label,
             // so snugness must not override that check.
-            !is_segmented_row_ruling_rule(rule, &rules)
-                && ((has_snug_text_owner(rule, items)
-                    && !has_flanking_verticals(rule, rects, lines, page))
-                    || !is_repeated_ruling_rule(rule, &rules))
+            if is_segmented_row_ruling_rule(rule, &rules) {
+                return None;
+            }
+            if !is_repeated_ruling_rule(rule, &rules) {
+                return Some(rule.clone());
+            }
+            if has_flanking_verticals(rule, rects, lines, page) {
+                return None;
+            }
+            // Redlines strike several whole lines of similar width, which the
+            // repetition check reads the same way; a rule that snugly strikes
+            // through one row is kept as a strikethrough.
+            if has_snug_owner_row(rule, items, rule_matches_item) {
+                Some(rule.clone())
+            } else if has_snug_owner_row(rule, items, rule_strikes_item) {
+                Some(Rule {
+                    strike_rescued: true,
+                    ..rule.clone()
+                })
+            } else {
+                None
+            }
         })
-        .cloned()
         .collect()
 }
 
@@ -254,15 +276,6 @@ fn has_flanking_verticals(
         };
         y_lo <= rule.y + 2.0 && y_hi >= rule.y - 2.0
     })
-}
-
-/// True when the rule snugly underlines one row of text, or snugly strikes
-/// through one. The two are judged separately so the runs a rule sits under
-/// and the runs it crosses, which belong to different rows, never pool into
-/// one owner.
-fn has_snug_text_owner(rule: &Rule, items: &[TextItem]) -> bool {
-    has_snug_owner_row(rule, items, rule_matches_item)
-        || has_snug_owner_row(rule, items, rule_strikes_item)
 }
 
 fn has_snug_owner_row(
@@ -740,6 +753,7 @@ pub(crate) fn mark_underlined_items(
         .collect();
 
     let mut strikeout_items = vec![false; items.len()];
+    let mut layout_strikeout_items = vec![false; items.len()];
     for (rule_idx, rule) in rules.iter().enumerate() {
         if tabular_rules.contains(&rule_idx)
             || has_connected_nonhorizontal_segment(rule, lines, page)
@@ -749,6 +763,7 @@ pub(crate) fn mark_underlined_items(
         }
         for item_idx in snug_strike_owner_indices(rule, items) {
             strikeout_items[item_idx] = true;
+            layout_strikeout_items[item_idx] |= !rule.strike_rescued;
         }
     }
 
@@ -758,7 +773,8 @@ pub(crate) fn mark_underlined_items(
         .filter(|(_, item)| {
             is_underline_candidate(item)
                 && rules.iter().enumerate().any(|(rule_idx, rule)| {
-                    !tabular_rules.contains(&rule_idx)
+                    !rule.strike_rescued
+                        && !tabular_rules.contains(&rule_idx)
                         && !fraction_rules.contains(&rule_idx)
                         && rule_matches_item(rule, item)
                 })
@@ -773,6 +789,9 @@ pub(crate) fn mark_underlined_items(
 
         if strikeout_items[item_idx] {
             item.is_strikeout = true;
+        }
+        if layout_strikeout_items[item_idx] {
+            item.layout_strikeout = true;
         }
         if underlined_items.contains(&item_idx) {
             item.is_underline = true;
@@ -807,6 +826,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -1256,6 +1276,16 @@ mod tests {
 
         assert!(items.iter().all(|item| item.is_strikeout));
         assert!(items.iter().all(|item| !item.is_underline));
+        // Kept only as decorations: layout heuristics see the page as before.
+        assert!(items.iter().all(|item| !item.layout_strikeout));
+    }
+
+    #[test]
+    fn lone_strikethrough_is_layout_evidence() {
+        let mut items = vec![item("struck out", 100.0, 500.0, 60.0, 10.0)];
+        let lines = vec![hline(99.0, 161.0, 503.0)];
+        mark_underlined_items(&mut items, &[], &lines, 1);
+        assert!(items[0].is_strikeout && items[0].layout_strikeout);
     }
 
     #[test]

@@ -19,6 +19,11 @@ version and date. Earlier releases are described in their
   decorations of table text exists for underlines, which a cell's bottom
   border imitates; no border runs through a cell's glyphs, and a
   tracked-changes page whose rules read as a grid lost every strike.
+- Strikes kept by the two fixes above are emitted as `<s>` but leave
+  layout as it was: run merging and heuristic table detection read the new
+  `TextItem::layout_strikeout`, which excludes them. A word hyphenated
+  across a line break inside a struck run rejoins across the reopened
+  `<s>` tag.
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is

@@ -268,6 +268,7 @@ fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,

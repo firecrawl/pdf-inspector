@@ -955,13 +955,15 @@ fn suppress_table_underlines(
         }
     }
 
-    // Only underlines are cleared: a cell's bottom border sits in the
-    // underline window, but no border crosses the middle of a cell's glyphs,
-    // so a strikethrough inside a table (a struck value, or a redline page
-    // whose rules read as a grid) is a real decoration.
+    // A cell's bottom border sits in the underline window, but no border
+    // crosses the middle of a cell's glyphs, so a strikethrough inside a
+    // table (a struck value, or a redline page whose rules read as a grid)
+    // is kept as a decoration. It stays out of layout evidence, which never
+    // saw strikes inside ruled tables.
     for index in table_item_indices {
         if let Some(item) = items.get_mut(index) {
             item.is_underline = false;
+            item.layout_strikeout = false;
         }
     }
 }
@@ -1503,7 +1505,7 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
         if next.is_bold != first.is_bold
             || next.is_italic != first.is_italic
             || next.is_underline != first.is_underline
-            || next.is_strikeout != first.is_strikeout
+            || next.layout_strikeout != first.layout_strikeout
         {
             break;
         }
@@ -2294,9 +2296,11 @@ fn merge_text_items_with_clips(
                 }
                 // Preserve the existing join behavior at non-bold style
                 // boundaries, including italic fragments within formulas.
+                // Strikes kept only as decorations (see
+                // `TextItem::layout_strikeout`) don't split a run.
                 if next.is_italic != first.is_italic
                     || next.is_underline != first.is_underline
-                    || next.is_strikeout != first.is_strikeout
+                    || next.layout_strikeout != first.layout_strikeout
                 {
                     break;
                 }
@@ -2484,6 +2488,7 @@ fn merge_text_items_with_clips(
                 render_mode: first.render_mode,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                layout_strikeout: first.layout_strikeout,
                 rotation: first.rotation,
                 advance_known: first.advance_known,
                 item_type: first.item_type.clone(),
@@ -2685,6 +2690,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -3198,7 +3204,10 @@ mod tests {
             match style {
                 0 => first.is_italic = true,
                 1 => first.is_underline = true,
-                _ => first.is_strikeout = true,
+                _ => {
+                    first.is_strikeout = true;
+                    first.layout_strikeout = true;
+                }
             }
             let merged = merge_text_items(vec![first, make_merge_item("Body", 125.2, 24.0)]);
             assert_eq!(merged.len(), 2);
@@ -3358,6 +3367,7 @@ mod tests {
         for item in &mut items {
             item.is_underline = true;
             item.is_strikeout = true;
+            item.layout_strikeout = true;
         }
         let lines = vec![
             make_line(100.0, 500.0, 300.0, 500.0),
@@ -3372,6 +3382,7 @@ mod tests {
 
         assert!(items.iter().all(|item| !item.is_underline));
         assert!(items.iter().all(|item| item.is_strikeout));
+        assert!(items.iter().all(|item| !item.layout_strikeout));
     }
 
     #[test]
@@ -3398,6 +3409,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -3425,6 +3437,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -3452,6 +3465,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4249,6 +4263,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4276,6 +4291,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4303,6 +4319,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4341,6 +4358,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4368,6 +4386,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4395,6 +4414,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4435,6 +4455,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4482,6 +4503,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4530,6 +4552,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4557,6 +4580,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4584,6 +4608,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4619,6 +4644,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -4769,6 +4795,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4796,6 +4823,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4833,6 +4861,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4860,6 +4889,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4913,6 +4943,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -4970,6 +5001,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -5027,6 +5059,7 @@ mod tests {
                 render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                layout_strikeout: false,
                 rotation: 0.0,
                 advance_known: true,
                 item_type: ItemType::Text,
@@ -5077,6 +5110,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
