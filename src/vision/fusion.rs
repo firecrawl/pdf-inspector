@@ -911,23 +911,11 @@ struct ComparisonKey {
 impl ComparisonKey {
     fn new(text: &str) -> Self {
         let mut tokens = Vec::new();
-        let mut token = String::new();
-        let mut punctuation = String::new();
-        for character in text.chars().flat_map(char::to_lowercase) {
-            if character.is_alphanumeric() {
-                token.push(character);
-            } else {
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-                if !character.is_whitespace() {
-                    punctuation.push(character);
-                }
-            }
-        }
-        if !token.is_empty() {
-            tokens.push(token);
-        }
+        let punctuation = text
+            .chars()
+            .filter(|character| !character.is_alphanumeric() && !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
         static UNITS: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"(?:[+\-−]\s*)?\p{N}+(?:[.,]\p{N}+)*|[\p{L}\p{M}]+")
                 .expect("valid comparison unit pattern")
@@ -945,9 +933,12 @@ impl ComparisonKey {
                 joined.push('\0');
                 joined.push_str(&number);
                 joined.push('\0');
+                tokens.push(number.clone());
                 numbers.push(number);
             } else {
-                joined.extend(unit.chars().flat_map(char::to_lowercase));
+                let word: String = unit.chars().flat_map(char::to_lowercase).collect();
+                joined.push_str(&word);
+                tokens.push(word);
             }
             boundaries.push(joined.len());
         }
