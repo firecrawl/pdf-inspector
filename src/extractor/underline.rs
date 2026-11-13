@@ -257,15 +257,18 @@ fn has_flanking_verticals(
 }
 
 fn has_snug_text_owner(rule: &Rule, items: &[TextItem]) -> bool {
-    // Underlines are drawn to the width of the text they decorate, but the
-    // text may be split into several runs (CJK lines mix scripts and font
-    // switches) — so ownership is judged against the UNION of the runs on
-    // the rule's baseline row. Table/form rulings overshoot their row's
-    // text (row separators span cell padding and empty columns), so they
-    // fail either containment or coverage.
+    // Underlines and strikethroughs are drawn to the width of the text they
+    // decorate, but the text may be split into several runs (CJK lines mix
+    // scripts and font switches) — so ownership is judged against the UNION
+    // of the runs the rule underlines or strikes through. Table/form rulings
+    // overshoot their row's text (row separators span cell padding and
+    // empty columns), so they fail either containment or coverage.
     let matched: Vec<&TextItem> = items
         .iter()
-        .filter(|item| is_underline_candidate(item) && rule_matches_item(rule, item))
+        .filter(|item| {
+            is_underline_candidate(item)
+                && (rule_matches_item(rule, item) || rule_strikes_item(rule, item))
+        })
         .collect();
     if matched.is_empty() {
         return false;
@@ -1222,6 +1225,53 @@ mod tests {
         mark_underlined_items(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| item.is_underline));
+    }
+
+    #[test]
+    fn repeated_snug_strikethroughs_survive_ruling_filter() {
+        // Redlines strike several whole lines of similar width: span-similar
+        // rules at 3+ y-levels crossing the glyphs must still mark each line.
+        let mut items = vec![
+            item("first struck line of text", 50.0, 700.0, 300.0, 11.0),
+            item("second struck line here", 50.0, 650.0, 300.0, 11.0),
+            item("third struck line as well", 50.0, 600.0, 300.0, 11.0),
+        ];
+        let lines = vec![
+            hline(50.0, 350.0, 703.0),
+            hline(50.0, 350.0, 653.0),
+            hline(50.0, 350.0, 603.0),
+        ];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| item.is_strikeout));
+        assert!(items.iter().all(|item| !item.is_underline));
+    }
+
+    #[test]
+    fn repeated_rules_through_spaced_cells_are_not_strikethroughs() {
+        // Repeated rules crossing rows of widely separated cells stay
+        // rulings: the snug rescue rejects column-sized gaps.
+        let mut items = vec![
+            item("cell a", 50.0, 700.0, 60.0, 11.0),
+            item("cell b", 190.0, 700.0, 60.0, 11.0),
+            item("cell c", 330.0, 700.0, 70.0, 11.0),
+            item("cell d", 50.0, 650.0, 60.0, 11.0),
+            item("cell e", 190.0, 650.0, 60.0, 11.0),
+            item("cell f", 330.0, 650.0, 70.0, 11.0),
+            item("cell g", 50.0, 600.0, 60.0, 11.0),
+            item("cell h", 190.0, 600.0, 60.0, 11.0),
+            item("cell i", 330.0, 600.0, 70.0, 11.0),
+        ];
+        let lines = vec![
+            hline(50.0, 400.0, 703.0),
+            hline(50.0, 400.0, 653.0),
+            hline(50.0, 400.0, 603.0),
+        ];
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items.iter().all(|item| !item.is_strikeout));
     }
 
     #[test]

@@ -11,6 +11,15 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
+- Strikethrough rules of similar width repeated down a page, as on a
+  tracked-changes page that strikes several whole lines, are kept. The
+  repeated-ruling filter only rescued a rule that underlines the text it
+  fits, so every such strike was dropped as a table ruling.
+- Text inside a detected table keeps its strikethrough. Clearing the
+  decorations of table text exists for underlines, which a cell's bottom
+  border imitates; no border runs through a cell's glyphs, and a
+  tracked-changes page whose rules read as a grid lost every strike.
+
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
   read through the Windows variant of the standard glyph order. That

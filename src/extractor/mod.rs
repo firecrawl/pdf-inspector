@@ -906,10 +906,7 @@ fn suppress_table_underlines(
     lines: &[PdfLine],
     page: u32,
 ) {
-    if !items
-        .iter()
-        .any(|item| item.is_underline || item.is_strikeout)
-    {
+    if !items.iter().any(|item| item.is_underline) {
         return;
     }
 
@@ -958,10 +955,13 @@ fn suppress_table_underlines(
         }
     }
 
+    // Only underlines are cleared: a cell's bottom border sits in the
+    // underline window, but no border crosses the middle of a cell's glyphs,
+    // so a strikethrough inside a table (a struck value, or a redline page
+    // whose rules read as a grid) is a real decoration.
     for index in table_item_indices {
         if let Some(item) = items.get_mut(index) {
             item.is_underline = false;
-            item.is_strikeout = false;
         }
     }
 }
@@ -3344,7 +3344,7 @@ mod tests {
     }
 
     #[test]
-    fn suppress_table_underlines_clears_line_detected_table_items() {
+    fn suppress_table_underlines_clears_underlines_but_keeps_strikeouts() {
         let mut items = vec![
             make_merge_item("H1", 125.0, 20.0),
             make_merge_item("H2", 225.0, 20.0),
@@ -3371,7 +3371,7 @@ mod tests {
         suppress_table_underlines(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_underline));
-        assert!(items.iter().all(|item| !item.is_strikeout));
+        assert!(items.iter().all(|item| item.is_strikeout));
     }
 
     #[test]
