@@ -183,6 +183,16 @@ fn fusion_regression_deduplicates_partial_rows_with_unchanged_numeric_values() {
         .markdown,
         native
     );
+    let native =
+        "ASPIRATION SUPPORT AVANT PROJECTION 70 m² prix 1,50 TVA 6% total 105,00 service inclus\n";
+    assert_eq!(
+        fuse(
+            native,
+            "ASPIRATION SUPPORT AVANT PROJECTION70 m² total 105,00"
+        )
+        .markdown,
+        native
+    );
     let native = "# Conditions\n\n1. Scope applies to all work during 60 days.\n\n\
         2. Site access requires 15 m of parking and costs 250 euros.\n";
     assert_eq!(
