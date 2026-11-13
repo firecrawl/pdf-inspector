@@ -256,19 +256,29 @@ fn has_flanking_verticals(
     })
 }
 
+/// True when the rule snugly underlines one row of text, or snugly strikes
+/// through one. The two are judged separately so the runs a rule sits under
+/// and the runs it crosses, which belong to different rows, never pool into
+/// one owner.
 fn has_snug_text_owner(rule: &Rule, items: &[TextItem]) -> bool {
+    has_snug_owner_row(rule, items, rule_matches_item)
+        || has_snug_owner_row(rule, items, rule_strikes_item)
+}
+
+fn has_snug_owner_row(
+    rule: &Rule,
+    items: &[TextItem],
+    decorates: fn(&Rule, &TextItem) -> bool,
+) -> bool {
     // Underlines and strikethroughs are drawn to the width of the text they
     // decorate, but the text may be split into several runs (CJK lines mix
     // scripts and font switches) — so ownership is judged against the UNION
-    // of the runs the rule underlines or strikes through. Table/form rulings
-    // overshoot their row's text (row separators span cell padding and
-    // empty columns), so they fail either containment or coverage.
+    // of the runs the rule decorates. Table/form rulings overshoot their
+    // row's text (row separators span cell padding and empty columns), so
+    // they fail either containment or coverage.
     let matched: Vec<&TextItem> = items
         .iter()
-        .filter(|item| {
-            is_underline_candidate(item)
-                && (rule_matches_item(rule, item) || rule_strikes_item(rule, item))
-        })
+        .filter(|item| is_underline_candidate(item) && decorates(rule, item))
         .collect();
     if matched.is_empty() {
         return false;
@@ -1272,6 +1282,27 @@ mod tests {
         mark_underlined_items(&mut items, &[], &lines, 1);
 
         assert!(items.iter().all(|item| !item.is_strikeout));
+    }
+
+    #[test]
+    fn rows_above_and_below_a_rule_do_not_pool_into_one_owner() {
+        // Tight rows: each repeated rule sits under one short cell and
+        // crosses the glyphs of the next row's short cell. Neither row alone
+        // covers the rule, so pooling both rows must not rescue it.
+        let mut items = Vec::new();
+        let mut lines = Vec::new();
+        for row in 0..4 {
+            let base = 700.0 - row as f32 * 20.0;
+            items.push(item("aaaa", 50.0, base, 40.0, 10.0));
+            items.push(item("bbbb", 104.0, base - 10.0, 40.0, 10.0));
+            lines.push(hline(50.0, 144.0, base - 7.0));
+        }
+
+        mark_underlined_items(&mut items, &[], &lines, 1);
+
+        assert!(items
+            .iter()
+            .all(|item| !item.is_strikeout && !item.is_underline));
     }
 
     #[test]
