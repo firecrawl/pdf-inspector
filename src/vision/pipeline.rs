@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::types::TextItem;
 use thiserror::Error;
 
 use crate::text_quality::{
@@ -253,6 +254,7 @@ pub fn process_pdf_with_ocr_mem(
         options.ocr.mode != OcrMode::Off,
     )?;
     let mut native = extraction.result;
+    let mut native_items = extraction.native_items;
     let page_count = extraction.page_count;
     let extracted_supplemental_regions = extraction.supplemental_ocr_regions;
     // The renderer reads the document as the loader repaired it, when it
@@ -352,6 +354,8 @@ pub fn process_pdf_with_ocr_mem(
                     };
                     native_page.markdown = candidate.markdown().to_string();
                     native_page.needs_ocr = false;
+                    native_items.retain(|item| item.page != page.page);
+                    native_items.extend(page.items);
                     native_candidates.remove(&page.page);
                     if let Some(route) =
                         route_after_native_recovery(page.page, &extracted_supplemental_regions)
@@ -418,6 +422,7 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            &native_items,
         )?
     } else {
         // Resolve the native renderer before any network request so a missing
@@ -440,6 +445,7 @@ pub fn process_pdf_with_ocr_mem(
             &fusion_options,
             &native_candidates,
             &fusion_routes,
+            &native_items,
         )?
     };
     fused.render_time_ms = fused
@@ -549,6 +555,7 @@ fn run_and_fuse_ocr_chunks<R, O>(
     fusion_options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     fusion_routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_items: &[TextItem],
 ) -> Result<FusedPages, OcrPipelineError>
 where
     R: PageRenderer,
@@ -591,6 +598,7 @@ where
             fusion_options,
             native_candidates,
             fusion_routes,
+            native_items,
         )?;
         render_time_ms = render_time_ms.saturating_add(fused.render_time_ms);
         ocr_time_ms = ocr_time_ms.saturating_add(fused.ocr_time_ms);
@@ -613,6 +621,7 @@ where
             fusion_options,
             native_candidates,
             fusion_routes,
+            native_items,
         )?;
         for page in fused.pages {
             pages_by_number.insert(page.page_number, page);
@@ -1222,6 +1231,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &[],
         )
         .unwrap();
 

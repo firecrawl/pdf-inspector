@@ -216,17 +216,31 @@ pub fn fuse_ocr_pages(
         options,
         &BTreeMap::new(),
         &routes,
+        &[],
     )
 }
 
+/// Fuses OCR with native geometry in original PDF user space, before any
+/// synthetic reading-orientation normalization. Trustworthy native pages own
+/// their vector text; raster additions require line confidence of at least 0.95.
+/// Unsupported OCR is reported in provenance instead of emitted as prose.
 pub fn fuse_ocr_pages_with_native_text(
     native_pages: &[PageMarkdown],
-    _native_items: &[TextItem],
+    native_items: &[TextItem],
     ocr_run: &OcrRun,
     document_page_count: u32,
     options: &OcrFusionOptions,
 ) -> Result<FusedPages, OcrFusionError> {
-    fuse_ocr_pages(native_pages, ocr_run, document_page_count, options)
+    let routes = full_page_routes(ocr_run);
+    fuse_ocr_pages_impl(
+        native_pages,
+        ocr_run,
+        document_page_count,
+        options,
+        &BTreeMap::new(),
+        &routes,
+        native_items,
+    )
 }
 
 /// OCR-pipeline fusion with trustworthy partial native candidates.
@@ -246,6 +260,7 @@ pub(crate) fn fuse_ocr_pages_adaptive(
         options,
         native_candidates,
         &routes,
+        &[],
     )
 }
 
@@ -265,6 +280,7 @@ pub(crate) fn fuse_ocr_pages_adaptive_with_routes(
     options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_items: &[TextItem],
 ) -> Result<FusedPages, OcrFusionError> {
     fuse_ocr_pages_impl(
         native_pages,
@@ -273,6 +289,7 @@ pub(crate) fn fuse_ocr_pages_adaptive_with_routes(
         options,
         native_candidates,
         routes,
+        native_items,
     )
 }
 
@@ -283,6 +300,7 @@ fn fuse_ocr_pages_impl(
     options: &OcrFusionOptions,
     native_candidates: &BTreeMap<u32, NativeFallbackCandidate>,
     routes: &BTreeMap<u32, OcrFusionRoute>,
+    native_items: &[TextItem],
 ) -> Result<FusedPages, OcrFusionError> {
     validate_options(options)?;
 
@@ -324,16 +342,27 @@ fn fuse_ocr_pages_impl(
 
         let (markdown, source, ocr_model, ocr_confidence, ocr_ms, hosted_recommended) =
             if let Some(local) = ocr_by_page.get(&page_number) {
-                let (ocr_items, discarded_spans) = ocr_text_items(local);
+                let route = routes
+                    .get(&page_number)
+                    .ok_or(OcrFusionError::MissingOcrRoute { page: page_number })?;
+                let geometry: Vec<_> = native_items
+                    .iter()
+                    .filter(|item| {
+                        !native.needs_ocr
+                            && !native.markdown.trim().is_empty()
+                            && matches!(route, OcrFusionRoute::FullPage)
+                            && item.page == page_number
+                            && valid_native_geometry(item)
+                    })
+                    .collect();
+                let (ocr_items, discarded_spans) =
+                    ocr_text_items_with_native(local, &geometry, &mut warnings);
                 if discarded_spans > 0 {
                     warnings.push(format!(
                         "discarded {discarded_spans} OCR spans with unusable text or geometry"
                     ));
                 }
                 warnings.extend(local.ocr.warnings.iter().cloned());
-                let route = routes
-                    .get(&page_number)
-                    .ok_or(OcrFusionError::MissingOcrRoute { page: page_number })?;
                 let ocr_markdown = match route {
                     OcrFusionRoute::SupplementalRegions(regions) => {
                         let region_items = items_inside_regions(ocr_items, regions);
@@ -605,7 +634,16 @@ fn assess_text_candidate(markdown: &str) -> Option<TextCandidateQuality> {
 
 /// Converts recognized line polygons to ordinary PDF-space text items.
 fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
+    ocr_text_items_with_native(page, &[], &mut Vec::new())
+}
+
+fn ocr_text_items_with_native(
+    page: &RoutedOcrPage,
+    native_items: &[&TextItem],
+    warnings: &mut Vec<String>,
+) -> (Vec<TextItem>, usize) {
     let mut discarded = 0usize;
+    let mut decisions = BTreeMap::<&str, usize>::new();
     let mut items = Vec::with_capacity(page.ocr.spans.len());
     for span in &page.ocr.spans {
         if span.text.trim().is_empty() {
@@ -626,7 +664,7 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             f64::from(right - left),
             f64::from(bottom - top),
         );
-        items.push(TextItem {
+        let item = TextItem {
             text: span.text.trim().to_string(),
             x: rect.x,
             y: rect.y,
@@ -652,8 +690,38 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
-        });
+        };
+        if !native_items.is_empty() {
+            let decision = native_ocr_decision(&item, span.confidence, native_items);
+            let (keep, reason) = match decision {
+                NativeOcrDecision::Keep => (true, None),
+                NativeOcrDecision::Conflict => (
+                    true,
+                    Some("native/OCR numerical conflicts retained for review"),
+                ),
+                NativeOcrDecision::Covered => {
+                    (false, Some("OCR spans covered by trustworthy native text"))
+                }
+                NativeOcrDecision::Uncertain => (false, Some("uncertain image OCR spans deferred")),
+                NativeOcrDecision::Unanchored => (
+                    false,
+                    Some("unanchored OCR spans deferred; no raster-region evidence"),
+                ),
+            };
+            if let Some(reason) = reason {
+                *decisions.entry(reason).or_default() += 1;
+            }
+            if !keep {
+                continue;
+            }
+        }
+        items.push(item);
     }
+    warnings.extend(
+        decisions
+            .into_iter()
+            .map(|(reason, count)| format!("{count} {reason}")),
+    );
     // OCR engines do not share an ordering contract. Geometry gives the
     // deterministic top-to-bottom seed expected by the existing layout
     // pipeline, which can still replace it with column-aware reading order.
@@ -665,6 +733,83 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             .then(first.x.total_cmp(&second.x))
     });
     (items, discarded)
+}
+
+enum NativeOcrDecision {
+    Keep,
+    Conflict,
+    Covered,
+    Uncertain,
+    Unanchored,
+}
+
+fn valid_native_geometry(item: &TextItem) -> bool {
+    matches!(
+        item.item_type,
+        ItemType::Text | ItemType::FormField | ItemType::Image
+    ) && (matches!(item.item_type, ItemType::Image) || !item.text.trim().is_empty())
+        && item.width > 0.0
+        && item.height > 0.0
+        && [
+            item.x,
+            item.y,
+            item.width,
+            item.height,
+            item.x + item.width,
+            item.y + item.height,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+}
+
+fn native_ocr_decision(
+    ocr: &TextItem,
+    confidence: f32,
+    native_items: &[&TextItem],
+) -> NativeOcrDecision {
+    let mut intervals = Vec::new();
+    let mut local_text = Vec::new();
+    let mut in_image = false;
+    for native in native_items {
+        let left = ocr.x.max(native.x);
+        let right = (ocr.x + ocr.width).min(native.x + native.width);
+        let bottom = ocr.y.max(native.y);
+        let top = (ocr.y + ocr.height).min(native.y + native.height);
+        if matches!(native.item_type, ItemType::Image) {
+            in_image |=
+                (right - left).max(0.0) * (top - bottom).max(0.0) >= ocr.width * ocr.height * 0.8;
+        } else {
+            let tolerance = ocr.height.min(native.height) * 0.3;
+            if right > left && top - bottom + tolerance >= ocr.height.min(native.height) * 0.5 {
+                intervals.push((left, right));
+                local_text.push(native.text.as_str());
+            }
+        }
+    }
+    intervals.sort_by(|first, second| first.0.total_cmp(&second.0));
+    let mut covered = 0.0;
+    let mut end = ocr.x;
+    for (left, right) in intervals {
+        covered += (right - left.max(end)).max(0.0);
+        end = end.max(right);
+    }
+    if covered >= ocr.width * 0.7 {
+        let recognized = ComparisonKey::new(&ocr.text);
+        let native = ComparisonKey::new(&local_text.join(" "));
+        return if token_overlap(&recognized.numbers, &native.numbers) < recognized.numbers.len() {
+            NativeOcrDecision::Conflict
+        } else {
+            NativeOcrDecision::Covered
+        };
+    }
+    if !in_image {
+        return NativeOcrDecision::Unanchored;
+    }
+    if !(0.95..=1.0).contains(&confidence) || assess_text_candidate(&ocr.text).is_none() {
+        NativeOcrDecision::Uncertain
+    } else {
+        NativeOcrDecision::Keep
+    }
 }
 
 fn image_quad_bounds(
@@ -1264,6 +1409,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &[],
         )
         .unwrap();
 
@@ -1308,6 +1454,7 @@ mod tests {
             &OcrFusionOptions::new(),
             &BTreeMap::new(),
             &routes,
+            &[],
         )
         .unwrap();
 

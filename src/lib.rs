@@ -555,6 +555,8 @@ pub(crate) struct InternalPagesExtraction {
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) native_items: Vec<TextItem>,
     /// The document written back out for the renderer when form XObjects
     /// were repaired at load (see `form_bbox_repair`); `None` when the
     /// original bytes render as loaded.
@@ -860,6 +862,19 @@ fn extract_pages_markdown_mem_impl(
         });
     }
 
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let native_items = if render_repairs {
+        let mut items = all_items;
+        for item in &mut items {
+            if let Some(turn) = _page_rotations.get(&item.page) {
+                turn.unrotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            }
+        }
+        items
+    } else {
+        Vec::new()
+    };
+
     Ok(InternalPagesExtraction {
         result: PagesExtractionResult {
             pages: results,
@@ -873,6 +888,8 @@ fn extract_pages_markdown_mem_impl(
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         supplemental_ocr_regions,
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        native_items,
         // A renderer reading the original bytes would clip a repaired form
         // to nothing, so the OCR pipeline renders the repaired document.
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
