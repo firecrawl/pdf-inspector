@@ -24,17 +24,24 @@ fn fuse(native: &str, recognized: &str) -> FusedPageMarkdown {
     .unwrap();
     let ocr = OcrPage {
         page_number: 1,
-        spans: vec![OcrSpan {
-            text: recognized.to_string(),
-            polygon: ImageQuad::new([
-                ImagePoint::new(10.0, 10.0),
-                ImagePoint::new(780.0, 10.0),
-                ImagePoint::new(780.0, 25.0),
-                ImagePoint::new(10.0, 25.0),
-            ]),
-            confidence: 0.99,
-            orientation_degrees: None,
-        }],
+        spans: recognized
+            .lines()
+            .enumerate()
+            .map(|(index, text)| {
+                let top = 10.0 + index as f32 * 20.0;
+                OcrSpan {
+                    text: text.to_string(),
+                    polygon: ImageQuad::new([
+                        ImagePoint::new(10.0, top),
+                        ImagePoint::new(780.0, top),
+                        ImagePoint::new(780.0, top + 15.0),
+                        ImagePoint::new(10.0, top + 15.0),
+                    ]),
+                    confidence: 0.99,
+                    orientation_degrees: None,
+                }
+            })
+            .collect(),
         mean_confidence: Some(0.99),
         model: ModelIdentity::new("synthetic-ocr", "v1"),
         processing_time_ms: 1,
