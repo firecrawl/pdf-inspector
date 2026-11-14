@@ -698,6 +698,23 @@ fn extract_pages_markdown_mem_impl(
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
 
+    // Each page's items, rects and lines, in document order, gathered in one
+    // pass over the document rather than one pass per page.
+    let mut item_indices: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, item) in all_items.iter().enumerate() {
+        if !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(item)) {
+            item_indices.entry(item.page).or_default().push(index);
+        }
+    }
+    let mut rects_by_page: HashMap<u32, Vec<&PdfRect>> = HashMap::new();
+    for rect in &all_rects {
+        rects_by_page.entry(rect.page).or_default().push(rect);
+    }
+    let mut lines_by_page: HashMap<u32, Vec<&types::PdfLine>> = HashMap::new();
+    for line in &all_lines {
+        lines_by_page.entry(line.page).or_default().push(line);
+    }
+
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
         if page_0idx >= page_count {
@@ -713,28 +730,26 @@ fn extract_pages_markdown_mem_impl(
 
         let page_1idx = page_0idx + 1;
 
-        // Partition items, removal decisions, and rects for this page only.
-        let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
-            .iter()
-            .zip(&page_number_removal_mask)
-            .filter(|(item, _)| {
-                item.page == page_1idx
-                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+        // This page's items, removal decisions, and rects.
+        let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = item_indices
+            .get(&page_1idx)
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&index| (all_items[index].clone(), page_number_removal_mask[index]))
+                    .unzip()
             })
-            .map(|(item, remove)| (item.clone(), *remove))
-            .unzip();
+            .unwrap_or_default();
 
-        let page_rects: Vec<PdfRect> = all_rects
-            .iter()
-            .filter(|r| r.page == page_1idx)
-            .cloned()
-            .collect();
+        let page_rects: Vec<PdfRect> = rects_by_page
+            .get(&page_1idx)
+            .map(|rects| rects.iter().map(|&rect| rect.clone()).collect())
+            .unwrap_or_default();
 
-        let page_lines: Vec<types::PdfLine> = all_lines
-            .iter()
-            .filter(|l| l.page == page_1idx)
-            .cloned()
-            .collect();
+        let page_lines: Vec<types::PdfLine> = lines_by_page
+            .get(&page_1idx)
+            .map(|lines| lines.iter().map(|&line| line.clone()).collect())
+            .unwrap_or_default();
 
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         {
