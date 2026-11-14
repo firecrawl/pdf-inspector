@@ -465,10 +465,12 @@ pub struct PdfClassification {
 
 /// Classify a PDF from a memory buffer without extracting text.
 /// Returns the PDF type and which pages need OCR (~10-50ms).
+/// Skips per-page OCR diagnostics; use [`detect_pdf_type_mem`] for reason codes.
 pub fn classify_pdf_mem(buffer: &[u8]) -> Result<PdfClassification, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
-    let detection = detector::detect_from_document(&doc, page_count, &DetectionConfig::default())?;
+    let detection =
+        detector::detect_from_document_for_routing(&doc, page_count, &DetectionConfig::default())?;
     Ok(PdfClassification {
         pdf_type: detection.pdf_type,
         page_count,
