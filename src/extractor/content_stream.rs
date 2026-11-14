@@ -188,7 +188,7 @@ pub(crate) struct PendingSpace {
 /// widest word-space threshold in item merging is 0.13 em for lowercase
 /// junctions, and line assembly uses 0.15–0.18 em. A space run that leaves
 /// a wider gap between its neighbours is detected there, and their items
-/// stay untouched; one the next run is kerned back over is not.
+/// stay untouched; a gap the next run is kerned back over is not.
 const SQUEEZED_SPACE_EM: f32 = 0.2;
 
 /// Whether a junction character can take a rescued word space: letters and
