@@ -1524,6 +1524,36 @@ fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
 }
 
+/// Pages whose only content is tables (no text line) still get their marker.
+#[test]
+fn test_page_markers_on_table_only_pages() {
+    let marker = regex::Regex::new(r"<!-- Page (\d+) -->").unwrap();
+    // td9264: page 1 is a table; 2013-app2: every page is read as tables, page 7 is empty
+    for (fixture, expected) in [
+        ("td9264", vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        ("2013-app2", vec![1, 2, 3, 4, 5, 6, 8]),
+    ] {
+        let buf = std::fs::read(format!("tests/fixtures/{fixture}.pdf")).unwrap();
+        let mut options = PdfOptions::new();
+        options.markdown.include_page_numbers = true;
+        let md = process_pdf_mem_with_options(&buf, options)
+            .unwrap()
+            .markdown
+            .unwrap();
+        let pages: Vec<u32> = marker
+            .captures_iter(&md)
+            .map(|c| c[1].parse().unwrap())
+            .collect();
+        assert_eq!(pages, expected, "{fixture}");
+        assert!(md.trim_start().starts_with("<!-- Page 1 -->"), "{fixture}");
+        // A marker written after its page's content would leave the last section empty
+        assert!(
+            marker.split(&md).skip(1).all(|s| !s.trim().is_empty()),
+            "{fixture}: empty page section"
+        );
+    }
+}
+
 /// Base-Hebrew text stored in visual (screen left-to-right) order: each show
 /// op's characters are reversed relative to reading order and ops paint
 /// left-to-right across the line. Extraction must reverse each run back to
