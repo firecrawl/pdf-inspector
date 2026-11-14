@@ -73,6 +73,12 @@ pub struct PositionOptions {
     /// bold. It matters only when `bold_from_weight` is set; a value outside
     /// the scale is clamped into it either way.
     pub bold_weight_threshold: u16,
+    /// Keep invisible (render mode 3) text, such as the OCR layer a scanner
+    /// writes behind a page image, instead of skipping it. Its items carry
+    /// `TextItem::render_mode` `Some(3)`, so a caller can tell them from
+    /// the visible text. The region functions then read the layer on every
+    /// page, not only on a page without visible text. Off by default.
+    pub include_invisible: bool,
 }
 
 impl Default for PositionOptions {
@@ -81,13 +87,14 @@ impl Default for PositionOptions {
             frame: PositionFrame::default(),
             bold_from_weight: false,
             bold_weight_threshold: content_stream::DEFAULT_BOLD_WEIGHT_THRESHOLD,
+            include_invisible: false,
         }
     }
 }
 
 impl PositionOptions {
     /// The defaults: sheet frame, bold not read from the weight class, a
-    /// threshold of 600 for when it is.
+    /// threshold of 600 for when it is, invisible text skipped.
     pub fn new() -> Self {
         Self::default()
     }
@@ -111,10 +118,16 @@ impl PositionOptions {
         self
     }
 
+    /// Set whether invisible (render mode 3) text is kept.
+    pub fn include_invisible(mut self, include_invisible: bool) -> Self {
+        self.include_invisible = include_invisible;
+        self
+    }
+
     /// The content-stream switches these options ask for.
-    pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
+    pub(crate) fn text_extraction(self) -> TextExtractionOptions {
         TextExtractionOptions {
-            include_invisible,
+            include_invisible: self.include_invisible,
             bold_from_weight: self.bold_from_weight,
             bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
             // The position readers report no CMap coverage.
@@ -494,7 +507,7 @@ pub(crate) fn extract_positioned_text_from_doc_in_page_box(
         doc,
         font_cmaps,
         page_filter,
-        options.text_extraction(false),
+        options.text_extraction(),
         None,
         CoordinateFrame::VisiblePageBox,
     )

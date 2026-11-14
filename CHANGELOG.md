@@ -20,6 +20,13 @@ Changes since 1.25.2.
   literal sets it, normally to the same value as `is_strikeout`.
   ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
 
+### Added
+
+- `PositionOptions::include_invisible` keeps invisible (render mode 3)
+  text in the positioned-text and region functions, such as the OCR layer
+  a scanner writes behind a page image. Its items carry `render_mode`
+  `Some(3)`. Off by default, so the output is unchanged without it.
+
 ### Fixed
 
 - Strikethrough rules of similar width repeated down a page, as on a
