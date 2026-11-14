@@ -14,10 +14,12 @@ basis for such a theory is contained in the important papers of Nyquist¹ and Ha
 
 1. It is practically more useful. Parameters of engineering importance such as time, bandwidth, number of relays, etc., tend to vary linearly with the logarithm of the number of possibilities. For example, adding one relay to a group doubles the number of possible states of the relays. It adds 1 to the base 2 logarithm of this number. Doubling the time roughly squares the number of possible messages, or doubles the logarithm, etc.
 2. It is nearer to our intuitive feeling as to the proper measure. This is closely related to (1) since we in- tuitively measures entities by linear comparison with common standards. One feels, for example, that two punched cards should have twice the capacity of one for information storage, and two identical channels twice the capacity of one for transmitting information.
-3. It is mathematically more suitable. Many of the limiting operations are simple in terms of the logarithm but would require clumsy restatement in terms of the number of possibilities. The choice of a logarithmic base corresponds to the choice of a unit for measuring information. If the
-base 2 is used the resulting units may be called binary digits, or more briefly *bits,* a word suggested by
+3. It is mathematically more suitable. Many of the limiting operations are simple in terms of the logarithm but would require clumsy restatement in terms of the number of possibilities.
+
+The choice of a logarithmic base corresponds to the choice of a unit for measuring information. If the base 2 is used the resulting units may be called binary digits, or more briefly *bits,* a word suggested by
 
 J. W. Tukey. A device with two stable positions, such as a relay or a flip-flop circuit, can store one bit of information. *N* such devices can store*N* bits, since the total number of possible states is 2<sup>N</sup> and log₂2<sup>N</sup> = *N*. If the base 10 is used the units may be called decimal digits. Since
+
 log₂*M* = log₁₀*M*= log₁₀2 = 3:32 log₁₀*M*;
 
 ¹Nyquist, H., “Certain Factors Affecting Telegraph Speed,” *Bell System Technical Journal,* April 1924, p. 324; “Certain Topics in Telegraph Transmission Theory,” *A.I.E.E. Trans.,* v. 47, April 1928, p. 617. ²Hartley, R. V. L., “Transmission of Information,” *Bell System Technical Journal,* July 1928, p. 535.
@@ -36,6 +38,7 @@ a decimal digit is about 3 <sup>1</sup>/<sub>3</sub> bits. A digit wheel on a de
 2. A *transmitter* which operates on the message in some way to produce a signal suitable for transmission over the channel. In telephony this operation consists merely of changing sound pressure into a proportional electrical current. In telegraphy we have an encoding operation which produces a sequence of dots, dashes and spaces on the channel corresponding to the message. In a multiplex PCM system the different speech functions must be sampled, compressed, quantized and encoded, and finally interleaved properly to construct the signal. Vocoder systems, television and frequency modulation are other examples of complex operations applied to the message to obtain the signal.
 3. The *channel* is merely the medium used to transmit the signal from transmitter to receiver. It may be a pair of wires, a coaxial cable, a band of radio frequencies, a beam of light, etc.
 4. The *receiver* ordinarily performs the inverse operation of that done by the transmitter, reconstructing the message from the signal.
-5. The *destination* is the person (or thing) for whom the message is intended. We wish to consider certain general problems involving communication systems. To do this it is first
-necessary to represent the various elements involved as mathematical entities, suitably idealized from their
+5. The *destination* is the person (or thing) for whom the message is intended.
+
+We wish to consider certain general problems involving communication systems. To do this it is first necessary to represent the various elements involved as mathematical entities, suitably idealized from their
 
