@@ -2423,6 +2423,9 @@ fn merge_text_items_with_clips(
                     && (needs_bullet_space || (gap > effective_threshold && !numeric_boundary))
                     && !explicit_bold_space
                     && !text.ends_with(char::is_whitespace)
+                    && !next_text.starts_with(|c: char| {
+                        c.is_whitespace() && (!c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+                    })
                 {
                     text.push(' ');
                 }
@@ -2625,6 +2628,40 @@ mod tests {
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "WORD");
+    }
+
+    #[test]
+    fn justified_words_with_leading_space_join_with_one_space() {
+        // InDesign justification: each word is its own Tj carrying a
+        // leading space, placed apart by Td. The gap and the fragment's own
+        // space are one word boundary, not two.
+        let items = vec![
+            make_merge_item("Three", 100.0, 30.0),
+            make_merge_item(" lectures", 134.0, 44.0),
+            make_merge_item(" are", 182.0, 20.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Three lectures are");
+
+        // A C1 control left in place of an unmapped ligature glyph is not a
+        // space: the gap before it still needs one.
+        let items = vec![
+            make_merge_item("una", 100.0, 18.0),
+            make_merge_item("\u{85}na", 122.0, 14.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "una \u{85}na");
+
+        // A tab the ToUnicode map decodes is a space of its own.
+        let items = vec![
+            make_merge_item("una", 100.0, 18.0),
+            make_merge_item("\tna", 122.0, 14.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "una\tna");
     }
 
     #[test]
