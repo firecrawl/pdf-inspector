@@ -1586,6 +1586,7 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
 /// NOTE: Resource-based check. Superseded by `used_fonts_are_only_type3`.
 /// Kept for existing unit tests.
 #[cfg(test)]
+#[allow(dead_code)]
 fn page_has_only_type3_fonts(doc: &Document, page_id: ObjectId) -> bool {
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -3023,7 +3024,6 @@ mod tests {
 
         // Normal doc: low text ops — doesn't qualify at all
         let text_ops = 300u32;
-        let font_changes = 50u32;
         assert!(text_ops < 1500);
     }
 

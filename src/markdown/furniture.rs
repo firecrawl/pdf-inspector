@@ -9,6 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::types::TextLine;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// Strip page-edge furniture on documents too short for repetition evidence.
 ///
@@ -612,6 +614,34 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         .collect()
 }
 
+/// Matches navigation-metadata lines. A line is navigation metadata when it:
+///   * begins with a destination-index marker (`P1: OTA`, `P2: DEST/...`), or
+///   * carries a bare `OTA/` / `DEST/` named-destination token, or
+///   * begins with an internal bookmark token (`JWBT634-fm`, `JWBT634-c03`), or
+///   * carries producer print metadata (`Printer: ...`).
+///
+/// These fragments are emitted as several adjacent content-stream lines that a
+/// paragraph merge later joins (e.g. `P1: OTA/XYZ P2: ABC` + `JWBT634-fm ...`).
+/// The filter runs on the pre-merge lines, so every fragment must match on its
+/// own.
+static NAVIGATION_METADATA_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^P\d+: OTA\b|OTA/|DEST/|^[A-Z]{2,}\d+-|Printer:").unwrap());
+
+/// Drop lines that are navigation metadata rather than document content:
+/// AcroForm field values and content-stream destination markers such as
+/// `P1: OTA/XYZ`, `P2: DEST/A/1`, or `P1: OTA JWBT634-c01 May 11, 2012 ...`.
+///
+/// Unlike [`strip_repeated_lines`], this matches a text pattern instead of
+/// cross-page repetition. Those lines vary from page to page (different
+/// bookmark names, dates and times) so they never reach the repetition
+/// threshold, yet they are pure bookkeeping and carry no readable content.
+pub(crate) fn drop_navigation_metadata_lines(lines: Vec<TextLine>) -> Vec<TextLine> {
+    lines
+        .into_iter()
+        .filter(|line| !NAVIGATION_METADATA_RE.is_match(line.text().trim()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +675,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -1315,5 +1348,74 @@ mod tests {
             .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
             .unwrap();
         assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
+    }
+
+    #[test]
+    fn navigation_metadata_lines_are_dropped_but_content_survives() {
+        let lines = vec![
+            make_line(
+                "P1: OTA/XYZ P2: ABC JWBT634-fm JWBT634-Grimes",
+                8.0,
+                1,
+                750.0,
+                None,
+            ),
+            make_line(
+                "JWBT634-fm JWBT634-Grimes May 11, 2012 8:28 Printer: Hamilton Printing",
+                8.0,
+                1,
+                748.0,
+                None,
+            ),
+            make_line(
+                "P1: OTA JWBT634-c03 JWBT634-Grimes May 10, 2012 7:26 Printer: Hamilton Printing",
+                8.0,
+                1,
+                746.0,
+                None,
+            ),
+            make_line(
+                "The Art and Science of Technical Analysis is a textbook",
+                11.0,
+                1,
+                700.0,
+                None,
+            ),
+            make_line(
+                "Traders who recognize this pattern early can establish",
+                11.0,
+                1,
+                685.0,
+                None,
+            ),
+        ];
+
+        let result = drop_navigation_metadata_lines(lines);
+
+        assert!(
+            !result.iter().any(|l| l.text().contains("OTA")
+                || l.text().contains("JWBT")
+                || l.text().contains("Printer:")),
+            "all navigation-metadata fragments must be dropped, got: {:?}",
+            result.iter().map(|l| l.text().clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(result.len(), 2, "only the two content lines should remain");
+        assert!(result
+            .iter()
+            .any(|l| l.text().contains("The Art and Science")));
+        assert!(result
+            .iter()
+            .any(|l| l.text().contains("Traders who recognize")));
+    }
+
+    #[test]
+    fn destination_index_markers_match_with_and_without_slash() {
+        assert!(NAVIGATION_METADATA_RE.is_match("P1: OTA/XYZ"));
+        assert!(NAVIGATION_METADATA_RE.is_match("P1: OTA JWBT634-c01"));
+        assert!(NAVIGATION_METADATA_RE.is_match("P2: DEST/A/1"));
+        assert!(NAVIGATION_METADATA_RE.is_match("OTA/"));
+        assert!(NAVIGATION_METADATA_RE.is_match("DEST/"));
+        // A real sentence that merely mentions the letters OTA must survive.
+        assert!(!NAVIGATION_METADATA_RE.is_match("The OTA policy affects delivery"));
     }
 }

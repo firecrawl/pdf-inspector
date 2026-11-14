@@ -368,6 +368,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: Some(7),
             baseline_shift: 3.5,
+
+            image_data: None,
+            image_format: None,
         }];
 
         let json = format_items_json(&items);
@@ -535,6 +538,9 @@ fn print_layout_info(layout: &LayoutComplexity) {
 }
 
 const VALUE_OPTIONS: &[&str] = &[
+    "--headings",
+    "--profile",
+    "--image-dir",
     "--select-pages",
     "--password",
     "--ocr",
@@ -560,9 +566,22 @@ fn print_usage(argv0: &str) {
     eprintln!("  --items-json        Output positioned TextItem JSON");
     eprintln!("  --raw               Output only markdown (no headers)");
     eprintln!("  --compact           Collapse token-heavy source formatting such as dot leaders");
+    eprintln!(
+        "  --profile PROFILE   Document genre profile: general, book, academic (default: general)"
+    );
+    eprintln!("  --headings MODE     Heading detection mode: auto, outlines, or heuristic (default: auto)");
+    eprintln!("  --outlines-only     Alias for --headings outlines (only bookmark entries become headings)");
+    eprintln!("  --figure-as-h6      Preserve Figure/Chart captions as H6 headings (default in book profile)");
+    eprintln!("  --images            Extract embedded images and embed markdown links");
+    eprintln!("  --extract-images    Alias for --images");
+    eprintln!("  --image-dir DIR     Directory to save extracted images (implies --images)");
     eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
     eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
     eprintln!("  --password PW       Password for an encrypted PDF");
+    eprintln!("  --drop-form-fields  Drop AcroForm form-field values that are navigation metadata (e.g. 'P1: OTA/XYZ'), keeping real content");
+    eprintln!(
+        "  --drop-page-numbers Drop page break markers (<!-- Page N -->), keeping real content"
+    );
     eprintln!("  --detect-only       Only detect PDF type (no extraction)");
     eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
     eprintln!("  --ocr MODE          OCR mode: off, auto, or force (requires feature `ocr`)");
@@ -628,9 +647,59 @@ fn main() {
     let items_json_output = args.iter().any(|a| a == "--items-json");
     let raw_output = args.iter().any(|a| a == "--raw");
     let compact_output = args.iter().any(|a| a == "--compact");
+    let drop_form_fields = args.iter().any(|a| a == "--drop-form-fields");
+    let drop_page_numbers = args.iter().any(|a| a == "--drop-page-numbers");
     let page_numbers = args.iter().any(|a| a == "--pages");
     let detect_only = args.iter().any(|a| a == "--detect-only");
     let analyze = args.iter().any(|a| a == "--analyze");
+    let extract_images = args
+        .iter()
+        .any(|a| a == "--images" || a == "--extract-images");
+    let figure_as_h6 = args.iter().any(|a| a == "--figure-as-h6");
+    let profile_argument = argument_value(&args, "--profile").unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    });
+    let document_profile = match profile_argument {
+        Some("book") => pdf_inspector::DocumentProfile::Book,
+        Some("academic") | Some("paper") => pdf_inspector::DocumentProfile::Academic,
+        Some("general") | None => pdf_inspector::DocumentProfile::General,
+        Some(other) => {
+            eprintln!(
+                "Error: invalid --profile value: {other:?} (expected general, book, or academic)"
+            );
+            process::exit(1);
+        }
+    };
+    let headings_argument = argument_value(&args, "--headings").unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    });
+    let outlines_only = args.iter().any(|a| a == "--outlines-only");
+    let heading_mode = match headings_argument {
+        Some("outlines") | Some("strict") | Some("outlines-strict") => {
+            pdf_inspector::HeadingMode::OutlinesStrict
+        }
+        Some("heuristic") | Some("heuristics") => pdf_inspector::HeadingMode::HeuristicOnly,
+        Some("auto") => pdf_inspector::HeadingMode::Auto,
+        Some(other) => {
+            eprintln!(
+                "Error: invalid --headings value: {other:?} (expected auto, outlines, or heuristic)"
+            );
+            process::exit(1);
+        }
+        None => {
+            if outlines_only || document_profile == pdf_inspector::DocumentProfile::Book {
+                pdf_inspector::HeadingMode::OutlinesStrict
+            } else {
+                pdf_inspector::HeadingMode::Auto
+            }
+        }
+    };
+    let image_dir_argument = argument_value(&args, "--image-dir").unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    });
     let ocr_mode_argument = argument_value(&args, "--ocr").unwrap_or_else(|error| {
         eprintln!("Error: {error}");
         process::exit(1);
@@ -666,7 +735,6 @@ fn main() {
         });
 
     let output_file = positionals.get(1).map(String::as_str);
-
     let has_ocr_only_option = [
         "--ocr-dpi",
         "--ocr-min-confidence",
@@ -682,6 +750,25 @@ fn main() {
             json_output,
         );
     }
+
+    let images_enabled = extract_images || image_dir_argument.is_some();
+    let resolved_image_dir = if images_enabled {
+        if let Some(dir) = image_dir_argument {
+            Some(dir.to_string())
+        } else if let Some(output) = output_file {
+            let p = std::path::Path::new(output);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+            if let Some(parent) = p.parent().filter(|p| !p.as_os_str().is_empty()) {
+                Some(format!("{}/{}_images", parent.display(), stem))
+            } else {
+                Some(format!("{}_images", stem))
+            }
+        } else {
+            Some("images".to_string())
+        }
+    } else {
+        None
+    };
 
     if let Some(mode) = ocr_mode_argument {
         if items_json_output || detect_only || analyze {
@@ -706,9 +793,9 @@ fn main() {
                 "off" => OcrMode::Off,
                 "auto" => OcrMode::Auto,
                 "force" => OcrMode::Force,
-                value => {
+                other => {
                     exit_ocr_error(
-                        &format!("invalid --ocr mode {value:?}; expected off, auto, or force"),
+                        &format!("invalid --ocr value: {other:?} (expected off, auto, or force)"),
                         json_output,
                     );
                 }
@@ -738,11 +825,23 @@ fn main() {
             if args.iter().any(|argument| argument == "--ocr-offline") {
                 ocr = ocr.model_downloads(ModelDownloadPolicy::Offline);
             }
-            let mut markdown = pdf_inspector::MarkdownOptions::default();
+            let mut markdown =
+                pdf_inspector::MarkdownOptions::default().with_document_profile(document_profile);
             if compact_output {
                 markdown.profile = pdf_inspector::MarkdownProfile::Compact;
             }
             markdown.include_page_numbers = page_numbers;
+            if drop_page_numbers {
+                markdown.include_page_numbers = false;
+            }
+            if let Some(ref dir) = resolved_image_dir {
+                markdown.include_images = true;
+                markdown.image_dir = Some(dir.clone());
+            }
+            markdown.heading_mode = heading_mode;
+            if figure_as_h6 {
+                markdown.figure_as_h6 = true;
+            }
             let mut pdf_options = OcrPdfOptions::new()
                 .render(RenderOptions::new().dpi(dpi))
                 .ocr(ocr)
@@ -778,6 +877,11 @@ fn main() {
                             fs::write(output, &result.markdown)
                                 .expect("Failed to write output file");
                             eprintln!("Markdown written to: {output}");
+                            if let Some(ref dir) = resolved_image_dir {
+                                if std::path::Path::new(dir).exists() {
+                                    eprintln!("Images exported to: {dir}");
+                                }
+                            }
                         } else {
                             eprintln!();
                             eprintln!("--- Markdown Output ---");
@@ -813,7 +917,9 @@ fn main() {
         ProcessMode::Full
     };
 
-    let mut options = PdfOptions::new().mode(process_mode);
+    let mut options = PdfOptions::new()
+        .mode(process_mode)
+        .document_profile(document_profile);
     if compact_output {
         options.markdown.profile = pdf_inspector::MarkdownProfile::Compact;
     }
@@ -822,6 +928,20 @@ fn main() {
         options.page_filter = Some(pages);
     }
     options.password = password;
+    if drop_form_fields {
+        options.include_form_fields = false;
+    }
+    if drop_page_numbers {
+        options.markdown.include_page_numbers = false;
+    }
+    if let Some(ref dir) = resolved_image_dir {
+        options.markdown.include_images = true;
+        options.markdown.image_dir = Some(dir.clone());
+    }
+    options.markdown.heading_mode = heading_mode;
+    if figure_as_h6 {
+        options.markdown.figure_as_h6 = true;
+    }
 
     match process_pdf_with_options(pdf_path, options) {
         Ok(result) => {
@@ -963,6 +1083,11 @@ fn main() {
                                 eprintln!();
                                 eprintln!("Markdown written to: {}", output);
                                 eprintln!("Length: {} characters", markdown.len());
+                                if let Some(ref dir) = resolved_image_dir {
+                                    if std::path::Path::new(dir).exists() {
+                                        eprintln!("Images exported to: {}", dir);
+                                    }
+                                }
                             } else {
                                 eprintln!();
                                 eprintln!("--- Markdown Output ---");
@@ -1006,6 +1131,11 @@ fn main() {
                                 fs::write(output, markdown).expect("Failed to write output file");
                                 eprintln!("Markdown written to: {}", output);
                                 eprintln!("Length: {} characters", markdown.len());
+                                if let Some(ref dir) = resolved_image_dir {
+                                    if std::path::Path::new(dir).exists() {
+                                        eprintln!("Images exported to: {}", dir);
+                                    }
+                                }
                             } else {
                                 eprintln!("--- Markdown Output ---");
                                 eprintln!();

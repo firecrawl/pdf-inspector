@@ -265,6 +265,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -344,6 +347,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: shift,
+
+            image_data: None,
+            image_format: None,
         }
     }
 

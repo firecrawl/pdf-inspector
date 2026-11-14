@@ -630,6 +630,9 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         });
     }
     // OCR engines do not share an ordering contract. Geometry gives the
@@ -1272,6 +1275,9 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+
+                image_data: None,
+                image_format: None,
             },
             TextItem {
                 text: "Value".to_string(),
@@ -1300,6 +1306,9 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+
+                image_data: None,
+                image_format: None,
             },
         ];
 
@@ -1338,6 +1347,9 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+
+                image_data: None,
+                image_format: None,
             },
             TextItem {
                 text: "outside".to_string(),
@@ -1366,6 +1378,9 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
+
+                image_data: None,
+                image_format: None,
             },
         ];
         let regions = [PdfRect {

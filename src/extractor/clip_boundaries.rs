@@ -75,13 +75,14 @@ impl ClipRect {
     /// is an estimate), a rotated run and a non-text item are never
     /// excluded.
     fn excludes_run(self, item: &TextItem) -> bool {
-        if !matches!(item.item_type, ItemType::Text)
-            || !item.is_upright()
-            || !item.advance_known
-            || !(item.width > 0.0 && item.height > 0.0)
-            || ![item.x, item.y, item.width, item.height]
+        if !(matches!(item.item_type, ItemType::Text)
+            && item.is_upright()
+            && item.advance_known
+            && item.width > 0.0
+            && item.height > 0.0
+            && [item.x, item.y, item.width, item.height]
                 .iter()
-                .all(|v| v.is_finite())
+                .all(|v| v.is_finite()))
         {
             return false;
         }
@@ -371,6 +372,8 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            image_data: None,
+            image_format: None,
         }
     }
 

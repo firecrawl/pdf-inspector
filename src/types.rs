@@ -557,6 +557,16 @@ pub struct TextItem {
     /// characters ("H₂O", "word²") and never carries a shift. `y` stays the
     /// glyph's own baseline; [`TextItem::line_y`] gives the anchor's.
     pub baseline_shift: f32,
+    /// Encoded image bytes for [`ItemType::Image`] items (e.g. a JPEG frame
+    /// for a `/DCTDecode` XObject). `None` for text, links, and other item
+    /// types. Populated by the extractor so the markdown pipeline can write
+    /// the figure to disk and reference it, rather than emitting a bare
+    /// placeholder.
+    pub image_data: Option<Vec<u8>>,
+    /// Image format for embedded bytes: `"jpg"` for DCTDecode, `"png"` for
+    /// other embedded raster XObjects. Mirrors [`image_data`]; `None`
+    /// whenever `image_data` is `None`.
+    pub image_format: Option<String>,
 }
 
 impl TextItem {
@@ -1026,6 +1036,9 @@ mod formatting_tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
