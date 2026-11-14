@@ -252,12 +252,13 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     // "de- fendant"
     static BREAK_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(&format!("({WORD}{{2,}})- ({WORD}{{2,}})")).unwrap());
-    // "Bap-** **tist" — an emphasis span split together with the word. The
-    // regex crate has no backreferences, so both markers are captured and
-    // compared in the replacement closure.
+    // "Bap-** **tist" — an emphasis span split together with the word, or a
+    // decoration closed and reopened around the break ("Perfor-</s>
+    // <s>mance"). The regex crate has no backreferences, so both markers are
+    // captured and compared in the replacement closure.
     static BREAK_EMPH_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"({WORD}{{2,}})-(\*{{1,2}}) (\*{{1,2}})({WORD}{{2,}})"
+            r"({WORD}{{2,}})-(\*{{1,2}}|</s>) (\*{{1,2}}|<s>)({WORD}{{2,}})"
         ))
         .unwrap()
     });
@@ -325,7 +326,7 @@ fn dehyphenate_line_breaks(text: &str) -> String {
                 .replace_all(&current, |caps: &regex::Captures| {
                     // Mismatched markers aren't a split span; a Keep decision
                     // preserves the original spacing and markers.
-                    if caps[2] != caps[3] {
+                    if caps[2].replacen("</", "<", 1) != caps[3] {
                         return caps[0].to_string();
                     }
                     let (a, b) = (&caps[1], &caps[4]);
@@ -701,6 +702,15 @@ mod tests {
         assert_eq!(
             dehyphenate_line_breaks(text),
             "Any commercial firm of this type offering commercial-type insurance."
+        );
+    }
+
+    #[test]
+    fn line_break_inside_reopened_decoration_is_joined() {
+        let text = "The Performance-based Award. <s>Payment thereof. Performance-</s> <s>based Awards shall</s> and <u>dead-</u> <s>line</s>.";
+        assert_eq!(
+            dehyphenate_line_breaks(text),
+            "The Performance-based Award. <s>Payment thereof. Performance-based Awards shall</s> and <u>dead-</u> <s>line</s>."
         );
     }
 
