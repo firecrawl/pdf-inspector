@@ -26,10 +26,12 @@ Changes since 1.25.2.
   tracked-changes page that strikes several whole lines, are kept. The
   repeated-ruling filter only rescued a rule that underlines the text it
   fits, so every such strike was dropped as a table ruling.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
 - Text inside a detected table keeps its strikethrough. Clearing the
   decorations of table text exists for underlines, which a cell's bottom
   border imitates; no border runs through a cell's glyphs, and a
   tracked-changes page whose rules read as a grid lost every strike.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
 - A word hyphenated across a line break inside a struck run rejoins across
   the reopened `<s>` tag.
   ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
@@ -43,6 +45,7 @@ Changes since 1.25.2.
   `company‘s` and en dashes as `œ`. The font's
   own advances choose the variant, since an accented letter advances like
   its base letter.
+  ([#618](https://github.com/firecrawl/pdf-inspector/pull/618))
 - A glyph in such a subset past the standard order that paints nothing but
   advances reads as a space. Word justifies lines with Arial's en and em
   spaces, which came out as U+FFFD between every word
