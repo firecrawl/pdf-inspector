@@ -2416,7 +2416,9 @@ fn merge_text_items_with_clips(
                     && (needs_bullet_space || (gap > effective_threshold && !numeric_boundary))
                     && !explicit_bold_space
                     && !text.ends_with(char::is_whitespace)
-                    && !next_text.starts_with(|c: char| c.is_whitespace() && !c.is_control())
+                    && !next_text.starts_with(|c: char| {
+                        c.is_whitespace() && (!c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+                    })
                 {
                     text.push(' ');
                 }
@@ -2643,6 +2645,15 @@ mod tests {
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "una \u{85}na");
+
+        // A tab the ToUnicode map decodes is a space of its own.
+        let items = vec![
+            make_merge_item("una", 100.0, 18.0),
+            make_merge_item("\tna", 122.0, 14.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "una\tna");
     }
 
     #[test]
