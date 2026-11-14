@@ -11,6 +11,7 @@ pub(crate) mod fonts;
 pub(crate) mod geometry;
 mod layout;
 mod links;
+pub(crate) mod outline;
 pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
@@ -139,6 +140,7 @@ pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_re
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
+pub use outline::OutlineEntry;
 pub(crate) use scripts::merge_subscript_items;
 pub(crate) use xobjects::FormWalkBudget;
 
