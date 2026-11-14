@@ -908,6 +908,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // and resolve font names per-XObject scope.
     if let Some((resource_dict, resource_ids)) = page_resources {
         let mut visited = HashSet::new();
+        let mut remaining_bytes = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
             counts.add(scan_xobjects_in_resources(
@@ -917,6 +918,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
+                &mut remaining_bytes,
+                0,
             ));
         }
         for resource_id in resource_ids {
@@ -929,6 +932,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
+                    &mut remaining_bytes,
+                    0,
                 ));
             }
         }
@@ -1535,7 +1540,12 @@ fn identity_h_font_has_fallback(font_dict: &lopdf::Dictionary, doc: &Document) -
                     .get_object(ff_ref)
                     .and_then(Object::as_stream)
                     .ok()
-                    .and_then(|stream| stream.decompressed_content().ok())
+                    .and_then(|stream| {
+                        crate::extractor::content_decode::decompressed_within(
+                            stream,
+                            crate::MAX_STREAM_DECOMPRESSED_BYTES,
+                        )
+                    })
                     .is_some_and(|data| crate::mac_glyph_order::font_file_follows_mac_order(&data))
             {
                 return true;
@@ -1553,9 +1563,12 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content() {
-        Ok(d) => d,
-        Err(_) => return false,
+    let data = match crate::extractor::content_decode::decompressed_within(
+        stream,
+        crate::MAX_STREAM_DECOMPRESSED_BYTES,
+    ) {
+        Some(d) => d,
+        None => return false,
     };
     let face = match ttf_parser::Face::parse(&data, 0) {
         Ok(f) => f,
@@ -1774,6 +1787,10 @@ fn used_fonts_have_decodable_text(
     false
 }
 
+/// Maximum recursion depth when scanning nested Form XObjects.
+const MAX_FORM_SCAN_DEPTH: usize = 32;
+
+#[allow(clippy::too_many_arguments)]
 fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
@@ -1781,8 +1798,13 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
+    remaining_bytes: &mut usize,
+    depth: usize,
 ) -> ContentCounts {
     let mut counts = ContentCounts::default();
+    if depth >= MAX_FORM_SCAN_DEPTH {
+        return counts;
+    }
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -1808,9 +1830,11 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    let Some(content) = content_resources::decoded_within(stream, *remaining_bytes)
+                    else {
+                        continue;
+                    };
+                    *remaining_bytes = remaining_bytes.saturating_sub(content.len());
                     // Collect raw font names from this XObject's content stream.
                     // Every form bound is counted here, invoked or not, as
                     // the text and font tallies always have been; what the
@@ -1856,6 +1880,8 @@ fn scan_xobjects_in_resources(
                             unique_chars,
                             used_font_ids,
                             font_map,
+                            remaining_bytes,
+                            depth + 1,
                         ));
                     }
                 }
@@ -5017,5 +5043,56 @@ mod tests {
             decoded_text_counts(&doc, page_id),
             DecodedTextCounts::default()
         );
+    }
+
+    #[test]
+    fn scan_xobjects_recursion_stops_at_max_depth() {
+        let mut doc = Document::new();
+        let chain_len = MAX_FORM_SCAN_DEPTH + 10;
+        let mut child_id = None;
+
+        for i in (0..chain_len).rev() {
+            let mut resources = lopdf::Dictionary::new();
+            if let Some(next_id) = child_id {
+                let mut xobj_dict = lopdf::Dictionary::new();
+                xobj_dict.set(format!("Fm{}", i + 1), Object::Reference(next_id));
+                resources.set("XObject", Object::Dictionary(xobj_dict));
+            }
+            let mut form_dict = lopdf::Dictionary::new();
+            form_dict.set("Subtype", Object::Name(b"Form".to_vec()));
+            form_dict.set("Resources", Object::Dictionary(resources));
+            let content = if i >= MAX_FORM_SCAN_DEPTH {
+                b"BT /F1 12 Tf (deep) Tj ET".to_vec()
+            } else {
+                Vec::new()
+            };
+            let stream = lopdf::Stream::new(form_dict, content);
+            child_id = Some(doc.add_object(stream));
+        }
+
+        let mut root_resources = lopdf::Dictionary::new();
+        let mut root_xobj = lopdf::Dictionary::new();
+        root_xobj.set("Fm0", Object::Reference(child_id.unwrap()));
+        root_resources.set("XObject", Object::Dictionary(root_xobj));
+
+        let mut visited = HashSet::new();
+        let mut unique_chars = HashSet::new();
+        let mut used_font_ids = HashSet::new();
+        let mut font_map = HashMap::new();
+        let mut remaining_bytes = 100_000;
+
+        let counts = scan_xobjects_in_resources(
+            &doc,
+            &root_resources,
+            &mut visited,
+            &mut unique_chars,
+            &mut used_font_ids,
+            &mut font_map,
+            &mut remaining_bytes,
+            0,
+        );
+
+        assert_eq!(counts.text_ops, 0);
+        assert_eq!(visited.len(), MAX_FORM_SCAN_DEPTH);
     }
 }
