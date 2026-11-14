@@ -246,6 +246,8 @@ wasm/                   — Browser bindings (wasm-bindgen)
 
 This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_ocr` — a list of specific page numbers that lack text, enabling per-page OCR routing instead of all-or-nothing.
 
+Detection results also expose `raster_coverage_by_page` for pages actually analyzed. Each value is an approximate 0–1 fraction of the visible page covered by drawn images; overlapping images count once. A missing page was not analyzed under the selected scan strategy, and `None` means the content walk was incomplete. This signal does not change classification thresholds.
+
 ### Scan strategies
 
 | Strategy | Behavior | Best for |

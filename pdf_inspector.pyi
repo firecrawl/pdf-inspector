@@ -1,6 +1,6 @@
 """Type stubs for pdf_inspector."""
 
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 class PdfResult:
     """Result of processing a PDF file."""
@@ -8,6 +8,8 @@ class PdfResult:
     """'text_based', 'scanned', 'image_based', or 'mixed'."""
     markdown: Optional[str]
     page_count: int
+    raster_coverage_by_page: Dict[int, Optional[float]]
+    """Estimated 0–1 coverage for analyzed pages; missing pages were not scanned, None means incomplete."""
     processing_time_ms: int
     pages_needing_ocr: list[int]
     """1-indexed page numbers that need OCR."""

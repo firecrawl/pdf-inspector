@@ -20,6 +20,12 @@ Changes since 1.25.2.
   literal sets it, normally to the same value as `is_strikeout`.
   ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
 
+### Added
+
+- `raster_coverage_by_page` in Rust and Python results: approximate drawn-image
+  coverage for pages analyzed by the selected scan strategy, independent of
+  page classification and OCR recommendations.
+
 ### Fixed
 
 - Strikethrough rules of similar width repeated down a page, as on a
