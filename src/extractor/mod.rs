@@ -123,7 +123,8 @@ impl PositionOptions {
     }
 }
 use links::{extract_form_fields, extract_page_links};
-pub(crate) use page_box::{visible_page_box, PageBox};
+pub(crate) use page_box::visible_page_box;
+pub use page_box::PageBox;
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
 pub use crate::text_utils::{is_bold_font, is_italic_font};
@@ -241,6 +242,27 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
             PositionOptions::default(),
         )?;
     Ok(extraction)
+}
+
+/// The visible page box of every page of a memory buffer, in page order.
+///
+/// This is the box that [`TextItem`] positions and region inputs are relative
+/// to (`CropBox ∩ MediaBox`, else `MediaBox`, resolved as a renderer does, see
+/// [`PageBox`]): entry `n - 1` belongs to page `n`. A page whose boxes yield
+/// no usable rectangle reports [`PageBox::LETTER`], the frame the position
+/// APIs use for it. `/Rotate` is not applied; the width and height of a page
+/// turned by 90 or 270 degrees swap in the [`PositionFrame::Display`] frame.
+///
+/// A caller that also renders the page with another engine can compare the
+/// two boxes to learn whether positions from both share an origin.
+pub fn page_boxes_mem(buffer: &[u8]) -> Result<Vec<PageBox>, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
+    Ok(doc
+        .get_pages()
+        .values()
+        .map(|&page_id| visible_page_box(&doc, page_id).unwrap_or(PageBox::LETTER))
+        .collect())
 }
 
 /// Extract text with positions from a memory buffer. Coordinates: see
