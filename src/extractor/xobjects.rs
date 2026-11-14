@@ -321,9 +321,10 @@ fn extract_form_xobject_text_inner(
     // inflating past it is skipped, as a page over it is, before anything
     // is allocated for it. A stream that fails to decode for another
     // reason is read raw, if that fits the bound too.
-    let content_data = match stream
-        .decompressed_content_with_limit(super::content_decode::MAX_PAGE_CONTENT_BYTES)
-    {
+    let content_data = match super::content_decode::decompressed_content_within(
+        stream,
+        super::content_decode::MAX_PAGE_CONTENT_BYTES,
+    ) {
         Ok(data) => data,
         Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => {
             log::warn!(

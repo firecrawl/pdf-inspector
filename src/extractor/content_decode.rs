@@ -7,6 +7,8 @@
 
 use crate::PdfError;
 use lopdf::content::Content;
+use lopdf::{DecompressError, Document, Error, Object, ObjectId, Stream};
+use std::cell::Cell;
 
 /// Maximum content-stream operators decoded for a page or a single Form
 /// XObject. Matches the previous post-decode skip threshold.
@@ -18,6 +20,86 @@ pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
 /// memory — the same degradation as the operator cap. Real page content
 /// runs a few MB at most; the bound is deliberately far above that.
 pub(crate) const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The least decompressed content-stream bytes a loaded document may decode
+/// in all — every page's content and every form's, in detection and
+/// extraction together, however often each is read.
+const MIN_DOCUMENT_CONTENT_BYTES: usize = 1 << 30;
+
+/// Decompressed content-stream bytes a document may decode per byte of its
+/// file, above [`MIN_DOCUMENT_CONTENT_BYTES`]: a large document with much
+/// content shared between pages reads it once per page and per pass, and
+/// keeps room for that; a small file inflating to gigabytes does not.
+const DOCUMENT_CONTENT_BYTES_PER_FILE_BYTE: usize = 512;
+
+thread_local! {
+    /// What is left of the content-stream budget of the document loaded
+    /// last on this thread. Documents are read on the thread that loaded
+    /// them, one at a time, from load to the end of the call.
+    static DOCUMENT_CONTENT_BYTES_LEFT: Cell<usize> =
+        const { Cell::new(MIN_DOCUMENT_CONTENT_BYTES) };
+}
+
+/// Start the content-stream budget of a document of `file_len` bytes just
+/// loaded on this thread.
+pub(crate) fn reset_document_content_budget(file_len: usize) {
+    let budget = file_len
+        .saturating_mul(DOCUMENT_CONTENT_BYTES_PER_FILE_BYTE)
+        .max(MIN_DOCUMENT_CONTENT_BYTES);
+    DOCUMENT_CONTENT_BYTES_LEFT.with(|left| left.set(budget));
+}
+
+/// A content stream's bytes decompressed within `limit` and within what is
+/// left of the document's content budget, which they are charged to: a
+/// stream over either is refused with `MemoryLimitExceeded`, and charged
+/// the bytes read before it was refused. A stream that fails to decode for
+/// another reason returns that error and is charged nothing, so a caller
+/// may fall back to its raw bytes as before.
+pub(crate) fn decompressed_content_within(stream: &Stream, limit: usize) -> lopdf::Result<Vec<u8>> {
+    DOCUMENT_CONTENT_BYTES_LEFT.with(|left| {
+        let available = left.get();
+        let limit = limit.min(available);
+        let result = stream.decompressed_content_with_limit(limit);
+        let charged = match &result {
+            Ok(content) => content.len(),
+            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => limit,
+            Err(_) => 0,
+        };
+        left.set(available.saturating_sub(charged));
+        result
+    })
+}
+
+/// A page's content streams decompressed and joined, as
+/// `Document::get_page_content_with_limit` joins them, within `limit`
+/// bytes for the page and within the document's content budget (see
+/// [`decompressed_content_within`]). Refused with `MemoryLimitExceeded`
+/// when the page's content would pass either.
+pub(crate) fn page_content_within(
+    doc: &Document,
+    page_id: ObjectId,
+    limit: usize,
+) -> lopdf::Result<Vec<u8>> {
+    let mut content = Vec::new();
+    for id in doc.get_page_contents(page_id) {
+        let Ok(stream) = doc.get_object(id).and_then(Object::as_stream) else {
+            continue;
+        };
+        let remaining = limit.saturating_sub(content.len());
+        match decompressed_content_within(stream, remaining) {
+            Ok(data) => content.extend_from_slice(&data),
+            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                return Err(DecompressError::MemoryLimitExceeded { limit }.into());
+            }
+            Err(_) if stream.content.len() > remaining => {
+                return Err(DecompressError::MemoryLimitExceeded { limit }.into());
+            }
+            Err(_) => content.extend_from_slice(&stream.content),
+        }
+        content.push(b'\n');
+    }
+    Ok(content)
+}
 
 /// Decode `data` unless it contains more than `max_operations` operators.
 ///
@@ -198,6 +280,7 @@ fn skip_inline_image_after_bi(data: &[u8], mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     fn lopdf_op_count(data: &[u8]) -> usize {
         Content::decode(data)
@@ -319,6 +402,124 @@ mod tests {
         for data in samples {
             assert_count_does_not_undercount(data);
         }
+    }
+
+    fn set_document_content_budget(bytes: usize) {
+        DOCUMENT_CONTENT_BYTES_LEFT.with(|left| left.set(bytes));
+    }
+
+    fn document_content_budget() -> usize {
+        DOCUMENT_CONTENT_BYTES_LEFT.with(Cell::get)
+    }
+
+    fn flate_stream(len: usize) -> Stream {
+        let mut stream = Stream::new(dictionary! {}, vec![b' '; len]);
+        stream.compress().unwrap();
+        assert!(stream.dict.get(b"Filter").is_ok());
+        stream
+    }
+
+    fn is_over_limit<T>(result: &lopdf::Result<T>) -> bool {
+        matches!(
+            result,
+            Err(Error::Decompress(
+                DecompressError::MemoryLimitExceeded { .. }
+            ))
+        )
+    }
+
+    /// A stream inflating past its limit is refused, and the document is
+    /// charged what was read before it was; one within it is decoded and
+    /// charged its length.
+    #[test]
+    fn stream_decode_is_bounded_and_charged_to_the_document() {
+        set_document_content_budget(10_000);
+        let stream = flate_stream(4_000);
+        assert!(is_over_limit(&decompressed_content_within(&stream, 3_000)));
+        assert_eq!(document_content_budget(), 7_000);
+        assert_eq!(
+            decompressed_content_within(&stream, 5_000).unwrap().len(),
+            4_000
+        );
+        assert_eq!(document_content_budget(), 3_000);
+        // Within its own limit, but past what the document has left.
+        assert!(is_over_limit(&decompressed_content_within(&stream, 5_000)));
+        assert_eq!(document_content_budget(), 0);
+        assert!(is_over_limit(&decompressed_content_within(
+            &Stream::new(dictionary! {}, b"q Q".to_vec()),
+            5_000
+        )));
+    }
+
+    /// The same stream read again and again — by every page that shares
+    /// it — is refused once the document's budget is spent.
+    #[test]
+    fn a_shared_stream_read_over_and_over_spends_the_document_budget() {
+        set_document_content_budget(1 << 20);
+        let stream = flate_stream(100_000);
+        let read = (0..100)
+            .take_while(|_| decompressed_content_within(&stream, MAX_PAGE_CONTENT_BYTES).is_ok())
+            .count();
+        assert_eq!(read, 10);
+    }
+
+    /// The document budget grows with the file past its floor.
+    #[test]
+    fn document_budget_follows_the_file_size() {
+        reset_document_content_budget(1_000);
+        assert_eq!(document_content_budget(), MIN_DOCUMENT_CONTENT_BYTES);
+        reset_document_content_budget(10 << 20);
+        assert_eq!(
+            document_content_budget(),
+            (10 << 20) * DOCUMENT_CONTENT_BYTES_PER_FILE_BYTE
+        );
+    }
+
+    fn doc_with_page_contents(streams: Vec<Stream>) -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let contents: Vec<Object> = streams
+            .into_iter()
+            .map(|stream| doc.add_object(stream).into())
+            .collect();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => contents,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        (doc, page_id)
+    }
+
+    /// A page's streams are joined as lopdf joins them, within the page's
+    /// limit and the document's budget.
+    #[test]
+    fn page_content_is_joined_within_the_page_limit_and_document_budget() {
+        let (doc, page_id) = doc_with_page_contents(vec![
+            Stream::new(dictionary! {}, b"BT (a) Tj ET".to_vec()),
+            flate_stream(2_000),
+            Stream::new(
+                dictionary! { "Filter" => "FlateDecode" },
+                b"not deflate".to_vec(),
+            ),
+        ]);
+        set_document_content_budget(1 << 20);
+        let expected = doc.get_page_content_with_limit(page_id, 1 << 20).unwrap();
+        assert_eq!(
+            page_content_within(&doc, page_id, 1 << 20).unwrap(),
+            expected
+        );
+        assert!(is_over_limit(&page_content_within(&doc, page_id, 1_000)));
+
+        set_document_content_budget(1_500);
+        assert!(is_over_limit(&page_content_within(&doc, page_id, 1 << 20)));
     }
 
     #[test]

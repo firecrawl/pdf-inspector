@@ -98,7 +98,7 @@ pub(super) fn decoded_within(stream: &lopdf::Stream, limit: usize) -> Option<Vec
     if stream.dict.get(b"Filter").is_err() {
         return raw_within();
     }
-    match stream.decompressed_content_with_limit(limit) {
+    match crate::extractor::content_decode::decompressed_content_within(stream, limit) {
         Ok(content) => Some(content),
         Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => None,
         Err(_) => raw_within(),

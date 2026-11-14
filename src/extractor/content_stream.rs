@@ -578,8 +578,8 @@ pub(crate) fn extract_page_text_items_with_options(
     // Get content, bounding decompression so a page-content bomb skips the
     // page instead of exhausting memory — same degradation as the operator
     // cap below.
-    use crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
-    let content_data = match doc.get_page_content_with_limit(page_id, MAX_PAGE_CONTENT_BYTES) {
+    use crate::extractor::content_decode::{page_content_within, MAX_PAGE_CONTENT_BYTES};
+    let content_data = match page_content_within(doc, page_id, MAX_PAGE_CONTENT_BYTES) {
         Ok(data) => data,
         Err(e) => {
             log::warn!(

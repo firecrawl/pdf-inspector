@@ -917,6 +917,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
+                0,
             ));
         }
         for resource_id in resource_ids {
@@ -929,6 +930,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
+                    0,
                 ));
             }
         }
@@ -1226,7 +1228,9 @@ fn decoded_text_counts_within(
     }
     // A page whose content alone is over the budget is not read here, as
     // the extractor does not read it.
-    let Ok(page_content) = doc.get_page_content_with_limit(page_id, max_bytes) else {
+    let Ok(page_content) =
+        crate::extractor::content_decode::page_content_within(doc, page_id, max_bytes)
+    else {
         return DecodedTextCounts::default();
     };
     let mut bytes_left = max_bytes.saturating_sub(page_content.len());
@@ -1273,7 +1277,9 @@ fn decoded_text_counts_within(
                 // Decompressed within what is left of the page's byte
                 // budget; a stream that fails to decode for another reason
                 // is read raw, as the page content is, if that fits too.
-                let content = match stream.decompressed_content_with_limit(bytes_left) {
+                let content = match crate::extractor::content_decode::decompressed_content_within(
+                    stream, bytes_left,
+                ) {
                     Ok(content) => content,
                     Err(lopdf::Error::Decompress(
                         lopdf::DecompressError::MemoryLimitExceeded { .. },
@@ -1774,6 +1780,12 @@ fn used_fonts_have_decodable_text(
     false
 }
 
+/// How many Form XObjects deep the resource walks follow forms bound in
+/// the resources of forms: real documents nest a handful; a chain past it
+/// is walked no deeper, so its length costs no stack.
+pub(crate) const MAX_RESOURCE_FORM_DEPTH: usize = 32;
+
+/// `depth` is how many forms deep `resources` lies: 0 for the page's.
 fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
@@ -1781,6 +1793,7 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
+    depth: usize,
 ) -> ContentCounts {
     let mut counts = ContentCounts::default();
 
@@ -1808,9 +1821,26 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    // Read within the page-content bound, as the extractor
+                    // reads a form: one inflating past it is scanned as
+                    // empty, its resources still walked.
+                    let content =
+                        match crate::extractor::content_decode::decompressed_content_within(
+                            stream,
+                            crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES,
+                        ) {
+                            Ok(content) => content,
+                            Err(lopdf::Error::Decompress(
+                                lopdf::DecompressError::MemoryLimitExceeded { .. },
+                            )) => Vec::new(),
+                            Err(_)
+                                if stream.content.len()
+                                    <= crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES =>
+                            {
+                                stream.content.clone()
+                            }
+                            Err(_) => Vec::new(),
+                        };
                     // Collect raw font names from this XObject's content stream.
                     // Every form bound is counted here, invoked or not, as
                     // the text and font tallies always have been; what the
@@ -1848,15 +1878,18 @@ fn scan_xobjects_in_resources(
                         resolve_font_names_to_ids(doc, res, &xobj_font_names, used_font_ids);
                         // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
-                        // Recurse into nested XObjects
-                        counts.add(scan_xobjects_in_resources(
-                            doc,
-                            res,
-                            visited,
-                            unique_chars,
-                            used_font_ids,
-                            font_map,
-                        ));
+                        // Recurse into nested XObjects, up to the depth cap.
+                        if depth < MAX_RESOURCE_FORM_DEPTH {
+                            counts.add(scan_xobjects_in_resources(
+                                doc,
+                                res,
+                                visited,
+                                unique_chars,
+                                used_font_ids,
+                                font_map,
+                                depth + 1,
+                            ));
+                        }
                     }
                 }
                 Some(b"Image") => {
@@ -2142,6 +2175,7 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
                 &mut has_template_image,
                 TEMPLATE_IMAGE_THRESHOLD,
                 &mut visited,
+                0,
             );
 
             // Also check Pattern resources: tiling patterns can contain
@@ -2178,6 +2212,7 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
                                         &mut has_template_image,
                                         TEMPLATE_IMAGE_THRESHOLD,
                                         &mut visited,
+                                        0,
                                     );
                                 }
                             }
@@ -2281,7 +2316,10 @@ pub(crate) struct PageOcrSignals {
 }
 
 /// Recursively collect image dimensions from XObject resources,
-/// including images nested inside Form XObjects.
+/// including images nested inside Form XObjects, `depth` forms deep (0 for
+/// the page's or a pattern's resources) and no deeper than
+/// [`MAX_RESOURCE_FORM_DEPTH`].
+#[allow(clippy::too_many_arguments)]
 fn collect_images_from_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
@@ -2290,6 +2328,7 @@ fn collect_images_from_resources(
     has_template_image: &mut bool,
     threshold: u64,
     visited: &mut HashSet<ObjectId>,
+    depth: usize,
 ) {
     let xobject = match resources.get(b"XObject") {
         Ok(obj) => obj,
@@ -2356,7 +2395,7 @@ fn collect_images_from_resources(
                     Object::Dictionary(dict) => Some(dict),
                     _ => None,
                 };
-                if let Some(form_res) = form_res_dict {
+                if let Some(form_res) = form_res_dict.filter(|_| depth < MAX_RESOURCE_FORM_DEPTH) {
                     collect_images_from_resources(
                         doc,
                         form_res,
@@ -2365,6 +2404,7 @@ fn collect_images_from_resources(
                         has_template_image,
                         threshold,
                         visited,
+                        depth + 1,
                     );
                 }
             }
