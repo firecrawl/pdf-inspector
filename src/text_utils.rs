@@ -860,21 +860,60 @@ fn strip_language_escapes(text: String) -> String {
 /// ActualText keeps [`decode_text_string`], whose reading the extracted
 /// text depends on.
 pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
+    decode_marked_text_string(bytes, true)
+}
+
+/// AcroForm `/T` and text or choice `/V`. Marked UTF-16 and UTF-8 follow
+/// their marks. Unmarked bytes are PDFDocEncoding when a byte is one PDFDoc
+/// reassigns (`C2 A0` is Â plus the euro sign, not U+00A0). A producer that
+/// writes UTF-8 without a mark is read as that UTF-8 when every byte is one
+/// PDFDoc leaves as Latin-1 (`José` is `4A 6F 73 C3 A9`), or when a byte is
+/// a 3- or 4-byte UTF-8 lead (`€`, an en dash).
+pub(crate) fn decode_form_field_text(bytes: &[u8]) -> String {
+    decode_marked_text_string(bytes, false)
+}
+
+fn decode_marked_text_string(bytes: &[u8], unmarked_utf8: bool) -> String {
     let mut text = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         strip_language_escapes(utf16_text(rest, u16::from_be_bytes))
     } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         strip_language_escapes(utf16_text(rest, u16::from_le_bytes))
     } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(rest).into_owned()
-    } else {
+    } else if unmarked_utf8 {
         match std::str::from_utf8(bytes) {
             Ok(utf8) if !utf8.is_ascii() => utf8.to_owned(),
             _ => bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect(),
         }
+    } else {
+        unmarked_form_field_text(bytes)
     };
     let end = text.trim_end_matches('\0').len();
     text.truncate(end);
     text
+}
+
+/// Unmarked AcroForm text. Valid non-ASCII UTF-8 is kept when every byte is
+/// a PDFDoc code that is still Latin-1 (`José` is `4A 6F 73 C3 A9`), or when
+/// a byte is a 3- or 4-byte UTF-8 lead. `€` is `E2 82 AC`; those continuation
+/// bytes are PDFDoc punctuation, but a lead in that range is not a PDFDoc
+/// string. Two-byte `C2`/`C3` sequences stay PDFDoc when a byte is one PDFDoc
+/// reassigns (`C2 A0` is Â plus the euro sign).
+fn unmarked_form_field_text(bytes: &[u8]) -> String {
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
+        let latin1 = bytes.iter().all(|&byte| pdf_doc_byte_is_latin1(byte));
+        let multibyte_lead = bytes.iter().any(|&byte| byte >= 0xE0);
+        if !utf8.is_ascii() && (latin1 || multibyte_lead) {
+            return utf8.to_owned();
+        }
+    }
+    bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect()
+}
+
+/// PDFDoc leaves this code as its Latin-1 character. The codes it reassigns
+/// are the spacing accents, the high punctuation and letters, and the euro.
+fn pdf_doc_byte_is_latin1(byte: u8) -> bool {
+    !matches!(byte, 0x18..=0x1F | 0x80..=0x9E | 0xA0)
 }
 
 /// Compute effective font size from base size and text matrix
