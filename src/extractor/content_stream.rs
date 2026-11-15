@@ -184,10 +184,11 @@ pub(crate) struct PendingSpace {
     em: f32,
 }
 
-/// Space runs narrower than this many em are invisible to gap detection:
-/// the widest word-space threshold in item merging is 0.13 em for
-/// lowercase junctions, and line assembly uses 0.15–0.18 em. Wider runs
-/// leave gaps that are detected there, and their items stay untouched.
+/// Gaps narrower than this many em are invisible to gap detection: the
+/// widest word-space threshold in item merging is 0.13 em for lowercase
+/// junctions, and line assembly uses 0.15–0.18 em. A space run that leaves
+/// a wider gap between its neighbours is detected there, and their items
+/// stay untouched; a gap the next run is kerned back over is not.
 const SQUEEZED_SPACE_EM: f32 = 0.2;
 
 /// Whether a junction character can take a rescued word space: letters and
@@ -196,9 +197,19 @@ fn takes_word_space(c: char) -> bool {
     c.is_alphanumeric() && !crate::text_utils::is_rtl_char(c)
 }
 
+/// Whether the character before a space run can end a word: a word
+/// character, or closing punctuation such as the `)` of `(CFR) and`.
+fn ends_word_before_space(c: char) -> bool {
+    takes_word_space(c)
+        || matches!(
+            c,
+            ')' | ']' | '}' | ',' | '.' | ';' | ':' | '!' | '?' | '%' | '"' | '’' | '”'
+        )
+}
+
 impl PendingSpace {
-    /// Note a whitespace-only run painted at `run` on `page`, when it is a
-    /// squeezed space right after the last item. A run continuing a pending
+    /// Note a whitespace-only run painted at `run` on `page`, when it
+    /// starts right where the last item ends. A run continuing a pending
     /// space extends it: several squeezed runs are still one space.
     pub(crate) fn note(
         pending: Option<Self>,
@@ -221,14 +232,14 @@ impl PendingSpace {
         if last.page != page || !matches!(last.item_type, ItemType::Text) || !last.is_upright() {
             return None;
         }
-        if !last.text.chars().last().is_some_and(takes_word_space) {
+        if !last.text.chars().last().is_some_and(ends_word_before_space) {
             return None;
         }
         let em = last.font_size.abs();
         if em <= 0.0 || !run.is_upright() || run.width <= 0.0 {
             return None;
         }
-        if run.width >= em * SQUEEZED_SPACE_EM || (run.y - last.y).abs() > em * 0.2 {
+        if (run.y - last.y).abs() > em * 0.2 {
             return None;
         }
         // The run must start where the previous item ends: a space painted
@@ -246,8 +257,8 @@ impl PendingSpace {
     }
 
     /// The next visible run is about to become an item: give the previous
-    /// item its space when the two runs are same-size alphanumeric text
-    /// with nothing but the space between them.
+    /// item its space when the two runs are same-size text with nothing but
+    /// the space between them and a gap too narrow to read as one.
     pub(crate) fn resolve(self, items: &mut [TextItem], next: &RunGeometry, text: &str, size: f32) {
         if self.after + 1 != items.len() || !next.is_upright() {
             return;
@@ -266,6 +277,9 @@ impl PendingSpace {
             return;
         }
         let last = &mut items[self.after];
+        if next.x - (last.x + last.width) >= em * SQUEEZED_SPACE_EM {
+            return;
+        }
         if !last.text.ends_with(char::is_whitespace) {
             last.text.push(' ');
         }
@@ -5239,6 +5253,27 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             (
                 "BT /F1 12 Tf 72 700 Td (900) Tj -6 Tc ( ) Tj 0 Tc (the) Tj ET",
                 "900 the",
+            ),
+        ] {
+            let items = extract_simple_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts, [expected], "{content}");
+        }
+    }
+
+    /// A full-width space run the next word is kerned back over leaves a
+    /// gap under the word-space thresholds, after a word or closing
+    /// punctuation alike: "(CFR) and" must not read "(CFR)and".
+    #[test]
+    fn space_run_overlapped_by_the_next_word_gives_the_word_space() {
+        for (content, expected) in [
+            (
+                "BT /F1 12 Tf 72 700 Td ((CFR)) Tj [( ) 500] TJ (and) Tj ET",
+                "(CFR) and",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td (for) Tj [( ) 500] TJ (the) Tj ET",
+                "for the",
             ),
         ] {
             let items = extract_simple_items(content.as_bytes());
