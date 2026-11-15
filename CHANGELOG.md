@@ -7,6 +7,21 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [1.26.1] - 2026-11-15
+
+Changes since 1.26.0.
+
+### Fixed
+
+- A word space painted as its own run is kept when the next word is
+  kerned back over it, and after closing punctuation as well as after a
+  word: `Regulations (CFR) and` painted as `(CFR`, `)`, a space and
+  `and` no longer reads `(CFR)and`, and a struck `(CFR)` no longer
+  spreads to the next word in consumers that style whole words. The test
+  is the gap the junction leaves, not the width of the space run, so wide
+  gaps are still left to gap detection.
+  ([#666](https://github.com/firecrawl/pdf-inspector/pull/666))
+
 ## [1.26.0] - 2026-11-13
 
 Changes since 1.25.2.
