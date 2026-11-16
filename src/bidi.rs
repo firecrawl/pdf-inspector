@@ -812,8 +812,10 @@ pub(crate) fn logical_line_order<T>(
     // Where each item's letters and digits land in the logical line.
     let is_strong = |c: char| c.is_alphanumeric() && !is_combining_mark(c);
     let mut strong_positions: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
+    let mut first_positions = vec![None; items.len()];
     for (at, VisualChar { ch, item }) in logical.iter().enumerate() {
         if let Some(index) = item {
+            first_positions[*index].get_or_insert(at);
             if is_strong(*ch) {
                 strong_positions[*index].push(at);
             }
@@ -862,6 +864,14 @@ pub(crate) fn logical_line_order<T>(
                 }
             }
         }
+        // A sole lettered neighbour is both first and last in `reading`.
+        // Use resolved character positions to decide which side an edge
+        // punctuation run belongs on before partitioning the logical text.
+        let run_position = run
+            .iter()
+            .filter_map(|&i| first_positions[i])
+            .min()
+            .expect("nonempty punctuation run has logical positions");
         let place = |i: usize| reading.iter().position(|&r| r == i).unwrap_or(0);
         let (insert_at, reversed) = match (left, right) {
             // Between two lettered items: right after the one read first,
@@ -875,18 +885,18 @@ pub(crate) fn logical_line_order<T>(
                 }
             }
             // At the page's left edge: the start of the reading when the
-            // neighbour is read first, else its very end, turned round.
+            // run resolves before its neighbour, else its very end, turned round.
             (None, Some(r)) => {
-                if place(r) == 0 {
+                if run_position < strong_positions[r][0] {
                     (0, false)
                 } else {
                     (reading.len(), true)
                 }
             }
             // At the page's right edge: the end of the reading when the
-            // neighbour is read last, else its very start, turned round.
+            // run resolves after its neighbour, else its very start, turned round.
             (Some(l), None) => {
-                if place(l) + 1 == reading.len() {
+                if run_position > strong_positions[l][0] {
                     (reading.len(), false)
                 } else {
                     (0, true)
@@ -1256,6 +1266,49 @@ mod tests {
                 (1, "16)".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn punctuation_at_rtl_line_edges_keeps_letters_in_their_own_run() {
+        let word = "\u{05D0}\u{05D1}\u{05D2}\u{05D3}";
+        let visual_word = "\u{05D3}\u{05D2}\u{05D1}\u{05D0}";
+        for rtl_base in [false, true] {
+            for visual in [false, true] {
+                for trailing in [false, true] {
+                    let text = if visual { visual_word } else { word };
+                    let items = if trailing {
+                        [(text, 50.0f32, 24.0f32), (", ", 82.0, 6.0)]
+                    } else {
+                        [(", ", 40.0f32, 6.0f32), (text, 50.0, 24.0)]
+                    };
+                    let order = logical_line_order(
+                        &items,
+                        |i| i.0,
+                        |i| (i.1, i.2),
+                        |_| 12.0,
+                        |_| visual,
+                        None,
+                        rtl_base,
+                    );
+                    let word_index = usize::from(!trailing);
+                    assert_eq!(
+                        order
+                            .iter()
+                            .find(|(index, _)| *index == word_index)
+                            .unwrap()
+                            .1,
+                        word,
+                        "rtl_base={rtl_base}, visual={visual}, trailing={trailing}: {order:?}",
+                    );
+                    let punctuation = &order
+                        .iter()
+                        .find(|(index, _)| *index != word_index)
+                        .unwrap()
+                        .1;
+                    assert_eq!(punctuation.trim(), ",", "{order:?}");
+                }
+            }
+        }
     }
 
     #[test]

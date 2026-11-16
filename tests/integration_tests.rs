@@ -7365,6 +7365,33 @@ fn hebrew_items(content: &str) -> Vec<TextItem> {
     extract_text_with_positions_mem(&bytes).unwrap()
 }
 
+#[test]
+fn rtl_word_beside_separate_punctuation_keeps_its_letters_after_line_grouping() {
+    let items = hebrew_items(
+        "BT /F1 12 Tf 1 0 0 1 50 120 Tm (DCBA) Tj ET\n\
+         BT /F1 12 Tf 1 0 0 1 50 100 Tm (DCBA) Tj ET\n\
+         BT /F1 12 Tf 1 0 0 1 82 100 Tm (, ) Tj ET\n",
+    );
+    let word = "\u{05D0}\u{05D1}\u{05D2}\u{05D3}";
+    assert_eq!(
+        items.iter().filter(|item| item.text.contains(word)).count(),
+        2,
+        "{items:?}",
+    );
+    let text = pdf_inspector::extractor::group_into_lines_preserving_all_text(items)
+        .into_iter()
+        .map(|line| line.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text.matches(word).count(), 2, "{text}");
+    assert_eq!(
+        text.lines().filter(|line| line.contains(word)).count(),
+        2,
+        "{text}",
+    );
+    assert_eq!(text.matches(',').count(), 1, "{text}");
+}
+
 fn clipped_rtl_items(left_clip: &str, right_clip: &str) -> Vec<TextItem> {
     let field = |clip: &str, x: u32, text: &str| {
         format!("q {clip} BT /F1 12 Tf 10 Tz 1 0 0 1 {x} 100 Tm ({text}) Tj ET Q\n")
