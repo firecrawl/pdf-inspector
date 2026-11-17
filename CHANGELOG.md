@@ -7,10 +7,49 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## [Unreleased]
+## [1.26.1] - 2026-11-15
+
+Changes since 1.26.0.
 
 ### Fixed
 
+- A word space painted as its own run is kept when the next word is
+  kerned back over it, and after closing punctuation as well as after a
+  word: `Regulations (CFR) and` painted as `(CFR`, `)`, a space and
+  `and` no longer reads `(CFR)and`, and a struck `(CFR)` no longer
+  spreads to the next word in consumers that style whole words. The test
+  is the gap the junction leaves, not the width of the space run, so wide
+  gaps are still left to gap detection.
+  ([#666](https://github.com/firecrawl/pdf-inspector/pull/666))
+
+## [1.26.0] - 2026-11-13
+
+Changes since 1.25.2.
+
+### Added
+
+- `TextItem::layout_strikeout`, the strikeout that layout heuristics read.
+  It equals `is_strikeout` except on the strikethroughs recovered below,
+  which are emitted as `<s>` but leave run merging and heuristic table
+  detection as they were without them. Code that builds a `TextItem`
+  literal sets it, normally to the same value as `is_strikeout`.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+
+### Fixed
+
+- Strikethrough rules of similar width repeated down a page, as on a
+  tracked-changes page that strikes several whole lines, are kept. The
+  repeated-ruling filter only rescued a rule that underlines the text it
+  fits, so every such strike was dropped as a table ruling.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+- Text inside a detected table keeps its strikethrough. Clearing the
+  decorations of table text exists for underlines, which a cell's bottom
+  border imitates; no border runs through a cell's glyphs, and a
+  tracked-changes page whose rules read as a grid lost every strike.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
+- A word hyphenated across a line break inside a struck run rejoins across
+  the reopened `<s>` tag.
+  ([#663](https://github.com/firecrawl/pdf-inspector/pull/663))
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
   comes from a core Windows font (Arial, Times New Roman, Verdana, ...) is
   read through the Windows variant of the standard glyph order. That
@@ -21,10 +60,12 @@ version and date. Earlier releases are described in their
   `company‘s` and en dashes as `œ`. The font's
   own advances choose the variant, since an accented letter advances like
   its base letter.
+  ([#618](https://github.com/firecrawl/pdf-inspector/pull/618))
 - A glyph in such a subset past the standard order that paints nothing but
   advances reads as a space. Word justifies lines with Arial's en and em
   spaces, which came out as U+FFFD between every word
   (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+  ([#618](https://github.com/firecrawl/pdf-inspector/pull/618))
 
 ## [1.25.2] - 2026-09-28
 

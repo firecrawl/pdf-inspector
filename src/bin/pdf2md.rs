@@ -362,6 +362,7 @@ mod tests {
             render_mode: Some(3),
             is_underline: true,
             is_strikeout: true,
+            layout_strikeout: true,
             rotation: 90.0,
             advance_known: true,
             item_type: ItemType::Text,
