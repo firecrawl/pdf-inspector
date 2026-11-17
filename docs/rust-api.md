@@ -39,7 +39,7 @@ For the latest unreleased changes, use the git dependency instead:
 pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector" }
 ```
 
-The crate also ships CLI binaries — `pdf2md` (PDF → Markdown, with `--json`, `--pages`, `--select-pages`, and the opt-in token-saving `--compact` profile) and `detect-pdf` (classification, with `--analyze --json`):
+The crate also ships CLI binaries — `pdf2md` (PDF → Markdown, with `--json`, `--pages`, `--select-pages`, and the opt-in token-saving `--compact` profile, plus `--drop-form-fields` and `--drop-page-numbers` to strip navigation metadata and `<!-- Page N -->` markers) and `detect-pdf` (classification, with `--analyze --json`):
 
 ```bash
 cargo install pdf-inspector
@@ -105,6 +105,20 @@ let result = process_pdf_with_options(
 let result = process_pdf_with_options(
     "document.pdf",
     PdfOptions::new().pages([1, 3, 5]),
+)?;
+```
+
+Drop navigation metadata that is not document content: AcroForm form-field
+values and content-stream destination/bookmark markers (for example
+named-destination entries like `P1: OTA/XYZ`, internal bookmarks like
+`JWBT634-c03`, or producer print footers like `Printer: Hamilton Printing`):
+
+```rust
+use pdf_inspector::{process_pdf_with_options, PdfOptions};
+
+let result = process_pdf_with_options(
+    "document.pdf",
+    PdfOptions::new().include_form_fields(false),
 )?;
 ```
 
@@ -567,7 +581,7 @@ Low-level detection functions are also available via the `detector` module (`det
 
 | Type | Description |
 |---|---|
-| `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter) |
+| `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter, form fields) |
 | `ProcessMode` | `DetectOnly`, `Analyze`, `Full` |
 | `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
 | `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, cmap_gaps, timing, and the document information dictionary's entries `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date` and `mod_date` (each decoded as a PDF text string — UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding otherwise — the dates as written; `None` when missing or not a string) |

@@ -3,17 +3,19 @@
 use std::collections::HashMap;
 
 use crate::structure_tree::StructRole;
+use crate::text_utils::should_join_items;
 use crate::types::{TextItem, TextLine};
 
 use super::analysis::detect_header_level;
 
-/// Resolve a heading level for a line, considering both struct-tree roles and font heuristics.
-/// Struct-tree headings take priority.
+/// Resolve a heading level for a line, considering struct-tree roles, PDF outlines, and font heuristics.
+/// Struct-tree headings take priority, followed by outline bookmarks, then font heuristics.
 fn effective_heading_level(
     line: &TextLine,
     base_size: f32,
     heading_tiers: &[f32],
     struct_roles: Option<&HashMap<u32, HashMap<i64, StructRole>>>,
+    outlines: Option<&[crate::outlines::OutlineItem]>,
 ) -> Option<usize> {
     // Check struct-tree role first
     if let Some(roles) = struct_roles {
@@ -40,6 +42,14 @@ fn effective_heading_level(
         }
     }
 
+    // Check PDF outline bookmarks
+    if let Some(o) = outlines {
+        let page_items: Vec<_> = o.iter().filter(|i| i.page == line.page).cloned().collect();
+        if let Some(level) = crate::outlines::match_outline_heading(line, &page_items) {
+            return Some(level);
+        }
+    }
+
     // Fall back to font-size heuristic
     let font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
     detect_header_level(
@@ -57,12 +67,13 @@ fn effective_heading_level(
 /// This function detects consecutive lines at the same heading tier on the same page
 /// with a small Y gap and merges them into one line.
 ///
-/// Both font-size heuristic headings and struct-tree tagged headings are considered.
+/// Both font-size heuristic headings, outline headings, and struct-tree tagged headings are considered.
 pub(crate) fn merge_heading_lines(
     lines: Vec<TextLine>,
     base_size: f32,
     heading_tiers: &[f32],
     struct_roles: Option<&HashMap<u32, HashMap<i64, StructRole>>>,
+    outlines: Option<&[crate::outlines::OutlineItem]>,
 ) -> Vec<TextLine> {
     if lines.is_empty() {
         return lines;
@@ -71,12 +82,14 @@ pub(crate) fn merge_heading_lines(
     let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
 
     for line in lines {
-        let line_level = effective_heading_level(&line, base_size, heading_tiers, struct_roles);
+        let line_level =
+            effective_heading_level(&line, base_size, heading_tiers, struct_roles, outlines);
         let line_font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
 
         // Check if the previous line is a heading at the same level on the same page
         let should_merge = if let (Some(prev), Some(curr_level)) = (result.last(), line_level) {
-            let prev_level = effective_heading_level(prev, base_size, heading_tiers, struct_roles);
+            let prev_level =
+                effective_heading_level(prev, base_size, heading_tiers, struct_roles, outlines);
             let same_page = prev.page == line.page;
             let same_level = prev_level == Some(curr_level);
             let y_gap = prev.y - line.y;
@@ -112,8 +125,14 @@ pub(crate) fn merge_heading_lines(
                 // Both lines must be tier-less: a tiered/tagged bold heading
                 // followed by bold body text must not absorb it.
                 line_level.is_none()
-                    && effective_heading_level(prev, base_size, heading_tiers, struct_roles)
-                        .is_none()
+                    && effective_heading_level(
+                        prev,
+                        base_size,
+                        heading_tiers,
+                        struct_roles,
+                        outlines,
+                    )
+                    .is_none()
                     && prev.page == line.page
                     && all_bold(prev)
                     && all_bold(&line)
@@ -149,20 +168,61 @@ pub(crate) fn merge_heading_lines(
 
 /// Merge drop caps with the appropriate line.
 /// A drop cap is a single large letter at the start of a paragraph.
-/// Due to PDF coordinate sorting, the drop cap may appear AFTER the line it belongs to.
+/// It may be grouped into the first line as its leading item, or may appear
+/// as a standalone line.
 pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextLine> {
     let mut result: Vec<TextLine> = Vec::with_capacity(lines.len());
 
-    for line in &lines {
+    for mut line in lines {
+        // Case 1: The drop cap is already the first item in a multi-item line
+        if line.items.len() >= 2 {
+            let first = &line.items[0];
+            let first_text = first.text.trim();
+            let second = &line.items[1];
+            let is_drop_cap_item = first_text.chars().count() >= 1
+                && first_text.chars().count() <= 2
+                && first_text.chars().any(|c| c.is_alphabetic())
+                && first_text
+                    .chars()
+                    .filter(|c| c.is_alphabetic())
+                    .all(|c| c.is_uppercase())
+                && first.font_size >= base_size * 1.8
+                && first.font_size >= 16.0
+                && second.font_size <= base_size * 1.4;
+
+            if is_drop_cap_item {
+                let drop_text = first_text.to_string();
+                let second_text = second.text.as_str();
+                let join_without_space = second_text
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_lowercase())
+                    || should_join_items(first, second, line.adaptive_threshold);
+
+                let first_x = line.items[0].x;
+                let first_legacy = line.items[0].legacy_symbol_rewrite;
+
+                if join_without_space {
+                    line.items[1].text = format!("{}{}", drop_text, second_text.trim_start());
+                } else {
+                    line.items[1].text = format!("{} {}", drop_text, second_text.trim_start());
+                }
+                line.items[1].x = first_x;
+                line.items[1].legacy_symbol_rewrite |= first_legacy;
+                line.items.remove(0);
+
+                result.push(line);
+                continue;
+            }
+        }
+
         let text = line.text();
         let trimmed = text.trim();
 
-        // Check if this looks like a drop cap:
-        // 1. Single character (or single char + space)
-        // 2. Much larger than base font (3x or more)
-        // 3. The character is uppercase
-        let is_drop_cap = trimmed.len() <= 2
-            && line.items.first().map(|i| i.font_size).unwrap_or(0.0) >= base_size * 2.5
+        // Case 2: Standalone drop cap line (single char / 2 chars)
+        let is_drop_cap = trimmed.chars().count() <= 2
+            && line.items.first().map(|i| i.font_size).unwrap_or(0.0) >= base_size * 1.8
             && trimmed
                 .chars()
                 .next()
@@ -173,10 +233,10 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
             let drop_char = trimmed.chars().next().unwrap();
 
             // Find the first line that starts with lowercase and is at the START of a paragraph
-            // (i.e., preceded by a header or non-lowercase-starting line)
+            // (search backwards from most recent lines on same page)
             let mut target_idx: Option<usize> = None;
 
-            for (idx, prev_line) in result.iter().enumerate() {
+            for (idx, prev_line) in result.iter().enumerate().rev() {
                 if prev_line.page != line.page {
                     continue;
                 }
@@ -225,7 +285,7 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
             continue;
         }
 
-        result.push(line.clone());
+        result.push(line);
     }
 
     result
@@ -264,6 +324,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -316,7 +379,7 @@ mod tests {
         roles.insert(12i64, StructRole::P);
         page_roles.insert(1u32, roles);
 
-        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles));
+        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles), None);
         assert_eq!(result.len(), 2, "should merge two H2 lines into one");
         let merged_text = result[0].text();
         assert!(
@@ -339,7 +402,7 @@ mod tests {
         roles.insert(11i64, StructRole::H2);
         page_roles.insert(1u32, roles);
 
-        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles));
+        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles), None);
         assert_eq!(result.len(), 2, "should not merge different heading levels");
     }
 
@@ -357,7 +420,7 @@ mod tests {
         roles.insert(11i64, StructRole::P);
         page_roles.insert(1u32, roles);
 
-        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles));
+        let result = merge_heading_lines(lines, 12.0, &[], Some(&page_roles), None);
         assert_eq!(result.len(), 2, "should not merge heading with body text");
     }
 
@@ -371,7 +434,7 @@ mod tests {
         ];
 
         let heading_tiers = vec![18.0];
-        let result = merge_heading_lines(lines, 12.0, &heading_tiers, None);
+        let result = merge_heading_lines(lines, 12.0, &heading_tiers, None, None);
         assert_eq!(result.len(), 2, "should merge font-based heading lines");
     }
 
@@ -399,7 +462,7 @@ mod tests {
             make_bold_line("structure in Japan", 1, 686.0),
             make_line("Body text paragraph follows here.", 12.0, 1, 660.0, None),
         ];
-        let result = merge_heading_lines(lines, 12.0, &[], None);
+        let result = merge_heading_lines(lines, 12.0, &[], None, None);
         assert_eq!(result.len(), 2, "wrapped bold heading should merge");
         assert!(result[0].text().contains("cost structure in Japan"));
     }
@@ -412,7 +475,7 @@ mod tests {
             make_bold_line("Replace", 1, 700.0),
             make_bold_line("Trash", 1, 686.0),
         ];
-        let result = merge_heading_lines(lines, 12.0, &[], None);
+        let result = merge_heading_lines(lines, 12.0, &[], None, None);
         assert_eq!(result.len(), 2, "distinct bold lines must not merge");
 
         // Previous line ends a sentence — continuation must not merge.
@@ -420,7 +483,7 @@ mod tests {
             make_bold_line("This is a bold sentence.", 1, 700.0),
             make_bold_line("another bold line", 1, 686.0),
         ];
-        let result = merge_heading_lines(lines, 12.0, &[], None);
+        let result = merge_heading_lines(lines, 12.0, &[], None, None);
         assert_eq!(result.len(), 2, "sentence-final bold line must not merge");
     }
 
@@ -435,7 +498,45 @@ mod tests {
             heading,
             make_bold_line("emphasized body text continues here", 1, 686.0),
         ];
-        let result = merge_heading_lines(lines, 12.0, &[16.0], None);
+        let result = merge_heading_lines(lines, 12.0, &[16.0], None, None);
         assert_eq!(result.len(), 2, "tiered heading must not absorb bold body");
+    }
+
+    #[test]
+    fn test_merge_drop_cap_in_multi_item_line() {
+        let cap_item = make_item("T", 36.0, None);
+        let body_item = make_item("here is something fascinating", 12.0, None);
+        let line = TextLine {
+            items: vec![cap_item, body_item],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.10,
+        };
+
+        let result = merge_drop_caps(vec![line], 12.0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text(), "There is something fascinating");
+        assert_eq!(result[0].items[0].font_size, 12.0);
+    }
+
+    #[test]
+    fn test_merge_outline_headings() {
+        let outlines = vec![crate::outlines::OutlineItem {
+            title: "The Foundation of Technical Analysis".to_string(),
+            level: 1,
+            page: 1,
+            dest_y: Some(700.0),
+        }];
+        let lines = vec![
+            make_line("The Foundation of", 12.0, 1, 700.0, None),
+            make_line("Technical Analysis", 12.0, 1, 686.0, None),
+            make_line("This is body text.", 12.0, 1, 660.0, None),
+        ];
+
+        let result = merge_heading_lines(lines, 12.0, &[], None, Some(&outlines));
+        assert_eq!(result.len(), 2, "should merge wrapped outline heading");
+        assert!(result[0]
+            .text()
+            .contains("The Foundation of Technical Analysis"));
     }
 }

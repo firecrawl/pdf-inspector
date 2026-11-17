@@ -909,6 +909,8 @@ mod tests {
             item_type: crate::types::ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            image_data: None,
+            image_format: None,
         };
         crate::types::TextLine {
             items: vec![item],

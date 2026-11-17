@@ -2954,13 +2954,110 @@ fn should_use_y_sorting(items: &[TextItem]) -> bool {
     chaos_ratio > 0.4
 }
 
+/// Detect drop caps and align their baseline `y` with the top line of the paragraph.
+/// A drop cap is a large initial letter (e.g. 2-3 lines high) whose glyph baseline
+/// is placed at line 2 or 3, while its top aligns with line 1.
+/// By setting `cap.y` to the baseline of the first line beside it, downstream
+/// Y-sorting and line grouping will place the drop cap at the start of the first line.
+fn adjust_drop_cap_positions(items: &mut [TextItem]) -> bool {
+    if items.len() < 2 {
+        return false;
+    }
+
+    // Estimate base font size for the item group (median of body items)
+    let mut font_sizes: Vec<f32> = items
+        .iter()
+        .filter(|i| i.is_upright() && i.is_horizontal() && i.font_size > 0.0)
+        .map(|i| i.font_size)
+        .collect();
+    if font_sizes.is_empty() {
+        return false;
+    }
+    font_sizes.sort_by(|a, b| a.total_cmp(b));
+    let base_size = font_sizes[font_sizes.len() / 2];
+
+    let mut adjusted = false;
+
+    // Find candidate drop caps
+    for i in 0..items.len() {
+        let cap = &items[i];
+        if !cap.is_upright() || !cap.is_horizontal() {
+            continue;
+        }
+        let text = cap.text.trim();
+        // Drop caps are typically 1 character (or 1 uppercase char + optional quote/punctuation)
+        let is_candidate_cap = text.chars().count() >= 1
+            && text.chars().count() <= 2
+            && text.chars().any(|c| c.is_alphabetic())
+            && text
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| c.is_uppercase())
+            && cap.font_size >= base_size * 1.8
+            && cap.font_size >= 16.0;
+
+        if !is_candidate_cap {
+            continue;
+        }
+
+        // Find the top-most line of text immediately to the right of this drop cap
+        let cap_x = cap.x;
+        let cap_w = cap.width;
+        let cap_y = cap.y;
+        let cap_size = cap.font_size;
+
+        let mut best_top_y: Option<f32> = None;
+
+        for (j, other) in items.iter().enumerate() {
+            if i == j || !other.is_upright() || !other.is_horizontal() {
+                continue;
+            }
+            // Must be smaller text (body font)
+            if other.font_size > cap_size * 0.75 {
+                continue;
+            }
+            // Must be positioned to the right of the drop cap (within reasonable indent range)
+            let x_right = other.x >= cap_x + cap_w * 0.3;
+            let x_near = other.x <= cap_x + cap_w * 3.5 + 100.0;
+            if !x_right || !x_near {
+                continue;
+            }
+            // Must be within vertical span of drop cap:
+            // in PDF coords, other.y is between cap_y - 2.0 and cap_y + cap_size * 1.5
+            let y_in_range = other.y >= cap_y - 2.0 && other.y <= cap_y + cap_size * 1.5;
+            if !y_in_range {
+                continue;
+            }
+
+            // We look for the highest baseline (max Y in PDF coords)
+            if let Some(cur_top) = best_top_y {
+                if other.y > cur_top {
+                    best_top_y = Some(other.y);
+                }
+            } else {
+                best_top_y = Some(other.y);
+            }
+        }
+
+        if let Some(top_y) = best_top_y {
+            // If top_y is above cap_y, snap cap.y to top_y so it sorts with the first line
+            if top_y > cap_y + 0.5 {
+                items[i].y = top_y;
+                adjusted = true;
+            }
+        }
+    }
+
+    adjusted
+}
+
 /// Group items from a single column into lines
 /// Uses heuristics to decide between PDF stream order and Y-position sorting.
 /// `page_rtl` is the direction of the page the column belongs to, which
 /// settles how its lines with right-to-left letters read when their own
 /// letters do not (see `rtl_line_base`).
 fn group_single_column(
-    items: Vec<TextItem>,
+    mut items: Vec<TextItem>,
     adaptive_threshold: f32,
     page_rtl: bool,
 ) -> Vec<TextLine> {
@@ -2968,8 +3065,10 @@ fn group_single_column(
         return Vec::new();
     }
 
+    let has_drop_cap = adjust_drop_cap_positions(&mut items);
+
     // Decide whether to use stream order or Y-sorting
-    let use_y_sorting = should_use_y_sorting(&items);
+    let use_y_sorting = has_drop_cap || should_use_y_sorting(&items);
 
     let items = if use_y_sorting {
         // Sort by Y descending (top to bottom in PDF coords). Script glyphs
@@ -3133,6 +3232,9 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+
+            image_data: None,
+            image_format: None,
         }
     }
 
@@ -3892,6 +3994,9 @@ mod tests {
                     item_type: ItemType::Text,
                     mcid: None,
                     baseline_shift: 0.0,
+
+                    image_data: None,
+                    image_format: None,
                 });
             }
             y -= 14.0;
@@ -4179,5 +4284,37 @@ mod tests {
         let mask = identify_spanning_lines(&items, &cols);
         let spanning_count = mask.iter().filter(|&&m| m).count();
         assert_eq!(spanning_count, 0, "Narrow header should NOT be pre-masked");
+    }
+
+    #[test]
+    fn drop_cap_grouped_into_top_line() {
+        let mut drop_cap = make_item(1, 50.0, 686.0, "T");
+        drop_cap.font_size = 36.0;
+        drop_cap.height = 36.0;
+        drop_cap.width = 24.0;
+
+        let mut line1 = make_item(1, 78.0, 700.0, "here is something fascinating");
+        line1.font_size = 12.0;
+        line1.height = 12.0;
+
+        let mut line2 = make_item(1, 78.0, 686.0, "traded markets and researchers");
+        line2.font_size = 12.0;
+        line2.height = 12.0;
+
+        let mut line3 = make_item(1, 50.0, 672.0, "markets, perhaps captivated");
+        line3.font_size = 12.0;
+        line3.height = 12.0;
+
+        let items = vec![drop_cap, line1, line2, line3];
+        let lines = group_single_column(items, 0.10, false);
+
+        assert_eq!(lines.len(), 3);
+        // Line 1 should contain the drop cap T and the line1 item
+        assert_eq!(lines[0].items.len(), 2);
+        assert_eq!(lines[0].items[0].text, "T");
+        assert_eq!(lines[0].items[1].text, "here is something fascinating");
+        // Line 2 and Line 3 should have their respective items only
+        assert_eq!(lines[1].items[0].text, "traded markets and researchers");
+        assert_eq!(lines[2].items[0].text, "markets, perhaps captivated");
     }
 }

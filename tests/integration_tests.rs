@@ -362,6 +362,8 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
+        image_data: None,
+        image_format: None,
     }
 }
 
@@ -401,6 +403,8 @@ fn make_text_item_with_font(
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
+        image_data: None,
+        image_format: None,
     }
 }
 
@@ -11061,4 +11065,343 @@ fn test_renumbered_subset_whose_program_reads_the_renumbered_codes_is_remapped()
         &lines,
     );
     assert_eq!(read, ["(2)(4)"]);
+}
+
+/// AcroForm fields whose values are named-destination metadata (e.g.
+/// `P1: OTA/XYZ`) are noise for most documents. `include_form_fields` must
+/// let callers drop them while keeping real content.
+#[test]
+fn include_form_fields_option_drops_field_noise_but_keeps_content() {
+    let buf = std::fs::read("tests/fixtures/_repro_formfield.pdf").unwrap();
+
+    // Default: form fields are included.
+    let default_result = process_pdf_mem(&buf).unwrap();
+    let default_md = default_result.markdown.unwrap();
+    assert!(
+        default_md.contains("P1: OTA/XYZ"),
+        "default output should keep form fields, got: {:?}",
+        default_md
+    );
+    assert!(default_md.contains("Real document text"));
+
+    // opt-out: form fields dropped, real content preserved.
+    let no_fields =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().include_form_fields(false)).unwrap();
+    let no_fields_md = no_fields.markdown.unwrap();
+    assert!(
+        !no_fields_md.contains("P1: OTA/XYZ"),
+        "form-field noise should be gone, got: {:?}",
+        no_fields_md
+    );
+    assert!(!no_fields_md.contains("P2: DEST/A/1"));
+    assert!(
+        no_fields_md.contains("Real document text"),
+        "real content must be preserved, got: {:?}",
+        no_fields_md
+    );
+}
+
+/// The `pdf2md` CLI `--drop-form-fields` flag must drop AcroForm navigation-
+/// metadata fields (e.g. `P1: OTA/XYZ`) while keeping real content.
+#[test]
+fn cli_drop_form_fields_flag() {
+    let binary = env!("CARGO_BIN_EXE_pdf2md");
+    let fixture = "tests/fixtures/_repro_formfield.pdf";
+
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(binary)
+            .arg(fixture)
+            .args(args)
+            .arg("--raw")
+            .output()
+            .expect("failed to run pdf2md");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // Default output keeps the form-field noise.
+    let default_md = run(&[]);
+    assert!(
+        default_md.contains("P1: OTA/XYZ"),
+        "default output should keep form fields, got: {default_md:?}"
+    );
+
+    // With the flag, the noise is gone but real content remains.
+    let dropped_md = run(&["--drop-form-fields"]);
+    assert!(
+        !dropped_md.contains("P1: OTA/XYZ"),
+        "form-field noise should be dropped, got: {dropped_md:?}"
+    );
+    assert!(!dropped_md.contains("P2: DEST/A/1"));
+    assert!(
+        dropped_md.contains("Real document text"),
+        "real content must be preserved, got: {dropped_md:?}"
+    );
+}
+
+#[test]
+fn cli_drop_page_numbers_flag() {
+    let binary = env!("CARGO_BIN_EXE_pdf2md");
+    let fixture = "tests/fixtures/firecrawl_docs_tagged.pdf";
+
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(binary)
+            .arg(fixture)
+            .args(args)
+            .arg("--raw")
+            .output()
+            .expect("failed to run pdf2md");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // --pages inserts page-break markers.
+    let marked_md = run(&["--pages"]);
+    assert!(
+        marked_md.contains("<!-- Page"),
+        "--pages should insert page markers, got: {} occurrences",
+        marked_md.matches("<!-- Page").count()
+    );
+
+    // --drop-page-numbers removes them even when --pages is also given.
+    let dropped_md = run(&["--pages", "--drop-page-numbers"]);
+    assert!(
+        !dropped_md.contains("<!-- Page"),
+        "--drop-page-numbers should remove page markers, got: {dropped_md:?}"
+    );
+
+    // Without --pages there are no markers either.
+    let plain_md = run(&["--drop-page-numbers"]);
+    assert!(!plain_md.contains("<!-- Page"));
+}
+
+#[test]
+fn test_image_extraction_and_markdown_linking() {
+    let binary = env!("CARGO_BIN_EXE_pdf2md");
+    let fixture = "tests/fixtures/upstage_key_functions.pdf";
+    let temp_dir = tempfile::tempdir().unwrap();
+    let md_path = temp_dir.path().join("output.md");
+    let img_dir = temp_dir.path().join("output_images");
+
+    let output = std::process::Command::new(binary)
+        .arg(fixture)
+        .arg(md_path.to_str().unwrap())
+        .arg("--images")
+        .output()
+        .expect("failed to run pdf2md");
+    assert!(output.status.success());
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("![Image: Image143]"));
+    assert!(img_dir.exists(), "image dir should exist: {img_dir:?}");
+    let entries: Vec<_> = std::fs::read_dir(&img_dir).unwrap().collect();
+    assert!(!entries.is_empty(), "should have exported images");
+}
+
+#[test]
+fn test_drop_cap_paragraph_extraction() {
+    use pdf_inspector::markdown::to_markdown_from_items;
+    use pdf_inspector::MarkdownOptions;
+
+    let mut drop_cap = make_text_item("T", 50.0, 686.0, 36.0, 1);
+    drop_cap.width = 24.0;
+    drop_cap.font = "Times-Roman".to_string();
+
+    let mut line1 = make_text_item(
+        "here is something fascinating and mesmerizing about price movements in actively",
+        78.0,
+        700.0,
+        12.0,
+        1,
+    );
+    line1.width = 400.0;
+    line1.font = "Times-Roman".to_string();
+
+    let mut line2 = make_text_item(
+        "traded markets; academics, researchers, traders, and analysts are drawn to study",
+        78.0,
+        686.0,
+        12.0,
+        1,
+    );
+    line2.width = 400.0;
+    line2.font = "Times-Roman".to_string();
+
+    let mut line3 = make_text_item(
+        "markets, perhaps captivated as much by the patterns in the market as by the",
+        50.0,
+        672.0,
+        12.0,
+        1,
+    );
+    line3.width = 428.0;
+    line3.font = "Times-Roman".to_string();
+
+    let items = vec![drop_cap, line1, line2, line3];
+    let md = to_markdown_from_items(items, MarkdownOptions::default());
+
+    // Must NOT be treated as a heading # Tmarkets...
+    assert!(!md.contains("# T"));
+    assert!(!md.contains('#'));
+    // Must start with "There is something..."
+    assert!(md.contains(
+        "There is something fascinating and mesmerizing about price movements in actively"
+    ));
+    // Must seamlessly contain subsequent lines
+    assert!(md.contains(
+        "traded markets; academics, researchers, traders, and analysts are drawn to study"
+    ));
+    assert!(
+        md.contains("markets, perhaps captivated as much by the patterns in the market as by the")
+    );
+}
+
+fn synthetic_outline_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+    let outlines_id = doc.new_object_id();
+    let item1_id = doc.new_object_id();
+    let item2_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 12.into()]),
+        // Heading 1 line at Y=700
+        Operation::new("Td", vec![50.into(), 700.into()]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("Chapter 1: The Foundation")],
+        ),
+        // Body text at Y=660
+        Operation::new("Td", vec![0.into(), Object::Integer(-40)]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("This is introductory text.")],
+        ),
+        // Heading 2 line at Y=500
+        Operation::new("Td", vec![0.into(), Object::Integer(-160)]),
+        Operation::new("Tj", vec![Object::string_literal("1.1 Market Dynamics")]),
+        // Body text at Y=460
+        Operation::new("Td", vec![0.into(), Object::Integer(-40)]),
+        Operation::new(
+            "Tj",
+            vec![Object::string_literal("Detailed discussion of markets.")],
+        ),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+
+    // Outlines tree: Root outlines dict -> item1 (H1) -> First -> item2 (H2)
+    doc.objects.insert(
+        outlines_id,
+        dictionary! {
+            "Type" => "Outlines",
+            "First" => item1_id,
+            "Last" => item1_id,
+            "Count" => 2,
+        }
+        .into(),
+    );
+
+    doc.objects.insert(
+        item1_id,
+        dictionary! {
+            "Title" => Object::string_literal("Chapter 1: The Foundation"),
+            "Parent" => outlines_id,
+            "First" => item2_id,
+            "Last" => item2_id,
+            "Count" => 1,
+            "Dest" => vec![page_id.into(), "XYZ".into(), 50.into(), 700.into(), Object::Null],
+        }
+        .into(),
+    );
+
+    doc.objects.insert(
+        item2_id,
+        dictionary! {
+            "Title" => Object::string_literal("1.1 Market Dynamics"),
+            "Parent" => item1_id,
+            "Dest" => vec![page_id.into(), "XYZ".into(), 50.into(), 500.into(), Object::Null],
+        }
+        .into(),
+    );
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "Outlines" => outlines_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_pdf_outlines_heading_extraction() {
+    let pdf_bytes = synthetic_outline_pdf();
+    let result = pdf_inspector::process_pdf_mem(&pdf_bytes).unwrap();
+    assert_eq!(result.page_count, 1);
+    let md = result.markdown.expect("markdown should be generated");
+
+    assert!(
+        md.contains("# Chapter 1: The Foundation"),
+        "Top-level outline item should produce H1: {md}"
+    );
+    assert!(
+        md.contains("## 1.1 Market Dynamics"),
+        "Child outline item should produce H2: {md}"
+    );
+    assert!(
+        md.contains("This is introductory text."),
+        "Body text should be preserved: {md}"
+    );
+    assert!(
+        md.contains("Detailed discussion of markets."),
+        "Body text should be preserved: {md}"
+    );
 }

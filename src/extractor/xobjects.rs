@@ -23,6 +23,610 @@ use super::word_gaps::{
     word_gap_candidate, word_gap_threshold, PenHighWater, PendingWordGaps, WordGapCandidate,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
+use crate::PdfError;
+
+/// Best-effort extraction of the raw encoded bytes for an embedded raster
+/// XObject, so the markdown pipeline can write the figure to disk and reference
+/// it by path instead of emitting a bare `![Image: Im0](image)` placeholder.
+///
+/// Only lossless-enough, self-describing frames we can hand straight to a viewer
+/// are returned: `/DCTDecode` JPEG (the overwhelming common case for embedded
+/// photos and charts). The returned bytes are guaranteed to carry the JPEG SOI
+/// (`FF D8`) and EOI (`FF D9`) markers so they form a valid standalone file.
+/// Other filters (JPX, ASCII85, Flate, …) return `None`; the caller keeps
+/// emitting a placeholder until a real decoder is wired in.
+///
+/// `owner_id` is the owning object's `ObjectId` (a page, or a Form XObject for
+/// figures embedded inside a form); `xobject_name` is the resource name as it
+/// appears in that object's `/Resources /XObject` dict.
+pub(crate) fn extract_image_by_id(
+    doc: &Document,
+    img_id: ObjectId,
+) -> Result<Option<(Vec<u8>, String)>, PdfError> {
+    let Ok(stream_obj) = doc.get_object(img_id) else {
+        return Ok(None);
+    };
+    let Object::Stream(stream) = stream_obj else {
+        return Ok(None);
+    };
+    extract_image_from_stream(doc, stream)
+}
+
+pub(crate) fn extract_image_from_xobject(
+    doc: &Document,
+    owner_id: ObjectId,
+    xobject_name: &str,
+) -> Result<Option<(Vec<u8>, String)>, PdfError> {
+    let Some(entry) = find_xobject_entry(doc, owner_id, xobject_name) else {
+        return Ok(None);
+    };
+    // Resolve the XObject entry, whether stored inline or by reference.
+    let stream_obj = match entry {
+        Object::Reference(r) => doc.get_object(*r)?,
+        other => other,
+    };
+    let Object::Stream(stream) = stream_obj else {
+        return Ok(None);
+    };
+    extract_image_from_stream(doc, stream)
+}
+
+pub(crate) fn extract_image_from_stream(
+    doc: &Document,
+    stream: &lopdf::Stream,
+) -> Result<Option<(Vec<u8>, String)>, PdfError> {
+    let is_dct = match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => name == b"DCTDecode",
+        Ok(Object::Array(arr)) => arr
+            .iter()
+            .any(|item| item.as_name().map(|n| n == b"DCTDecode").unwrap_or(false)),
+        _ => false,
+    };
+    if is_dct {
+        let mut bytes = stream.content.clone();
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+            if bytes[bytes.len() - 2] != 0xFF || bytes[bytes.len() - 1] != 0xD9 {
+                bytes.push(0xFF);
+                bytes.push(0xD9);
+            }
+            return Ok(Some((bytes, "jpg".to_string())));
+        } else if bytes.len() > 4 {
+            bytes.insert(0, 0xD8);
+            bytes.insert(0, 0xFF);
+            bytes.push(0xFF);
+            bytes.push(0xD9);
+            return Ok(Some((bytes, "jpg".to_string())));
+        }
+        return Ok(None);
+    }
+
+    let is_jpx = match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => name == b"JPXDecode",
+        Ok(Object::Array(arr)) => arr
+            .iter()
+            .any(|item| item.as_name().map(|n| n == b"JPXDecode").unwrap_or(false)),
+        _ => false,
+    };
+    if is_jpx {
+        return Ok(Some((stream.content.clone(), "jp2".to_string())));
+    }
+
+    // JBIG2 bi-level image stream
+    let is_jbig2 = match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => name == b"JBIG2Decode",
+        Ok(Object::Array(arr)) => arr
+            .iter()
+            .any(|item| item.as_name().map(|n| n == b"JBIG2Decode").unwrap_or(false)),
+        _ => false,
+    };
+    if is_jbig2 {
+        let jbig2_bytes = match stream.decompressed_content() {
+            Ok(data) => data,
+            Err(_) => stream.content.clone(),
+        };
+        if !jbig2_bytes.is_empty() {
+            let globals_bytes = resolve_jbig2_globals(doc, stream);
+            if let Ok(img) =
+                hayro_jbig2::Image::new_embedded(&jbig2_bytes, globals_bytes.as_deref())
+            {
+                let w = img.width();
+                let h = img.height();
+                if w > 0 && h > 0 {
+                    let mut buf = vec![255u8; (w * h) as usize];
+                    let mut dec = Jbig2LumaDecoder {
+                        buf: &mut buf,
+                        pos: 0,
+                    };
+                    if img.decode(&mut dec).is_ok() {
+                        // Invert if /Decode array specifies inverted polarity [1, 0]
+                        if let Ok(Object::Array(arr)) = stream.dict.get(b"Decode") {
+                            if arr.len() >= 2 {
+                                let d0 = arr[0]
+                                    .as_float()
+                                    .or_else(|_| arr[0].as_i64().map(|v| v as f32))
+                                    .unwrap_or(0.0);
+                                let d1 = arr[1]
+                                    .as_float()
+                                    .or_else(|_| arr[1].as_i64().map(|v| v as f32))
+                                    .unwrap_or(1.0);
+                                if d0 > d1 {
+                                    for b in &mut buf {
+                                        *b = 255 - *b;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(png) = encode_png(w, h, 0, &buf) {
+                            return Ok(Some((png, "png".to_string())));
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    // FlateDecode or uncompressed raster image
+    let is_flate = match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => name == b"FlateDecode",
+        Ok(Object::Array(arr)) => arr
+            .iter()
+            .any(|item| item.as_name().map(|n| n == b"FlateDecode").unwrap_or(false)),
+        Err(_) => true, // No filter = raw stream
+        _ => false,
+    };
+    if is_flate {
+        let width = stream
+            .dict
+            .get(b"Width")
+            .ok()
+            .and_then(get_number)
+            .map(|n| n as u32);
+        let height = stream
+            .dict
+            .get(b"Height")
+            .ok()
+            .and_then(get_number)
+            .map(|n| n as u32);
+        let bpc = stream
+            .dict
+            .get(b"BitsPerComponent")
+            .ok()
+            .and_then(get_number)
+            .map(|n| n as u32)
+            .unwrap_or(8);
+        if let (Some(w), Some(h)) = (width, height) {
+            if w > 0 && h > 0 {
+                let decompressed = match stream.decompressed_content() {
+                    Ok(data) => data,
+                    Err(_) => stream.content.clone(),
+                };
+
+                let cs_obj = match stream.dict.get(b"ColorSpace") {
+                    Ok(Object::Reference(r)) => doc.get_object(*r).ok(),
+                    Ok(obj) => Some(obj),
+                    Err(_) => None,
+                };
+
+                // Check for Indexed ColorSpace
+                if let Some(Object::Array(arr)) = cs_obj {
+                    if arr.first().and_then(|item| item.as_name().ok()) == Some(b"Indexed") {
+                        if let Some(res) = extract_indexed_image(doc, arr, w, h, bpc, &decompressed)
+                        {
+                            return Ok(Some(res));
+                        }
+                    }
+                }
+
+                // Check for 1-bit monochrome (DeviceGray or implicit mask)
+                if bpc == 1 {
+                    let (cs_name, _) = match cs_obj {
+                        Some(Object::Name(name)) => (Some(name.as_slice()), None),
+                        Some(Object::Array(arr)) => parse_cs_array(doc, arr),
+                        _ => (None, None),
+                    };
+                    if cs_name.is_none() || cs_name == Some(b"DeviceGray") {
+                        let row_bytes = (w as usize).div_ceil(8);
+                        if decompressed.len() >= row_bytes * (h as usize) {
+                            let mut gray = Vec::with_capacity((w * h) as usize);
+                            for row in 0..h as usize {
+                                let row_slice =
+                                    &decompressed[row * row_bytes..(row + 1) * row_bytes];
+                                for x in 0..w as usize {
+                                    let byte = row_slice[x / 8];
+                                    let bit = (byte >> (7 - (x % 8))) & 1;
+                                    gray.push(if bit == 1 { 255 } else { 0 });
+                                }
+                            }
+                            if let Some(png) = encode_png(w, h, 0, &gray) {
+                                return Ok(Some((png, "png".to_string())));
+                            }
+                        }
+                    }
+                }
+
+                if bpc == 8 {
+                    let (cs_name, _) = match cs_obj {
+                        Some(Object::Name(name)) => (Some(name.as_slice()), None),
+                        Some(Object::Reference(r)) => {
+                            if let Ok(obj) = doc.get_object(*r) {
+                                match obj {
+                                    Object::Name(name) => (Some(name.as_slice()), None),
+                                    Object::Array(arr) => parse_cs_array(doc, arr),
+                                    _ => (None, None),
+                                }
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        Some(Object::Array(arr)) => parse_cs_array(doc, arr),
+                        _ => (None, None),
+                    };
+                    if let Some(cs) = cs_name {
+                        if cs == b"DeviceRGB" && decompressed.len() >= (w * h * 3) as usize {
+                            if let Some(png) =
+                                encode_png(w, h, 2, &decompressed[..(w * h * 3) as usize])
+                            {
+                                return Ok(Some((png, "png".to_string())));
+                            }
+                        } else if cs == b"DeviceGray" && decompressed.len() >= (w * h) as usize {
+                            if let Some(png) =
+                                encode_png(w, h, 0, &decompressed[..(w * h) as usize])
+                            {
+                                return Ok(Some((png, "png".to_string())));
+                            }
+                        } else if cs == b"DeviceCMYK" && decompressed.len() >= (w * h * 4) as usize
+                        {
+                            let total_pixels = (w * h) as usize;
+                            let mut rgb = Vec::with_capacity(total_pixels * 3);
+                            for chunk in decompressed[..(total_pixels * 4)].chunks_exact(4) {
+                                let c = chunk[0] as f32 / 255.0;
+                                let m = chunk[1] as f32 / 255.0;
+                                let y = chunk[2] as f32 / 255.0;
+                                let k = chunk[3] as f32 / 255.0;
+                                let r = ((1.0 - c) * (1.0 - k) * 255.0).clamp(0.0, 255.0) as u8;
+                                let g = ((1.0 - m) * (1.0 - k) * 255.0).clamp(0.0, 255.0) as u8;
+                                let b = ((1.0 - y) * (1.0 - k) * 255.0).clamp(0.0, 255.0) as u8;
+                                rgb.push(r);
+                                rgb.push(g);
+                                rgb.push(b);
+                            }
+                            if let Some(png) = encode_png(w, h, 2, &rgb) {
+                                return Ok(Some((png, "png".to_string())));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn extract_indexed_image(
+    doc: &Document,
+    arr: &[Object],
+    w: u32,
+    h: u32,
+    bpc: u32,
+    decompressed: &[u8],
+) -> Option<(Vec<u8>, String)> {
+    if arr.len() < 4 {
+        return None;
+    }
+    let base_obj = match &arr[1] {
+        Object::Reference(r) => doc.get_object(*r).ok(),
+        other => Some(other),
+    }?;
+    let (_base_cs, num_components) = match base_obj {
+        Object::Name(name) => {
+            if name == b"DeviceRGB" {
+                (b"DeviceRGB".as_slice(), 3usize)
+            } else if name == b"DeviceGray" {
+                (b"DeviceGray".as_slice(), 1usize)
+            } else if name == b"DeviceCMYK" {
+                (b"DeviceCMYK".as_slice(), 4usize)
+            } else {
+                return None;
+            }
+        }
+        Object::Array(sub_arr) => {
+            let (name, n) = parse_cs_array(doc, sub_arr);
+            (name?, n? as usize)
+        }
+        _ => return None,
+    };
+
+    let hival = match &arr[2] {
+        Object::Integer(i) => *i as usize,
+        Object::Real(r) => *r as usize,
+        _ => return None,
+    };
+    if hival > 255 {
+        return None;
+    }
+
+    let lookup_data: Vec<u8> = match &arr[3] {
+        Object::String(bytes, _) => bytes.clone(),
+        Object::Reference(r) => {
+            if let Ok(obj) = doc.get_object(*r) {
+                match obj {
+                    Object::String(bytes, _) => bytes.clone(),
+                    Object::Stream(s) => s
+                        .decompressed_content()
+                        .unwrap_or_else(|_| s.content.clone()),
+                    _ => return None,
+                }
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let required_lookup_len = (hival + 1) * num_components;
+    if lookup_data.len() < required_lookup_len {
+        return None;
+    }
+
+    let total_pixels = (w as usize).checked_mul(h as usize)?;
+    let mut rgb = Vec::with_capacity(total_pixels * 3);
+
+    if bpc == 8 {
+        if decompressed.len() < total_pixels {
+            return None;
+        }
+        for &sample in &decompressed[..total_pixels] {
+            let idx = (sample as usize).min(hival);
+            match num_components {
+                3 => {
+                    let offset = idx * 3;
+                    rgb.extend_from_slice(&lookup_data[offset..offset + 3]);
+                }
+                1 => {
+                    let g = lookup_data[idx];
+                    rgb.push(g);
+                    rgb.push(g);
+                    rgb.push(g);
+                }
+                4 => {
+                    let offset = idx * 4;
+                    let c = lookup_data[offset] as f32 / 255.0;
+                    let m = lookup_data[offset + 1] as f32 / 255.0;
+                    let y = lookup_data[offset + 2] as f32 / 255.0;
+                    let k = lookup_data[offset + 3] as f32 / 255.0;
+                    let r = ((1.0 - c) * (1.0 - k) * 255.0).clamp(0.0, 255.0) as u8;
+                    let g = ((1.0 - m) * (1.0 - k) * 255.0).clamp(0.0, 255.0) as u8;
+                    let b = ((1.0 - y) * (1.0 - k) * 255.0).clamp(0.0, 255.0) as u8;
+                    rgb.push(r);
+                    rgb.push(g);
+                    rgb.push(b);
+                }
+                _ => return None,
+            }
+        }
+    } else if bpc == 4 {
+        let row_bytes = (w as usize).div_ceil(2);
+        if decompressed.len() < row_bytes * (h as usize) {
+            return None;
+        }
+        for row in 0..h as usize {
+            let row_slice = &decompressed[row * row_bytes..(row + 1) * row_bytes];
+            for x in 0..w as usize {
+                let byte = row_slice[x / 2];
+                let sample = if x % 2 == 0 {
+                    (byte >> 4) & 0x0F
+                } else {
+                    byte & 0x0F
+                };
+                let idx = (sample as usize).min(hival);
+                match num_components {
+                    3 => {
+                        let offset = idx * 3;
+                        rgb.extend_from_slice(&lookup_data[offset..offset + 3]);
+                    }
+                    1 => {
+                        let g = lookup_data[idx];
+                        rgb.push(g);
+                        rgb.push(g);
+                        rgb.push(g);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    } else if bpc == 1 {
+        let row_bytes = (w as usize).div_ceil(8);
+        if decompressed.len() < row_bytes * (h as usize) {
+            return None;
+        }
+        for row in 0..h as usize {
+            let row_slice = &decompressed[row * row_bytes..(row + 1) * row_bytes];
+            for x in 0..w as usize {
+                let byte = row_slice[x / 8];
+                let bit = (byte >> (7 - (x % 8))) & 1;
+                let idx = (bit as usize).min(hival);
+                match num_components {
+                    3 => {
+                        let offset = idx * 3;
+                        rgb.extend_from_slice(&lookup_data[offset..offset + 3]);
+                    }
+                    1 => {
+                        let g = lookup_data[idx];
+                        rgb.push(g);
+                        rgb.push(g);
+                        rgb.push(g);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    } else {
+        return None;
+    }
+
+    let png = encode_png(w, h, 2, &rgb)?;
+    Some((png, "png".to_string()))
+}
+
+fn parse_cs_array<'a>(doc: &'a Document, arr: &'a [Object]) -> (Option<&'a [u8]>, Option<u32>) {
+    if arr.is_empty() {
+        return (None, None);
+    }
+    if let Ok(name) = arr[0].as_name() {
+        if name == b"DeviceRGB" {
+            return (Some(b"DeviceRGB"), Some(3));
+        } else if name == b"DeviceGray" {
+            return (Some(b"DeviceGray"), Some(1));
+        } else if name == b"DeviceCMYK" {
+            return (Some(b"DeviceCMYK"), Some(4));
+        } else if name == b"ICCBased" && arr.len() > 1 {
+            let icc_stream = match &arr[1] {
+                Object::Reference(r) => doc.get_object(*r).ok(),
+                other => Some(other),
+            };
+            if let Some(Object::Stream(s)) = icc_stream {
+                if let Some(n) = s.dict.get(b"N").ok().and_then(get_number) {
+                    let n = n as u32;
+                    return match n {
+                        1 => (Some(b"DeviceGray"), Some(1)),
+                        3 => (Some(b"DeviceRGB"), Some(3)),
+                        4 => (Some(b"DeviceCMYK"), Some(4)),
+                        _ => (None, Some(n)),
+                    };
+                }
+            }
+        }
+    }
+    (None, None)
+}
+
+fn encode_png(width: u32, height: u32, color_type: u8, raw_pixels: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let bpp = match color_type {
+        0 => 1, // Grayscale
+        2 => 3, // RGB
+        6 => 4, // RGBA
+        _ => return None,
+    };
+    let row_bytes = (width as usize).checked_mul(bpp)?;
+    let total_bytes = row_bytes.checked_mul(height as usize)?;
+    if raw_pixels.len() < total_bytes {
+        return None;
+    }
+
+    let mut filtered_data = Vec::with_capacity((row_bytes + 1) * height as usize);
+    for row in 0..height as usize {
+        filtered_data.push(0); // Filter type 0 (None)
+        let start = row * row_bytes;
+        let end = start + row_bytes;
+        filtered_data.extend_from_slice(&raw_pixels[start..end]);
+    }
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    if encoder.write_all(&filtered_data).is_err() {
+        return None;
+    }
+    let compressed_idat = encoder.finish().ok()?;
+
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+    let mut ihdr_data = Vec::with_capacity(13);
+    ihdr_data.extend_from_slice(&width.to_be_bytes());
+    ihdr_data.extend_from_slice(&height.to_be_bytes());
+    ihdr_data.push(8); // bit depth 8
+    ihdr_data.push(color_type);
+    ihdr_data.push(0); // compression
+    ihdr_data.push(0); // filter
+    ihdr_data.push(0); // interlace
+    write_png_chunk(&mut png, b"IHDR", &ihdr_data);
+
+    write_png_chunk(&mut png, b"IDAT", &compressed_idat);
+    write_png_chunk(&mut png, b"IEND", &[]);
+
+    Some(png)
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    let len = data.len() as u32;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(chunk_type);
+    hasher.update(data);
+    let crc = hasher.finalize();
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+struct Jbig2LumaDecoder<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl hayro_jbig2::Decoder for Jbig2LumaDecoder<'_> {
+    fn push_pixel(&mut self, black: bool) {
+        if self.pos < self.buf.len() {
+            self.buf[self.pos] = if black { 0 } else { 255 };
+            self.pos += 1;
+        }
+    }
+
+    fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+        let luma = if black { 0 } else { 255 };
+        let count = chunk_count as usize * 8;
+        let end = (self.pos + count).min(self.buf.len());
+        if self.pos < end {
+            self.buf[self.pos..end].fill(luma);
+            self.pos = end;
+        }
+    }
+
+    fn next_line(&mut self) {}
+}
+
+fn resolve_jbig2_globals(doc: &Document, stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    let dp = stream.dict.get(b"DecodeParms").ok()?;
+    let globals_obj = match dp {
+        Object::Dictionary(dict) => dict.get(b"JBIG2Globals").ok()?,
+        Object::Array(arr) => arr.iter().find_map(|item| match item {
+            Object::Dictionary(dict) => dict.get(b"JBIG2Globals").ok(),
+            _ => None,
+        })?,
+        _ => return None,
+    };
+    let resolved = match globals_obj {
+        Object::Reference(r) => doc.get_object(*r).ok()?,
+        other => other,
+    };
+    match resolved {
+        Object::Stream(s) => match s.decompressed_content() {
+            Ok(data) => Some(data),
+            Err(_) => Some(s.content.clone()),
+        },
+        _ => None,
+    }
+}
+
+/// Resolve a dictionary field value (inline dict or reference) to a borrowed
+/// dictionary, propagating lookup errors.
+fn resolve_dict<'a>(
+    doc: &'a Document,
+    value: &'a Object,
+) -> Result<&'a lopdf::Dictionary, PdfError> {
+    if let Ok(obj_ref) = value.as_reference() {
+        doc.get_dictionary(obj_ref).map_err(PdfError::from)
+    } else {
+        value.as_dict().map_err(PdfError::from)
+    }
+}
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
@@ -96,9 +700,58 @@ impl FormWalkBudget {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum XObjectType {
-    Image,
+    Image(ObjectId),
     Form(ObjectId),
+}
+
+fn find_xobject_entry<'a>(
+    doc: &'a Document,
+    owner_id: ObjectId,
+    xobject_name: &str,
+) -> Option<&'a Object> {
+    let name_bytes = xobject_name.as_bytes();
+    // 1. Try page resources (includes inherited resources from parent /Pages)
+    if let Ok((own_dict, inherited_ids)) = doc.get_page_resources(owner_id) {
+        if let Some(res) = own_dict {
+            if let Ok(xobjects_obj) = res.get(b"XObject") {
+                if let Ok(xobjects) = resolve_dict(doc, xobjects_obj) {
+                    if let Ok(entry) = xobjects.get(name_bytes) {
+                        return Some(entry);
+                    }
+                }
+            }
+        }
+        for id in inherited_ids {
+            if let Ok(res) = doc.get_dictionary(id) {
+                if let Ok(xobjects_obj) = res.get(b"XObject") {
+                    if let Ok(xobjects) = resolve_dict(doc, xobjects_obj) {
+                        if let Ok(entry) = xobjects.get(name_bytes) {
+                            return Some(entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Direct lookup on owner_dict (e.g. Form XObject)
+    if let Ok(owner_dict) = doc.get_dictionary(owner_id) {
+        if let Ok(res_obj) = owner_dict.get(b"Resources") {
+            if let Ok(resources) = resolve_dict(doc, res_obj) {
+                if let Ok(xobjects_obj) = resources.get(b"XObject") {
+                    if let Ok(xobjects) = resolve_dict(doc, xobjects_obj) {
+                        if let Ok(entry) = xobjects.get(name_bytes) {
+                            return Some(entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Get XObjects from page resources, categorized by type
@@ -108,9 +761,16 @@ pub(crate) fn get_page_xobjects(
 ) -> std::collections::HashMap<String, XObjectType> {
     let mut xobject_types = std::collections::HashMap::new();
 
-    // Try to get the page dictionary
-    if let Ok(page_dict) = doc.get_dictionary(page_id) {
-        // Get Resources dictionary
+    if let Ok((own_dict, inherited_ids)) = doc.get_page_resources(page_id) {
+        for id in inherited_ids {
+            if let Ok(resources) = doc.get_dictionary(id) {
+                collect_xobjects_from_dict(doc, resources, &mut xobject_types);
+            }
+        }
+        if let Some(resources) = own_dict {
+            collect_xobjects_from_dict(doc, resources, &mut xobject_types);
+        }
+    } else if let Ok(page_dict) = doc.get_dictionary(page_id) {
         let resources = if let Ok(res_ref) = page_dict.get(b"Resources") {
             if let Ok(obj_ref) = res_ref.as_reference() {
                 doc.get_dictionary(obj_ref).ok()
@@ -175,7 +835,7 @@ fn collect_xobjects_from_dict(
                         if let Ok(subtype) = stream.dict.get(b"Subtype") {
                             if let Ok(subtype_name) = subtype.as_name() {
                                 if subtype_name == b"Image" {
-                                    xobject_types.insert(name_str, XObjectType::Image);
+                                    xobject_types.insert(name_str, XObjectType::Image(obj_ref));
                                 } else if subtype_name == b"Form" {
                                     xobject_types.insert(name_str, XObjectType::Form(obj_ref));
                                 }
@@ -600,12 +1260,23 @@ fn extract_form_xobject_text_inner(
                                     );
                                 }
                             }
-                            Some(XObjectType::Image) => {
+                            Some(XObjectType::Image(img_id)) => {
                                 // Mirror the top-level Image-XObject emission
                                 // in content_stream.rs so figures embedded
                                 // inside Form XObjects (common in print-to-PDF
                                 // workflows) aren't silently dropped.
                                 let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                                // Pull the frame from the image object id directly or fallback to name lookup
+                                let (image_data, image_format) =
+                                    match extract_image_by_id(doc, *img_id) {
+                                        Ok(Some((data, fmt))) => (Some(data), Some(fmt)),
+                                        _ => match extract_image_from_xobject(
+                                            doc, form_id, &xobj_name,
+                                        ) {
+                                            Ok(Some((data, fmt))) => (Some(data), Some(fmt)),
+                                            _ => (None, None),
+                                        },
+                                    };
                                 items.push(TextItem {
                                     text: format!("[Image: {}]", xobj_name),
                                     x,
@@ -633,6 +1304,8 @@ fn extract_form_xobject_text_inner(
                                     item_type: ItemType::Image,
                                     mcid: None,
                                     baseline_shift: 0.0,
+                                    image_data,
+                                    image_format,
                                 });
                             }
                             None => {}
@@ -967,6 +1640,9 @@ fn extract_form_xobject_text_inner(
                                 item_type: ItemType::Text,
                                 mcid: None,
                                 baseline_shift: 0.0,
+
+                                image_data: None,
+                                image_format: None,
                             });
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
@@ -1467,6 +2143,9 @@ fn extract_form_xobject_text_inner(
                                     item_type: ItemType::Text,
                                     mcid: None,
                                     baseline_shift: 0.0,
+
+                                    image_data: None,
+                                    image_format: None,
                                 });
                             }
                         }
@@ -2818,5 +3497,112 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
         let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
         let expected = format!("\u{179C}{} \u{178F}\u{17D2}", "\u{1789}".repeat(20));
         assert_eq!(texts, [expected.as_str()]);
+    }
+
+    #[test]
+    fn test_upstage_image_extraction() {
+        let doc = Document::load("tests/fixtures/upstage_key_functions.pdf").unwrap();
+        let page_id = doc.get_pages().get(&1).copied().unwrap();
+        let xobjects = get_page_xobjects(&doc, page_id);
+        assert!(!xobjects.is_empty());
+        for (_name, xobj) in &xobjects {
+            if let XObjectType::Image(id) = xobj {
+                let img = extract_image_by_id(&doc, *id).unwrap();
+                assert!(img.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn test_indexed_color_image_extraction() {
+        let doc = Document::with_version("1.7");
+        let palette = vec![
+            255, 0, 0, // index 0: Red
+            0, 255, 0, // index 1: Green
+            0, 0, 255, // index 2: Blue
+            255, 255, 255, // index 3: White
+        ];
+        let cs_array = vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            Object::Integer(3),
+            Object::String(palette, lopdf::StringFormat::Literal),
+        ];
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Type", Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype", Object::Name(b"Image".to_vec()));
+        dict.set(b"Width", Object::Integer(2));
+        dict.set(b"Height", Object::Integer(2));
+        dict.set(b"BitsPerComponent", Object::Integer(8));
+        dict.set(b"ColorSpace", Object::Array(cs_array));
+
+        // 2x2 image with indices 0, 1, 2, 3
+        let content = vec![0, 1, 2, 3];
+        let stream = lopdf::Stream::new(dict, content);
+        let extracted = extract_image_from_stream(&doc, &stream).unwrap();
+        assert!(extracted.is_some());
+        let (data, fmt) = extracted.unwrap();
+        assert_eq!(fmt, "png");
+        assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn test_monochrome_1bit_image_extraction() {
+        let doc = Document::with_version("1.7");
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Type", Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype", Object::Name(b"Image".to_vec()));
+        dict.set(b"Width", Object::Integer(8));
+        dict.set(b"Height", Object::Integer(1));
+        dict.set(b"BitsPerComponent", Object::Integer(1));
+        dict.set(b"ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+
+        let content = vec![0b10101010];
+        let stream = lopdf::Stream::new(dict, content);
+        let extracted = extract_image_from_stream(&doc, &stream).unwrap();
+        assert!(extracted.is_some());
+        let (data, fmt) = extracted.unwrap();
+        assert_eq!(fmt, "png");
+        assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn test_jbig2_image_extraction() {
+        let doc = Document::with_version("1.7");
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(b"Type", Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype", Object::Name(b"Image".to_vec()));
+        dict.set(b"Width", Object::Integer(8));
+        dict.set(b"Height", Object::Integer(1));
+        dict.set(b"ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set(b"Filter", Object::Name(b"JBIG2Decode".to_vec()));
+
+        // Minimal valid embedded JBIG2 stream:
+        // Segment 0: Page Information (19 bytes data, width=8, height=1)
+        // Segment 1: End of Page (0 bytes data)
+        let mut content = Vec::new();
+        // Seg 0 header: seg_num=0 (4B), flags=0x30 (Page Info, 1B), no refs (1B), page_assoc=1 (1B), len=19 (4B)
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00, 0x13,
+        ]);
+        // Seg 0 data: width=8 (4B), height=1 (4B), xres=0 (4B), yres=0 (4B), flags=0 (1B), striping=0 (2B)
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        // Seg 1 header: seg_num=1 (4B), flags=0x31 (End of Page, 1B), no refs (1B), page_assoc=1 (1B), len=0 (4B)
+        content.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x31, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ]);
+
+        let stream = lopdf::Stream::new(dict, content);
+        let extracted = extract_image_from_stream(&doc, &stream).unwrap();
+        assert!(
+            extracted.is_some(),
+            "JBIG2 stream should decode successfully"
+        );
+        let (data, fmt) = extracted.unwrap();
+        assert_eq!(fmt, "png");
+        assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 }

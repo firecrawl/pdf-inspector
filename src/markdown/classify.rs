@@ -64,6 +64,43 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
     false
 }
 
+/// Check if text is specifically a figure/chart caption (e.g. "Figure 1.1", "Fig. 2", "Chart 3").
+/// These can be preserved as the lowest level outline / heading (`######`).
+pub(crate) fn is_figure_caption_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let prefixes = [
+        "Figure ",
+        "Figura ",
+        "Fig. ",
+        "Fig ",
+        "Chart ",
+        "Gráfico ",
+        "Graph ",
+        "Diagram ",
+        "Image ",
+        "Imagem ",
+        "Photo ",
+        "Foto ",
+    ];
+    let lower = trimmed.to_lowercase();
+    for pfx in &prefixes {
+        let pfx_lower = pfx.to_lowercase();
+        if let Some(rest) = lower.strip_prefix(&pfx_lower) {
+            let rest_trimmed = rest.trim_start();
+            if rest_trimmed
+                .starts_with(|c: char| c.is_ascii_digit() || c == '(' || c == '#' || c == ':')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check if text starts with an unambiguous bullet marker (●, •, ○, ◦).
 ///
 /// Narrower than [`is_list_item`]: it excludes numbered/lettered patterns
@@ -313,5 +350,19 @@ mod tests {
         assert!(is_list_item("● Item"));
         assert!(is_list_item("• Item"));
         assert!(is_list_item("- Item"));
+    }
+
+    #[test]
+    fn test_is_figure_caption_line() {
+        assert!(is_figure_caption_line("Figure 1.1"));
+        assert!(is_figure_caption_line("Figure 1.1: Daily Bar Chart"));
+        assert!(is_figure_caption_line("Fig. 2"));
+        assert!(is_figure_caption_line("Fig 3.4"));
+        assert!(is_figure_caption_line("Chart 12: Trend analysis"));
+        assert!(is_figure_caption_line("Diagram (A)"));
+        assert!(!is_figure_caption_line("Figure drawing"));
+        assert!(!is_figure_caption_line("Table 1.1"));
+        assert!(!is_figure_caption_line("Source: Bloomberg"));
+        assert!(!is_figure_caption_line(""));
     }
 }

@@ -758,6 +758,9 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             baseline_shift: item.baseline_shift,
             item_type: item_type_str(&item.item_type),
             mcid: item.mcid,
+
+            image_data: None,
+            image_format: None,
         })
         .collect()
 }
@@ -849,11 +852,18 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 
 /// Process a PDF file: detect type, extract text, and convert to Markdown.
 #[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
+#[pyo3(signature = (path, pages=None, include_form_fields=None))]
+fn process_pdf(
+    path: &str,
+    pages: Option<Vec<u32>>,
+    include_form_fields: Option<bool>,
+) -> PyResult<PyPdfResult> {
     let mut opts = crate::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
+    }
+    if let Some(include) = include_form_fields {
+        opts = opts.include_form_fields(include);
     }
     let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))
@@ -861,11 +871,18 @@ fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
 
 /// Process a PDF from bytes in memory.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
-fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
+#[pyo3(signature = (data, pages=None, include_form_fields=None))]
+fn process_pdf_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+    include_form_fields: Option<bool>,
+) -> PyResult<PyPdfResult> {
     let mut opts = crate::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
+    }
+    if let Some(include) = include_form_fields {
+        opts = opts.include_form_fields(include);
     }
     let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
     Ok(to_py_result(result))

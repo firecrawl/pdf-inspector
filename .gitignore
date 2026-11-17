@@ -42,3 +42,6 @@ test_output/
 __pycache__/
 *.pyc
 .pytest_cache/
+*.md
+*.[pP][nN][gG]
+*.jpg

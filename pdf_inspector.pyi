@@ -304,11 +304,15 @@ class PagesExtractionResult:
     is_complex: bool
     """True if any page has tables or multi-column layout."""
 
-def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
-    """Process a PDF: detect type, extract text, convert to Markdown."""
+def process_pdf(path: str, pages: Optional[list[int]] = None, include_form_fields: Optional[bool] = None) -> PdfResult:
+    """Process a PDF: detect type, extract text, convert to Markdown.
+
+    Set ``include_form_fields=False`` to drop AcroForm form-field values
+    (e.g. named-destination metadata that is not real document content).
+    """
     ...
 
-def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
+def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None, include_form_fields: Optional[bool] = None) -> PdfResult:
     """Process a PDF from bytes in memory."""
     ...
 

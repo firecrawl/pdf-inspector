@@ -63,6 +63,11 @@ print(result.markdown)       # Markdown string or None
 # Process specific pages only
 result = pdf_inspector.process_pdf("document.pdf", pages=[1, 3, 5])
 
+# Drop navigation metadata that is not document content: AcroForm form-field
+# values and content-stream destination/bookmark markers (e.g. "P1: OTA/XYZ",
+# internal bookmarks like "JWBT634-c03", or producer print footers).
+result = pdf_inspector.process_pdf("document.pdf", include_form_fields=False)
+
 # Process from bytes (no filesystem needed)
 with open("document.pdf", "rb") as f:
     result = pdf_inspector.process_pdf_bytes(f.read())
@@ -127,8 +132,8 @@ headings = [
 
 | Function | Description |
 |---|---|
-| `process_pdf(path, pages=None)` | Full processing (detect + extract + markdown) |
-| `process_pdf_bytes(data, pages=None)` | Full processing from bytes |
+| `process_pdf(path, pages=None, include_form_fields=None)` | Full processing (detect + extract + markdown). Set `include_form_fields=False` to drop navigation metadata that is not content — AcroForm field values and content-stream destination/bookmark markers such as `P1: OTA/XYZ`, `JWBT634-c03`, or `Printer: ...`. |
+| `process_pdf_bytes(data, pages=None, include_form_fields=None)` | Full processing from bytes |
 | `process_pdf_with_ocr(path, **options)` | Native extraction + selective OCR with provenance |
 | `process_pdf_with_ocr_bytes(data, **options)` | Native extraction + selective OCR from bytes |
 | `detect_pdf(path)` | Fast detection only (returns PdfResult) |
