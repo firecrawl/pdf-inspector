@@ -4681,6 +4681,30 @@ end"#;
     }
 
     #[test]
+    fn strip_pdf_comments_keeps_an_inline_image_with_no_space_after_bi() {
+        let input = b"BI/W 2/H 1/BPC 8/CS/RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_uses_the_length_entry_of_a_filtered_inline_image() {
+        let input = b"BI /W 9 /H 9 /BPC 8 /CS /RGB /F /DCT /L 6 ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_sizes_an_indexed_inline_image_past_its_lookup_table() {
+        let input = b"BI /W 6 /H 1 /BPC 8 /CS [/I /RGB 1 ( ID /W 9 )] ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_skips_a_comment_in_an_inline_image_header() {
+        let input = b"BI /W 2 /H 1 % not ID yet\n/BPC 8 /CS /RGB ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
     fn text_after_an_inline_image_with_a_percent_byte_is_extracted() {
         let items = extract_simple_items(
             b"q 10 0 0 1 0 0 cm BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q\nBT /F1 12 Tf 72 700 Td (Hello) Tj ET\n",

@@ -197,52 +197,103 @@ fn skip_inline_image_after_bi(data: &[u8], mut i: usize) -> usize {
 
 pub(super) fn is_inline_image_start(data: &[u8], i: usize) -> bool {
     data[i..].starts_with(b"BI")
-        && data.get(i + 2).is_none_or(|&b| is_content_space(b))
+        && data
+            .get(i + 2)
+            .is_none_or(|&b| is_content_space(b) || b == b'/')
         && (i == 0 || is_content_space(data[i - 1]) || matches!(data[i - 1], b')' | b'>' | b']'))
 }
 
 /// Offset just past the `EI` that closes the inline image whose `BI` ends at
-/// `after_bi`. Unfiltered data is skipped by its declared length, as lopdf
-/// reads it, so an `EI` lookalike among the pixel bytes does not end it early.
+/// `after_bi`. Data with a known length is skipped by that length, as lopdf
+/// reads it, so an `EI` lookalike among the data bytes does not end it early.
 pub(super) fn inline_image_end(data: &[u8], after_bi: usize) -> Option<usize> {
-    let id = after_bi + spaced_keyword_position(&data[after_bi..], b"ID")? + 1;
-    let data_start = id + 3;
-    let search_from = unfiltered_inline_image_len(&data[after_bi..id])
+    let (entries, data_start) = inline_image_header(data, after_bi)?;
+    let search_from = inline_image_data_len(&entries)
         .and_then(|len| data_start.checked_add(len))
         .filter(|&data_end| data_end <= data.len())
         .unwrap_or(data_start);
-    let ei = search_from - 1 + spaced_keyword_position(&data[search_from - 1..], b"EI")? + 1;
-    Some(ei + 2)
+    let ei = data[search_from - 1..].windows(4).position(|w| {
+        is_content_space(w[0]) && w[1] == b'E' && w[2] == b'I' && is_content_space(w[3])
+    })?;
+    Some(search_from + ei + 2)
 }
 
-fn spaced_keyword_position(data: &[u8], keyword: &[u8; 2]) -> Option<usize> {
-    data.windows(4)
-        .position(|w| is_content_space(w[0]) && w[1..3] == keyword[..] && is_content_space(w[3]))
+fn inline_image_header(data: &[u8], after_bi: usize) -> Option<(Vec<&[u8]>, usize)> {
+    let mut entries = Vec::new();
+    let mut i = after_bi;
+    loop {
+        skip_content_space(data, &mut i);
+        let start = i;
+        match *data.get(i)? {
+            b'%' => {
+                skip_comment(data, &mut i);
+                continue;
+            }
+            b'/' => skip_name(data, &mut i),
+            b'(' | b'<' | b'[' => i = skip_object(data, i),
+            _ => {
+                while i < data.len() && !is_content_space(data[i]) && !is_delimiter(data[i]) {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+            }
+        }
+        if &data[start..i] == b"ID" {
+            return is_content_space(*data.get(i)?).then_some((entries, i + 1));
+        }
+        entries.push(&data[start..i]);
+    }
 }
 
-fn unfiltered_inline_image_len(header: &[u8]) -> Option<usize> {
-    let mut tokens: Vec<&[u8]> = Vec::new();
-    let mut start = 0;
-    for (i, &b) in header.iter().enumerate() {
-        if is_content_space(b) {
-            tokens.push(&header[start..i]);
-            start = i + 1;
-        } else if b == b'/' {
-            tokens.push(&header[start..i]);
-            start = i;
+fn skip_object(data: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < data.len() {
+        match data[i] {
+            b'(' => i = skip_literal_string(data, i),
+            b'<' if data.get(i + 1) != Some(&b'<') => i = skip_hex_string(data, i),
+            b'%' => skip_comment(data, &mut i),
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'<' => {
+                depth += 1;
+                i += 2;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'>' => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+        if depth == 0 {
+            break;
         }
     }
-    tokens.push(&header[start..]);
-    tokens.retain(|token| !token.is_empty());
+    i.min(data.len())
+}
 
+fn inline_image_data_len(entries: &[&[u8]]) -> Option<usize> {
     let value = |abbreviation: &[u8], name: &[u8]| {
-        let key = tokens
+        entries
+            .as_chunks::<2>()
+            .0
             .iter()
-            .position(|&t| t == abbreviation || t == name)?;
-        tokens.get(key + 1).copied()
+            .find(|[key, _]| *key == abbreviation || *key == name)
+            .map(|[_, value]| *value)
     };
     let integer = |token: &[u8]| std::str::from_utf8(token).ok()?.parse::<usize>().ok();
 
+    if let Some(length) = value(b"/L", b"/Length") {
+        return integer(length);
+    }
     if value(b"/F", b"/Filter").is_some() {
         return None;
     }
@@ -251,15 +302,28 @@ fn unfiltered_inline_image_len(header: &[u8]) -> Option<usize> {
     let bits_per_pixel = if value(b"/IM", b"/ImageMask") == Some(b"true") {
         1
     } else {
-        let components: usize = match value(b"/CS", b"/ColorSpace")? {
+        let color_space = value(b"/CS", b"/ColorSpace")?;
+        let components: usize = match color_space {
             b"/G" | b"/DeviceGray" | b"/CalGray" => 1,
             b"/RGB" | b"/DeviceRGB" | b"/CalRGB" => 3,
             b"/CMYK" | b"/DeviceCMYK" => 4,
+            _ if is_indexed_color_space(color_space) => 1,
             _ => return None,
         };
         components.checked_mul(integer(value(b"/BPC", b"/BitsPerComponent")?)?)?
     };
     height.checked_mul(width.checked_mul(bits_per_pixel)?.div_ceil(8))
+}
+
+fn is_indexed_color_space(color_space: &[u8]) -> bool {
+    let Some(family) = color_space.strip_prefix(b"[") else {
+        return false;
+    };
+    let mut start = 0;
+    skip_content_space(family, &mut start);
+    let mut end = start;
+    skip_name(family, &mut end);
+    matches!(family.get(start..end), Some(b"/I" | b"/Indexed"))
 }
 
 #[cfg(test)]
