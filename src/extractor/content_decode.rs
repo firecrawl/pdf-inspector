@@ -212,10 +212,14 @@ pub(super) fn inline_image_end(data: &[u8], after_bi: usize) -> Option<usize> {
         .and_then(|len| data_start.checked_add(len))
         .filter(|&data_end| data_end <= data.len())
         .unwrap_or(data_start);
-    let ei = data[search_from - 1..].windows(4).position(|w| {
-        is_content_space(w[0]) && w[1] == b'E' && w[2] == b'I' && is_content_space(w[3])
+    let ei = (search_from - 1..data.len()).find(|&i| {
+        is_content_space(data[i])
+            && data[i + 1..].starts_with(b"EI")
+            && data
+                .get(i + 3)
+                .is_none_or(|&b| is_content_space(b) || is_delimiter(b))
     })?;
-    Some(search_from + ei + 2)
+    Some(ei + 3)
 }
 
 fn inline_image_header(data: &[u8], after_bi: usize) -> Option<(Vec<&[u8]>, usize)> {
@@ -231,6 +235,17 @@ fn inline_image_header(data: &[u8], after_bi: usize) -> Option<(Vec<&[u8]>, usiz
             }
             b'/' => skip_name(data, &mut i),
             b'(' | b'<' | b'[' => i = skip_object(data, i),
+            _ if entries.len() % 2 == 0 => {
+                if !data[start..].starts_with(b"ID") {
+                    return None;
+                }
+                let data_follows_directly = !is_content_space(*data.get(start + 2)?);
+                if data_follows_directly && !has_ascii_filter(&entries) {
+                    return None;
+                }
+                let data_start = start + if data_follows_directly { 2 } else { 3 };
+                return Some((entries, data_start));
+            }
             _ => {
                 while i < data.len() && !is_content_space(data[i]) && !is_delimiter(data[i]) {
                     i += 1;
@@ -239,9 +254,6 @@ fn inline_image_header(data: &[u8], after_bi: usize) -> Option<(Vec<&[u8]>, usiz
                     return None;
                 }
             }
-        }
-        if &data[start..i] == b"ID" {
-            return is_content_space(*data.get(i)?).then_some((entries, i + 1));
         }
         entries.push(&data[start..i]);
     }
@@ -280,15 +292,42 @@ fn skip_object(data: &[u8], start: usize) -> usize {
     i.min(data.len())
 }
 
-fn inline_image_data_len(entries: &[&[u8]]) -> Option<usize> {
-    let value = |abbreviation: &[u8], name: &[u8]| {
+fn inline_image_entry<'a>(
+    entries: &[&'a [u8]],
+    abbreviation: &[u8],
+    name: &[u8],
+) -> Option<&'a [u8]> {
+    let value_of = |key: &[u8]| {
         entries
             .as_chunks::<2>()
             .0
             .iter()
-            .find(|[key, _]| *key == abbreviation || *key == name)
+            .find(|[entry_key, _]| *entry_key == key)
             .map(|[_, value]| *value)
     };
+    value_of(abbreviation).or_else(|| value_of(name))
+}
+
+fn first_name_in_array(value: &[u8]) -> Option<&[u8]> {
+    let elements = value.strip_prefix(b"[")?;
+    let mut start = 0;
+    skip_content_space(elements, &mut start);
+    let mut end = start;
+    skip_name(elements, &mut end);
+    elements.get(start..end)
+}
+
+fn has_ascii_filter(entries: &[&[u8]]) -> bool {
+    inline_image_entry(entries, b"/F", b"/Filter").is_some_and(|filter| {
+        matches!(
+            first_name_in_array(filter).unwrap_or(filter),
+            b"/A85" | b"/ASCII85Decode" | b"/AHx" | b"/ASCIIHexDecode"
+        )
+    })
+}
+
+fn inline_image_data_len(entries: &[&[u8]]) -> Option<usize> {
+    let value = |abbreviation: &[u8], name: &[u8]| inline_image_entry(entries, abbreviation, name);
     let integer = |token: &[u8]| std::str::from_utf8(token).ok()?.parse::<usize>().ok();
 
     if let Some(length) = value(b"/L", b"/Length") {
@@ -307,23 +346,12 @@ fn inline_image_data_len(entries: &[&[u8]]) -> Option<usize> {
             b"/G" | b"/DeviceGray" | b"/CalGray" => 1,
             b"/RGB" | b"/DeviceRGB" | b"/CalRGB" => 3,
             b"/CMYK" | b"/DeviceCMYK" => 4,
-            _ if is_indexed_color_space(color_space) => 1,
+            _ if matches!(first_name_in_array(color_space), Some(b"/I" | b"/Indexed")) => 1,
             _ => return None,
         };
         components.checked_mul(integer(value(b"/BPC", b"/BitsPerComponent")?)?)?
     };
     height.checked_mul(width.checked_mul(bits_per_pixel)?.div_ceil(8))
-}
-
-fn is_indexed_color_space(color_space: &[u8]) -> bool {
-    let Some(family) = color_space.strip_prefix(b"[") else {
-        return false;
-    };
-    let mut start = 0;
-    skip_content_space(family, &mut start);
-    let mut end = start;
-    skip_name(family, &mut end);
-    matches!(family.get(start..end), Some(b"/I" | b"/Indexed"))
 }
 
 #[cfg(test)]

@@ -4705,6 +4705,24 @@ end"#;
     }
 
     #[test]
+    fn strip_pdf_comments_prefers_the_abbreviated_inline_image_key() {
+        let input = b"BI /Width 9 /W 2 /H 1 /BPC 8 /CS /RGB ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_ascii_inline_image_data_that_follows_id_directly() {
+        let input = b"BI /W 2 /H 1 /BPC 8 /CS /RGB /F /A85 ID%-ZrA~>\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_an_inline_image_that_ends_the_stream() {
+        let input = b"BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
     fn text_after_an_inline_image_with_a_percent_byte_is_extracted() {
         let items = extract_simple_items(
             b"q 10 0 0 1 0 0 cm BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q\nBT /F1 12 Tf 72 700 Td (Hello) Tj ET\n",
