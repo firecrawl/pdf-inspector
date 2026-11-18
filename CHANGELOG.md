@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A `%` byte inside inline image data (`BI ... ID <data> EI`) is no
+  longer stripped as a comment. One such byte in an uncompressed inline
+  image removed part of the image and failed the whole document with
+  `couldn't parse input`.
+  ([#675](https://github.com/firecrawl/pdf-inspector/pull/675))
+
 ## [1.26.1] - 2026-11-15
 
 Changes since 1.26.0.
