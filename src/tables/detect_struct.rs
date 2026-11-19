@@ -239,6 +239,15 @@ fn restore_missing_tagged_cells(row: &[MatchedCell], columns: &[f32]) -> Option<
     let mut next_column = 0;
 
     for cell in row {
+        // An explicit empty tag claims a slot even when it has no position.
+        // Reserving the earliest free slot leaves room for omitted gaps.
+        if cell.x.is_none() && cell.text.is_empty() && cell.item_indices.is_empty() {
+            if next_column >= columns.len() {
+                return None;
+            }
+            next_column += 1;
+            continue;
+        }
         let x = cell.x.filter(|x| x.is_finite())?;
         let right = columns.partition_point(|&anchor| anchor < x);
         let left = right.saturating_sub(1);
@@ -1144,13 +1153,14 @@ mod tests {
         assert!(!table.item_indices.contains(&1));
     }
 
-    const STATEMENT_ROWS: [[&str; 5]; 3] = [
+    const STATEMENT_ROWS: [[&str; 5]; 4] = [
         ["Date", "Description", "Withdrawals", "Deposits", "Balance"],
         ["10/01", "LOAN PMT", "2,675.12", "", "15,777.25"],
         ["10/06", "MOBILE DEPOSIT", "", "6,146.48", "17,352.24"],
+        ["10/07", "NO MOVEMENT", "", "", "17,352.24"],
     ];
 
-    fn tagged_statement_cells(omit_empty_tags: bool) -> Vec<Vec<String>> {
+    fn tagged_statement_cells(omits_tag: impl Fn(usize, usize) -> bool) -> Vec<Vec<String>> {
         let header_x = [76.8, 167.73, 272.77, 392.92, 502.86];
         let body_x = [36.0, 144.6, 253.2, 361.79, 470.39];
         let mut items = Vec::new();
@@ -1161,7 +1171,7 @@ mod tests {
             let mut cells = Vec::new();
             for (column, text) in row.iter().enumerate() {
                 if text.is_empty() {
-                    if !omit_empty_tags {
+                    if !omits_tag(row_index, column) {
                         cells.push(StructTableCell {
                             is_header: false,
                             mcids: Vec::new(),
@@ -1194,7 +1204,7 @@ mod tests {
     #[test]
     fn tagged_statement_keeps_explicit_empty_cells() {
         assert_eq!(
-            tagged_statement_cells(false),
+            tagged_statement_cells(|_, _| false),
             STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
         );
     }
@@ -1203,7 +1213,15 @@ mod tests {
     fn tagged_statement_restores_omitted_empty_cells() {
         // Chrome omits the structure element for an empty HTML cell.
         assert_eq!(
-            tagged_statement_cells(true),
+            tagged_statement_cells(|_, _| true),
+            STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
+        );
+    }
+
+    #[test]
+    fn tagged_statement_restores_omitted_cells_next_to_explicit_blanks() {
+        assert_eq!(
+            tagged_statement_cells(|row, column| row != 3 || column == 3),
             STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
         );
     }
