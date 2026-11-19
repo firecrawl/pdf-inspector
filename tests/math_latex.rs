@@ -3,10 +3,19 @@ use pdf_inspector::{extract_math_latex_in_regions_mem, MathGate, PositionFrame};
 
 /// One page, 600x400pt, whose fonts are named after the TeX fonts they
 /// stand in for. Every glyph advances 500/1000 em so positions follow the
-/// operators directly.
-fn pdf(content: &str, rotate: Option<i64>) -> Vec<u8> {
+/// operators directly. `form`, when given, is the content of a Form XObject
+/// `/Fm` with its own font `F7` (cmr7); `inherited` puts the page's
+/// resources on its parent in the page tree.
+fn build(content: &str, rotate: Option<i64>, form: Option<&str>, inherited: bool) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
+    let font = |doc: &mut Document, base: &str| {
+        doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => base,
+            "FirstChar" => 0, "LastChar" => 255,
+            "Widths" => Object::Array((0..=255).map(|_| 500.into()).collect()),
+        })
+    };
     let mut fonts = lopdf::Dictionary::new();
     for (name, base) in [
         ("F1", "ABCDEF+CMMI10"),
@@ -16,33 +25,58 @@ fn pdf(content: &str, rotate: Option<i64>) -> Vec<u8> {
         ("F5", "ABCDEF+CMMI7"),
         ("F6", "Courier"),
     ] {
-        let id = doc.add_object(dictionary! {
-            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => base,
-            "FirstChar" => 0, "LastChar" => 255,
-            "Widths" => Object::Array((0..=255).map(|_| 500.into()).collect()),
-        });
-        fonts.set(name, id);
+        fonts.set(name, font(&mut doc, base));
+    }
+    let unnamed = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "ABCDEF+CMBX10",
+        "FirstChar" => 0, "LastChar" => 255,
+        "Widths" => Object::Array((0..=255).map(|_| 500.into()).collect()),
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![65.into(), Object::Name(b"uniE001".to_vec()), Object::Name(b"uniE002".to_vec())],
+        },
+    });
+    fonts.set("F8", unnamed);
+    let mut resources = dictionary! { "Font" => fonts };
+    if let Some(form) = form {
+        let cmr7 = font(&mut doc, "ABCDEF+CMR7");
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 600.into(), 400.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F7" => cmr7 } },
+            },
+            form.as_bytes().to_vec(),
+        ));
+        resources.set("XObject", dictionary! { "Fm" => form_id });
     }
     let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
     let mut page = dictionary! {
         "Type" => "Page", "Parent" => pages_id,
         "MediaBox" => vec![0.into(), 0.into(), 600.into(), 400.into()],
-        "Resources" => dictionary! { "Font" => fonts },
         "Contents" => content_id,
     };
+    let mut pages = dictionary! { "Type" => "Pages", "Count" => 1 };
+    if inherited {
+        pages.set("Resources", resources);
+    } else {
+        page.set("Resources", resources);
+    }
     if let Some(rotate) = rotate {
         page.set("Rotate", rotate);
     }
     let page_id = doc.add_object(page);
-    doc.objects.insert(
-        pages_id,
-        dictionary! { "Type" => "Pages", "Count" => 1, "Kids" => vec![page_id.into()] }.into(),
-    );
+    pages.set("Kids", vec![page_id.into()]);
+    doc.objects.insert(pages_id, pages.into());
     let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
     doc.trailer.set("Root", catalog_id);
     let mut out = Vec::new();
     doc.save_to(&mut out).expect("save");
     out
+}
+
+fn pdf(content: &str, rotate: Option<i64>) -> Vec<u8> {
+    build(content, rotate, None, false)
 }
 
 fn read(bytes: &[u8], rect: [f32; 4], frame: PositionFrame) -> (String, MathGate) {
@@ -128,4 +162,60 @@ fn an_empty_region_reports_no_glyphs() {
     .expect("read");
     assert_eq!(result[0].page, 5);
     assert_eq!(result[0].regions[0].gate, MathGate::NoGlyphs);
+}
+
+#[test]
+fn a_page_whose_text_runs_up_the_sheet_reads_along_it() {
+    // The scripts layout turned a quarter anticlockwise: (x, y) -> (400 - y, x).
+    let bytes = pdf(&format!("q 0 1 -1 0 400 0 cm\n{SCRIPTS}\nQ"), None);
+    let (latex, gate) = read(&bytes, [88.0, 260.0, 106.0, 305.0], PositionFrame::Sheet);
+    assert_eq!(gate, MathGate::Pass);
+    assert_eq!(latex, "x^2+y_i");
+}
+
+#[test]
+fn form_xobjects_are_read_with_their_fonts_over_the_page_fonts() {
+    // The form paints with its own F7 and with the page's F1; the page
+    // inherits its resources from the page tree.
+    let form = "BT /F1 10 Tf 100 300 Td (x) Tj ET
+BT /F7 7 Tf 105 304 Td (2) Tj ET";
+    let bytes = build("q 1 0 0 1 0 0 cm /Fm Do Q", None, Some(form), true);
+    let (latex, gate) = read(&bytes, [95.0, 88.0, 140.0, 106.0], PositionFrame::Sheet);
+    assert_eq!(gate, MathGate::Pass);
+    assert_eq!(latex, "x^2");
+}
+
+#[test]
+fn a_region_of_undecodable_glyphs_is_not_read() {
+    let bytes = pdf(
+        "BT /F8 10 Tf 100 300 Td (ABAB) Tj ET\nBT /F1 10 Tf 125 300 Td (x) Tj ET",
+        None,
+    );
+    let result = extract_math_latex_in_regions_mem(
+        &bytes,
+        &[(0, vec![[95.0, 88.0, 140.0, 106.0]])],
+        PositionFrame::Sheet,
+    )
+    .expect("read");
+    let region = &result[0].regions[0];
+    assert_eq!(region.gate, MathGate::Unmapped);
+    assert_eq!(region.latex, "");
+    assert_eq!(region.glyphs, 5);
+}
+
+#[test]
+fn writes_the_napi_fixture() {
+    // tests/fixtures/math_scripts.pdf, read by napi/test.mjs.
+    let bytes = pdf(SCRIPTS, None);
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/math_scripts.pdf"
+    );
+    if std::env::var_os("REGENERATE_FIXTURES").is_some() {
+        std::fs::write(path, &bytes).expect("write fixture");
+    }
+    assert!(
+        std::fs::read(path).ok() == Some(bytes),
+        "regenerate {path} with REGENERATE_FIXTURES=1"
+    );
 }

@@ -1052,8 +1052,8 @@ pub struct PageMathRegionsJs {
 ///
 /// `pageRegions` takes 0-based pages and bboxes as for
 /// [`extractTextInRegions`]; a glyph belongs to a region when its centre lies
-/// inside it, with 1pt of slack across and 3pt up and down. Only `frame` is
-/// read from `options`.
+/// inside it, with 1pt of slack along the baseline and 3pt across it. Only
+/// `frame` is read from `options`; its other fields are ignored.
 #[napi]
 pub fn extract_math_latex_in_regions(
     buffer: Buffer,
@@ -1062,7 +1062,18 @@ pub fn extract_math_latex_in_regions(
 ) -> Result<Vec<PageMathRegionsJs>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
-    let frame = position_options(options.as_ref(), "extract_math_latex_in_regions")?.frame;
+    let frame = match options.as_ref().and_then(|options| options.frame.as_deref()) {
+        None | Some("sheet") => pdf_inspector::PositionFrame::Sheet,
+        Some("display") => pdf_inspector::PositionFrame::Display,
+        Some(other) => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "extract_math_latex_in_regions: unknown frame {other:?}; expected \"sheet\" or \"display\""
+                ),
+            ))
+        }
+    };
 
     catch_panic("extract_math_latex_in_regions", move || {
         let results = pdf_inspector::extract_math_latex_in_regions_mem(&bytes, &regions, frame)

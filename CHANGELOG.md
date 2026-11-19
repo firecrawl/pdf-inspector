@@ -17,9 +17,10 @@ version and date. Earlier releases are described in their
   limits of `\sum`, `\int`, `\lim` and other large operators, accents,
   font alphabets (`\mathbb`, `\mathcal`, `\mathfrak`, `\mathbf`), and
   delimiters stacked from TeX extension-font pieces. Each region carries a
-  gate saying whether its text layer was read: regions holding only an
-  invisible OCR layer, undecodable glyphs, or text on a page with no math
-  fonts are reported and left empty. Fractions, radicals, matrices and
+  gate saying whether its text layer was read: a region holding only an
+  invisible OCR layer, one where more than a tenth of the glyphs do not
+  decode, or one mostly outside math fonts on a page with next to no math
+  fonts is reported and left empty. Fractions, radicals, matrices and
   multi-line displays are not rebuilt.
 
 ## [1.26.1] - 2026-11-15

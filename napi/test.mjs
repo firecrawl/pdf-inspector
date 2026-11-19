@@ -217,7 +217,17 @@ for (const region of mathResults[0].regions) {
   assert.equal(typeof region.glyphs, 'number');
 }
 assert.equal(mathResults[0].regions[1].gate, 'no_glyphs');
+assert.equal(mathResults[0].regions[1].latex, '');
 assert.throws(() => extractMathLatexInRegions(fixture, [], { frame: 'page' }), /unknown frame "page"/);
+// x^2 + y_i set in TeX math fonts (tests/math_latex.rs writes the fixture).
+const mathFixture = readFileSync('../tests/fixtures/math_scripts.pdf');
+const [scripts] = extractMathLatexInRegions(
+  mathFixture,
+  [{ page: 0, regions: [[95, 88, 140, 106], [300, 200, 350, 220]] }],
+  { frame: 'display', boldWeightThreshold: 50 },
+);
+assert.deepEqual(scripts.regions[0], { latex: 'x^2+y_i', gate: 'pass', glyphs: 5 });
+assert.deepEqual(scripts.regions[1], { latex: '', gate: 'no_glyphs', glyphs: 0 });
 console.log('  extractMathLatexInRegions: OK');
 
 // --- coordinate frame: positions and regions share the visible page box ---

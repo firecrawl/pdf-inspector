@@ -15,7 +15,7 @@ pub(crate) enum FontClass {
     Extension,
 }
 
-/// A glyph or a finished atom (\`tex\` set). \`y\` grows downwards.
+/// A glyph or a finished atom (`tex` set). `y` grows downwards.
 #[derive(Debug, Clone)]
 pub(crate) struct G {
     pub(crate) c: String,
@@ -58,7 +58,6 @@ pub(crate) fn is_extension(key: &str) -> bool {
     ]
     .iter()
     .any(|n| key.contains(n))
-        || key.starts_with("ex")
 }
 
 fn is_computer_modern(key: &str) -> bool {
@@ -112,7 +111,7 @@ fn font_class(key: &str) -> FontClass {
         FontClass::Symbol
     } else if has(&["cmbx", "cmmib", "bold", "cmbsy"]) {
         FontClass::Bold
-    } else if has(&["cmmi", "italic", "cmti"]) {
+    } else if has(&["cmmi", "ital", "cmti"]) {
         FontClass::Italic
     } else {
         FontClass::Roman
@@ -209,7 +208,7 @@ fn is_unmapped(c: char) -> bool {
     c == '\u{FFFD}' || ('\u{E000}'..='\u{F8FF}').contains(&c) || c.is_control()
 }
 
-/// The reader's view of a painted glyph, or \`None\` when it paints only
+/// The reader's view of a painted glyph, or `None` when it paints only
 /// space. The second value says the glyph decoded to nothing usable.
 pub(crate) fn from_math_glyph(m: &MathGlyph) -> (Option<G>, bool) {
     let key = font_key(&m.font);

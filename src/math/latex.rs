@@ -197,6 +197,13 @@ fn accent(c: &str) -> Option<&'static str> {
 /// its alphabet names, as LaTeX.
 fn math_alphanumeric(c: char) -> Option<String> {
     let o = c as u32;
+    if (0x1D6A8..=0x1D7C9).contains(&o) {
+        const GREEK: &str = "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡϴΣΤΥΦΧΨΩ∇αβγδεζηθικλμνξοπρςστυφχψω∂ϵϑϰϕϱϖ";
+        return GREEK
+            .chars()
+            .nth(((o - 0x1D6A8) % 58) as usize)
+            .map(|g| tok_char(g, FontClass::Roman));
+    }
     if !(0x1D400..=0x1D6A3).contains(&o) {
         if (0x1D7CE..=0x1D7FF).contains(&o) {
             let offset = o - 0x1D7CE;
@@ -251,6 +258,8 @@ fn tok_char(c: char, class: FontClass) -> String {
         'ℤ' => "\\mathbb{Z}".to_string(),
         'ℚ' => "\\mathbb{Q}".to_string(),
         'ℂ' => "\\mathbb{C}".to_string(),
+        '$' => "\\$".to_string(),
+        '\\' => "\\backslash".to_string(),
         _ => c.to_string(),
     }
 }
@@ -535,8 +544,8 @@ const BIG_OPS: [&str; 11] = [
     "\\bigotimes",
 ];
 
-/// The glyphs of \`cands\` that sit centred on operator \`g\`: those nearest
-/// to it among \`ops\`, grouped into horizontal runs, keeping the runs
+/// The glyphs of `cands` that sit centred on operator `g`: those nearest
+/// to it among `ops`, grouped into horizontal runs, keeping the runs
 /// centred within its width.
 fn limit_runs(gs: &[G], cands: Vec<usize>, g: usize, ops: &[usize]) -> Vec<usize> {
     let op = &gs[g];
@@ -694,6 +703,7 @@ pub(crate) fn render_line(gs: Vec<G>) -> String {
         optex[g] = Some(t);
     }
     let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
     let mut i = 0;
     while i < n {
         if used[i] {
@@ -701,6 +711,7 @@ pub(crate) fn render_line(gs: Vec<G>) -> String {
             continue;
         }
         if let Some(t) = optex[i].take() {
+            flush_word(&mut out, &mut word);
             used[i] = true;
             out.push(t);
             i += 1;
@@ -708,10 +719,20 @@ pub(crate) fn render_line(gs: Vec<G>) -> String {
         }
         if classify(&gs[i], base, main) == Level::Main {
             used[i] = true;
-            out.push(glyph_tex(&gs[i]));
+            let g = &gs[i];
+            if g.tex.is_none()
+                && g.class == FontClass::Roman
+                && g.c.chars().all(|c| c.is_ascii_alphabetic())
+            {
+                word.push_str(&g.c);
+            } else {
+                flush_word(&mut out, &mut word);
+                out.push(glyph_tex(g));
+            }
             i += 1;
             continue;
         }
+        flush_word(&mut out, &mut word);
         let (mut sub, mut sup) = (Vec::new(), Vec::new());
         while i < n {
             if used[i] {
@@ -743,7 +764,17 @@ pub(crate) fn render_line(gs: Vec<G>) -> String {
         }
         out.push(s);
     }
-    postfix(&funcify(&join(out)))
+    flush_word(&mut out, &mut word);
+    postfix(&join(out))
+}
+
+/// A run of upright letters, with the function names in it written as
+/// their operators: italic letters are variables, however they spell.
+fn flush_word(out: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        out.push(funcify(word));
+        word.clear();
+    }
 }
 
 #[cfg(test)]
