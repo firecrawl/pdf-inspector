@@ -40,6 +40,7 @@ mod form_bbox_repair;
 pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
+pub mod math;
 mod overlong_numerals;
 pub mod process_mode;
 pub mod structure_tree;
@@ -68,6 +69,7 @@ pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
+pub use math::{extract_math_latex_in_regions_mem, MathGate, MathRegionLatex, PageMathRegions};
 pub use process_mode::ProcessMode;
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 

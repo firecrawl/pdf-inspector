@@ -130,7 +130,7 @@ pub(crate) fn get_page_xobjects(
 }
 
 /// Get XObjects from a Form XObject's Resources
-fn get_form_xobjects(
+pub(crate) fn get_form_xobjects(
     doc: &Document,
     form_dict: &lopdf::Dictionary,
 ) -> HashMap<String, XObjectType> {
