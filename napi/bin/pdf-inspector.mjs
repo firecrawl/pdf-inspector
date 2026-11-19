@@ -55,8 +55,11 @@ function parseArgs(argv) {
       i++;
       if (!argv[i]) die("--pages requires a value (e.g. 1,3,5)");
       opts.pages = argv[i].split(",").map((p) => {
-        const n = parseInt(p.trim(), 10);
-        if (Number.isNaN(n) || n < 1) die(`invalid page number: ${p}`);
+        const value = p.trim();
+        const n = Number(value);
+        if (!/^\d+$/.test(value) || !Number.isSafeInteger(n) || n < 1) {
+          die(`invalid page number: ${p}`);
+        }
         return n;
       });
     } else if (arg === "-o" || arg === "--output") {
