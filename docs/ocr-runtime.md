@@ -47,7 +47,7 @@ platform library search path:
 
 ```bash
 export PDFIUM_LIB_PATH=/absolute/path/to/libpdfium.so
-export ORT_DYLIB_PATH=/absolute/path/to/libonnxruntime.so
+export ORT_DYLIB_PATH=/absolute/path/to/libonnxruntime.so.1.27.0
 pdf2md scan.pdf --ocr auto --json
 ```
 
