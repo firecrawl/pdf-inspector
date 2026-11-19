@@ -359,7 +359,7 @@ impl ActualTextBounds {
 
 /// Switches of one page's text extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TextExtractionOptions {
+pub(crate) struct TextExtractionOptions<'a> {
     /// Keep invisible (Tr 3) text instead of skipping it.
     pub(crate) include_invisible: bool,
     /// Read bold from the weight class too — see
@@ -374,15 +374,17 @@ pub(crate) struct TextExtractionOptions {
     /// readers, a document-wide pass gathering folio evidence — which then
     /// neither gather the runs nor sum them.
     pub(crate) cmap_coverage: bool,
+    pub(crate) tagged_table_cells: Option<&'a crate::structure_tree::TaggedTableCellIndex>,
 }
 
-impl Default for TextExtractionOptions {
+impl Default for TextExtractionOptions<'_> {
     fn default() -> Self {
         Self {
             include_invisible: false,
             bold_from_weight: false,
             bold_weight_threshold: DEFAULT_BOLD_WEIGHT_THRESHOLD,
             cmap_coverage: false,
+            tagged_table_cells: None,
         }
     }
 }
@@ -454,7 +456,7 @@ pub(crate) fn extract_page_text_items_with_options(
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-    options: TextExtractionOptions,
+    options: TextExtractionOptions<'_>,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, PageRotation, bool, Vec<RunCoverage>), PdfError> {
@@ -2735,13 +2737,22 @@ pub(crate) fn extract_page_text_items_with_options(
     } else {
         Vec::new()
     };
-    let items = if page_rotation == PageRotation::Upright {
-        super::merge_text_items_with_clips(items, &item_clips, visual_rtl, &replaced_text)
+    // Clips use the original page frame, so discard them after rotation.
+    let merge_clips = if page_rotation == PageRotation::Upright {
+        item_clips.as_slice()
     } else {
-        // Clips use the original page frame; rotated-page correction is an
-        // intentionally unsupported provenance case.
-        super::merge_text_items_with_clips(items, &[], visual_rtl, &replaced_text)
+        &[]
     };
+    let tagged_cells = options
+        .tagged_table_cells
+        .and_then(|index| index.get(&page_num));
+    let items = super::merge_text_items_with_clips(
+        items,
+        merge_clips,
+        visual_rtl,
+        &replaced_text,
+        tagged_cells,
+    );
     let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),

@@ -32,6 +32,23 @@ use pdf_inspector::{
 };
 use std::collections::HashSet;
 
+#[test]
+fn compact_tagged_statement_preserves_empty_cells() {
+    let pdf = include_bytes!("fixtures/chrome_compact_tagged_statement.pdf");
+    let result = process_pdf_mem(pdf).expect("parse the synthetic tagged statement");
+    let markdown = result.markdown.expect("extract statement Markdown");
+
+    assert_eq!(
+        markdown.trim(),
+        concat!(
+            "|Date|Description|Withdrawals|Deposits|Balance|\n",
+            "|---|---|---|---|---|\n",
+            "|10/01|LOAN PMT|2,675.12||15,777.25|\n",
+            "|10/06|MOBILE DEPOSIT||6,146.48|17,352.24|",
+        )
+    );
+}
+
 /// The `/F1` font object of the PDFs the builders below write unless told
 /// otherwise: Helvetica under its standard encoding.
 const HELVETICA_FONT: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";

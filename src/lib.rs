@@ -4644,6 +4644,27 @@ fn process_document(
         });
     }
 
+    // Parse the structure tree before extraction so text joins know where
+    // one tagged table cell ends and another begins.
+    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
+        .map(|tree| {
+            let page_ids = doc.get_pages();
+            let roles = tree.mcid_to_roles(&page_ids);
+            let tables = tree.extract_tables(&page_ids);
+            if !roles.is_empty() {
+                log::debug!(
+                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
+                    roles.len(),
+                    tree.mcid_count(),
+                    tables.len()
+                );
+            }
+            let roles = if roles.is_empty() { None } else { Some(roles) };
+            (roles, tables)
+        })
+        .unwrap_or((None, Vec::new()));
+    let tagged_table_cells = structure_tree::index_sparse_tagged_table_cells(&struct_tables);
+
     // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
@@ -4654,6 +4675,7 @@ fn process_document(
             &doc,
             &font_cmaps,
             options.page_filter.as_ref(),
+            &tagged_table_cells,
         );
 
         // For Mixed/template PDFs: if normal extraction produces garbage text
@@ -4677,6 +4699,7 @@ fn process_document(
                         &doc,
                         &font_cmaps,
                         options.page_filter.as_ref(),
+                        &tagged_table_cells,
                     )
                 } else {
                     result
@@ -4687,6 +4710,7 @@ fn process_document(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
+                    &tagged_table_cells,
                 )
             }
         } else {
@@ -4700,25 +4724,6 @@ fn process_document(
     } else {
         Some(extracted?)
     };
-
-    // Parse structure tree for tagged PDFs (reuses the loaded document)
-    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
-        .map(|tree| {
-            let page_ids = doc.get_pages();
-            let roles = tree.mcid_to_roles(&page_ids);
-            let tables = tree.extract_tables(&page_ids);
-            if !roles.is_empty() {
-                log::debug!(
-                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
-                    roles.len(),
-                    tree.mcid_count(),
-                    tables.len()
-                );
-            }
-            let roles = if roles.is_empty() { None } else { Some(roles) };
-            (roles, tables)
-        })
-        .unwrap_or((None, Vec::new()));
 
     let (
         markdown,
