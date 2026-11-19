@@ -201,7 +201,10 @@ struct Walker<'a, 'b> {
     operations: usize,
     form_invocations: usize,
     form_bytes: usize,
-    forms: HashMap<ObjectId, Option<Rc<Form<'a>>>>,
+    /// Forms by object id and the font context they were invoked with: a
+    /// form's fonts fall back on its caller's, so one form shown from two
+    /// contexts is two forms.
+    forms: HashMap<(ObjectId, *const FontContext<'a>), Option<Rc<Form<'a>>>>,
     glyphs: Vec<PaintedGlyph>,
 }
 
@@ -500,7 +503,8 @@ impl<'a> Walker<'a, '_> {
     /// A Form XObject, decoded once per page. The decompressed bytes of all
     /// forms share one page-content budget; a form past it is skipped.
     fn form(&mut self, form_id: ObjectId, parent: &Rc<FontContext<'a>>) -> Option<Rc<Form<'a>>> {
-        if let Some(form) = self.forms.get(&form_id) {
+        let key = (form_id, Rc::as_ptr(parent));
+        if let Some(form) = self.forms.get(&key) {
             return form.clone();
         }
         let doc = self.doc;
@@ -522,8 +526,13 @@ impl<'a> Walker<'a, '_> {
                 .get(b"Matrix")
                 .and_then(Object::as_array)
                 .ok()
-                .map(|m| m.iter().filter_map(get_number).collect::<Vec<f32>>())
-                .filter(|m| m.len() == 6)
+                .filter(|m| m.len() >= 6)
+                .and_then(|m| {
+                    m.iter()
+                        .take(6)
+                        .map(get_number)
+                        .collect::<Option<Vec<f32>>>()
+                })
                 .map(|m| [m[0], m[1], m[2], m[3], m[4], m[5]]);
             let own_fonts = get_form_fonts(doc, &stream.dict);
             let fonts = (!own_fonts.is_empty()).then(|| {
@@ -543,7 +552,7 @@ impl<'a> Walker<'a, '_> {
                 matrix,
             }))
         })();
-        self.forms.insert(form_id, form.clone());
+        self.forms.insert(key, form.clone());
         form
     }
 

@@ -37,6 +37,11 @@ fn build(content: &str, rotate: Option<i64>, form: Option<&str>, inherited: bool
         },
     });
     fonts.set("F8", unnamed);
+    if form.is_some() {
+        // A page font under the form font's name: a form that looked its
+        // fonts up on the page first would paint cmex brackets.
+        fonts.set("F7", font(&mut doc, "ABCDEF+CMEX10"));
+    }
     let mut resources = dictionary! { "Font" => fonts };
     if let Some(form) = form {
         let cmr7 = font(&mut doc, "ABCDEF+CMR7");
@@ -175,8 +180,8 @@ fn a_page_whose_text_runs_up_the_sheet_reads_along_it() {
 
 #[test]
 fn form_xobjects_are_read_with_their_fonts_over_the_page_fonts() {
-    // The form paints with its own F7 and with the page's F1; the page
-    // inherits its resources from the page tree.
+    // The form paints with its own F7 (the page's F7 is another font) and
+    // with the page's F1; the page inherits its resources from the page tree.
     let form = "BT /F1 10 Tf 100 300 Td (x) Tj ET
 BT /F7 7 Tf 105 304 Td (2) Tj ET";
     let bytes = build("q 1 0 0 1 0 0 cm /Fm Do Q", None, Some(form), true);
