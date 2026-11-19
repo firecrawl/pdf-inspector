@@ -1099,6 +1099,61 @@ mod tests {
         assert!(!table.item_indices.contains(&1));
     }
 
+    const STATEMENT_ROWS: [[&str; 5]; 3] = [
+        ["Date", "Description", "Withdrawals", "Deposits", "Balance"],
+        ["10/01", "LOAN PMT", "2,675.12", "", "15,777.25"],
+        ["10/06", "MOBILE DEPOSIT", "", "6,146.48", "17,352.24"],
+    ];
+
+    fn tagged_statement_cells(omit_empty_tags: bool) -> Vec<Vec<String>> {
+        let header_x = [76.8, 167.73, 272.77, 392.92, 502.86];
+        let body_x = [36.0, 144.6, 253.2, 361.79, 470.39];
+        let mut items = Vec::new();
+        let mut tagged_rows = Vec::new();
+        for (row_index, row) in STATEMENT_ROWS.iter().enumerate() {
+            let is_header = row_index == 0;
+            let coords = if is_header { header_x } else { body_x };
+            let mut cells = Vec::new();
+            for (column, text) in row.iter().enumerate() {
+                if text.is_empty() {
+                    if !omit_empty_tags {
+                        cells.push(StructTableCell {
+                            is_header: false,
+                            mcids: Vec::new(),
+                        });
+                    }
+                    continue;
+                }
+                let mcid = items.len() as i64;
+                items.push(make_item(
+                    text,
+                    coords[column],
+                    120.0 - row_index as f32 * 20.0,
+                    1,
+                    Some(mcid),
+                ));
+                cells.push(StructTableCell {
+                    is_header,
+                    mcids: vec![(mcid, 1)],
+                });
+            }
+            tagged_rows.push(StructTableRow { cells });
+        }
+
+        let mut tables =
+            detect_tables_from_struct_tree(&items, &[StructTable { rows: tagged_rows }], 1);
+        assert_eq!(tables.len(), 1);
+        tables.remove(0).cells
+    }
+
+    #[test]
+    fn tagged_statement_keeps_explicit_empty_cells() {
+        assert_eq!(
+            tagged_statement_cells(false),
+            STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
+        );
+    }
+
     #[test]
     fn ragged_rows_without_recovered_header_keep_legacy_alignment() {
         let items = vec![
