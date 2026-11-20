@@ -646,6 +646,11 @@ struct PageAnalysis {
     /// `has_invisible_text_layer`.
     executed_form_bytes: usize,
     form_bytes_exceeded: bool,
+    /// Whether the walk over bound Form XObjects refused one past its byte
+    /// budget, so its text, image and font tallies are incomplete: what the
+    /// unread forms hold, they still hold, and no `no_text` verdict rests
+    /// on what the walk did not read.
+    bound_form_walk_truncated: bool,
     /// Total image area in pixels (reserved for future use)
     #[allow(dead_code)]
     total_image_area: u64,
@@ -699,7 +704,14 @@ fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     }
     if reasons.is_empty() {
         let has_extractable_text = a.text_operator_count > 0 && a.unique_text_chars > 0;
-        if !has_extractable_text && !a.has_images && !a.has_template_image {
+        if !has_extractable_text
+            && !a.has_images
+            && !a.has_template_image
+            // What the bound-form walk did not read may hold text, so a page
+            // whose walk truncated is not known to have none: it keeps the
+            // classification the rest of its evidence gives it.
+            && !a.bound_form_walk_truncated
+        {
             reasons.push(crate::OCR_REASON_NO_TEXT);
         } else {
             // Image-backed with no usable text, or too little text to trust.
@@ -905,9 +917,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     }
 
     // Scan XObject Form contents for text operators, collect their fonts,
-    // and resolve font names per-XObject scope.
+    // and resolve font names per-XObject scope. One byte budget covers every
+    // bound form the walk reads, so the decoded content of them all costs no
+    // more than a page's; when one is refused past it, the walk's tallies
+    // are incomplete and no claim may rest on what it did not read.
+    let mut bound_walk_truncated = false;
     if let Some((resource_dict, resource_ids)) = page_resources {
         let mut visited = HashSet::new();
+        let mut bound_form_bytes_left = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
             counts.add(scan_xobjects_in_resources(
@@ -917,6 +934,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
+                &mut bound_form_bytes_left,
+                &mut bound_walk_truncated,
             ));
         }
         for resource_id in resource_ids {
@@ -929,6 +948,8 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
+                    &mut bound_form_bytes_left,
+                    &mut bound_walk_truncated,
                 ));
             }
         }
@@ -1007,6 +1028,14 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     let has_decodable_text_fonts =
         text_ops > 0 && used_fonts_have_decodable_text(&used_font_ids, &font_map, doc);
 
+    if bound_walk_truncated {
+        log::debug!(
+            "page {page_id:?}: a bound Form XObject's content ran past the walk's byte \
+             budget and it, with every form after it, went unread; the walk's tallies \
+             are incomplete and no no_text verdict rests on them"
+        );
+    }
+
     PageAnalysis {
         text_operator_count: text_ops,
         executed_text_operator_count: executed_text_ops,
@@ -1017,6 +1046,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_invisible_text_layer,
         executed_form_bytes,
         form_bytes_exceeded,
+        bound_form_walk_truncated: bound_walk_truncated,
         total_image_area,
         image_count,
         unique_text_chars: all_unique_chars.len() as u32,
@@ -1774,6 +1804,7 @@ fn used_fonts_have_decodable_text(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_xobjects_in_resources(
     doc: &Document,
     resources: &lopdf::Dictionary,
@@ -1781,6 +1812,8 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
+    bytes_left: &mut usize,
+    truncated: &mut bool,
 ) -> ContentCounts {
     let mut counts = ContentCounts::default();
 
@@ -1808,9 +1841,6 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream.
                     // Every form bound is counted here, invoked or not, as
                     // the text and font tallies always have been; what the
@@ -1821,13 +1851,28 @@ fn scan_xobjects_in_resources(
                         content_resources::stream_resources(doc, stream)
                             .into_iter()
                             .collect();
-                    counts.add(content_scan::scan_content_stream_alone(
-                        doc,
-                        &content,
-                        unique_chars,
-                        &mut xobj_font_names,
-                        &own_resources,
-                    ));
+                    // The form's content is decoded within the walk's
+                    // remaining byte budget; a stream that would exceed it —
+                    // a small Flate stream inflating to gigabytes — is
+                    // skipped rather than decoded, its fonts left
+                    // uncollected. Sticky, as the form budget is: from the
+                    // form that would pass the budget on, none is read —
+                    // decoding a bomb again for each later form costs the
+                    // reads the budget forbids.
+                    let content = content_resources::decoded_within(stream, *bytes_left);
+                    if let Some(content) = content.as_ref() {
+                        *bytes_left = bytes_left.saturating_sub(content.len());
+                        counts.add(content_scan::scan_content_stream_alone(
+                            doc,
+                            content,
+                            unique_chars,
+                            &mut xobj_font_names,
+                            &own_resources,
+                        ));
+                    } else {
+                        *bytes_left = 0;
+                        *truncated = true;
+                    }
 
                     // Resolve the Form XObject's /Resources — handle both inline
                     // dicts and indirect references (P2 fix: indirect refs were
@@ -1856,6 +1901,8 @@ fn scan_xobjects_in_resources(
                             unique_chars,
                             used_font_ids,
                             font_map,
+                            bytes_left,
+                            truncated,
                         ));
                     }
                 }
@@ -2497,6 +2544,17 @@ mod tests {
         // No text, no image → no_text.
         let blank = PageAnalysis::default();
         assert_eq!(page_ocr_reasons(&blank), vec![crate::OCR_REASON_NO_TEXT]);
+
+        // A page whose bound-form walk truncated is not known to have no
+        // text: the unread forms may hold it, so no_text rests on nothing.
+        let truncated = PageAnalysis {
+            bound_form_walk_truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            page_ocr_reasons(&truncated),
+            vec![crate::OCR_REASON_SCANNED]
+        );
 
         // Vector-outlined text.
         let vector = PageAnalysis {
