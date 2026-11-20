@@ -17,6 +17,25 @@ version and date. Earlier releases are described in their
   `couldn't parse input`.
   ([#675](https://github.com/firecrawl/pdf-inspector/pull/675))
 
+## [1.27.0] - 2026-11-20
+
+Changes since 1.26.1.
+
+### Added
+
+- `extract_math_latex_in_regions_mem` (Node: `extractMathLatexInRegions`)
+  reads each region as a formula from the PDF's own text layer and writes
+  one line of LaTeX: sub- and superscripts from glyph baselines and sizes,
+  limits of `\sum`, `\int`, `\lim` and other large operators, accents,
+  font alphabets (`\mathbb`, `\mathcal`, `\mathfrak`, `\mathbf`), and
+  delimiters stacked from TeX extension-font pieces. Each region carries a
+  gate saying whether its text layer was read: a region holding only an
+  invisible text layer (render mode 3 or 7, as OCR layers are written), one where more than a tenth of the glyphs do not
+  decode, or one mostly outside math fonts on a page with next to no math
+  fonts is reported and left empty. Fractions, radicals, matrices and
+  multi-line displays are not rebuilt
+  ([#677](https://github.com/firecrawl/pdf-inspector/pull/677)).
+
 ## [1.26.1] - 2026-11-15
 
 Changes since 1.26.0.

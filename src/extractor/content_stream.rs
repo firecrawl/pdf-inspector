@@ -39,7 +39,7 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 /// (parentheses) are NOT stripped — only top-level comments.  Inline image
 /// data (`BI ... ID <data> EI`) is binary, so a `%` byte in it is not a
 /// comment either and the image is copied through unchanged.
-fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
+pub(crate) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
         return data.to_vec();
