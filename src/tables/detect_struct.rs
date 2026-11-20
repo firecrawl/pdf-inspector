@@ -1156,8 +1156,8 @@ mod tests {
     const STATEMENT_ROWS: [[&str; 5]; 4] = [
         ["Date", "Description", "Withdrawals", "Deposits", "Balance"],
         ["10/01", "LOAN PMT", "2,675.12", "", "15,777.25"],
-        ["10/06", "MOBILE DEPOSIT", "", "6,146.48", "17,352.24"],
-        ["10/07", "NO MOVEMENT", "", "", "17,352.24"],
+        ["10/06", "MOBILE DEPOSIT", "", "6,146.48", "21,923.73"],
+        ["10/07", "NO MOVEMENT", "", "", "21,923.73"],
     ];
 
     fn tagged_statement_cells(omits_tag: impl Fn(usize, usize) -> bool) -> Vec<Vec<String>> {

@@ -44,7 +44,7 @@ fn compact_tagged_statement_preserves_empty_cells() {
             "|Date|Description|Withdrawals|Deposits|Balance|\n",
             "|---|---|---|---|---|\n",
             "|10/01|LOAN PMT|2,675.12||15,777.25|\n",
-            "|10/06|MOBILE DEPOSIT||6,146.48|17,352.24|",
+            "|10/06|MOBILE DEPOSIT||6,146.48|21,923.73|",
         )
     );
 }

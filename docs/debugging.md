@@ -50,7 +50,7 @@ cargo run --bin pdf2md -- tests/fixtures/chrome_compact_tagged_statement.pdf sta
 |Date|Description|Withdrawals|Deposits|Balance|
 |---|---|---|---|---|
 |10/01|LOAN PMT|2,675.12||15,777.25|
-|10/06|MOBILE DEPOSIT||6,146.48|17,352.24|
+|10/06|MOBILE DEPOSIT||6,146.48|21,923.73|
 ```
 
 Check the Rust integration test if the columns move or nearby cells are joined into one text run.
