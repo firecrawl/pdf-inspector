@@ -218,6 +218,25 @@ pub(crate) fn detect_from_document(
     page_count: u32,
     config: &DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    detect_from_document_with_reason_collection(doc, page_count, config, true)
+}
+
+/// Classify pages for OCR routing without collecting diagnostic reasons.
+/// Callers needing per-page explanations should use [`detect_from_document`].
+pub(crate) fn detect_from_document_for_routing(
+    doc: &Document,
+    page_count: u32,
+    config: &DetectionConfig,
+) -> Result<PdfTypeResult, PdfError> {
+    detect_from_document_with_reason_collection(doc, page_count, config, false)
+}
+
+fn detect_from_document_with_reason_collection(
+    doc: &Document,
+    page_count: u32,
+    config: &DetectionConfig,
+    collect_ocr_reasons: bool,
+) -> Result<PdfTypeResult, PdfError> {
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
 
@@ -515,29 +534,31 @@ pub(crate) fn detect_from_document(
     // page otherwise defaults to `scanned`.
     let mut ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>> =
         std::collections::BTreeMap::new();
-    for &page_num in &pages_needing_ocr {
-        let reasons = match analysis_cache.get(&page_num) {
-            Some(analysis) => page_ocr_reasons(analysis),
-            None => match pages.get(&page_num) {
-                Some(&page_id) => {
-                    let executed = content_scan::page_executed_content(doc, page_id);
-                    if executed.form_bytes_exceeded {
-                        pages_past_form_budget += 1;
-                        log::debug!(
-                            "page {}: form content past the scan's byte budget after {} bytes; the rest went unread and the page keeps its classification",
-                            page_num, executed.form_bytes
-                        );
+    if collect_ocr_reasons {
+        for &page_num in &pages_needing_ocr {
+            let reasons = match analysis_cache.get(&page_num) {
+                Some(analysis) => page_ocr_reasons(analysis),
+                None => match pages.get(&page_num) {
+                    Some(&page_id) => {
+                        let executed = content_scan::page_executed_content(doc, page_id);
+                        if executed.form_bytes_exceeded {
+                            pages_past_form_budget += 1;
+                            log::debug!(
+                                "page {}: form content past the scan's byte budget after {} bytes; the rest went unread and the page keeps its classification",
+                                page_num, executed.form_bytes
+                            );
+                        }
+                        if executed.shows_only_a_hidden_text_layer {
+                            vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
+                        } else {
+                            vec![crate::OCR_REASON_SCANNED]
+                        }
                     }
-                    if executed.shows_only_a_hidden_text_layer {
-                        vec![crate::OCR_REASON_INVISIBLE_TEXT_LAYER]
-                    } else {
-                        vec![crate::OCR_REASON_SCANNED]
-                    }
-                }
-                None => vec![crate::OCR_REASON_SCANNED],
-            },
-        };
-        ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
+                    None => vec![crate::OCR_REASON_SCANNED],
+                },
+            };
+            ocr_reasons_by_page.insert(page_num, reasons.into_iter().map(String::from).collect());
+        }
     }
     if pages_past_form_budget > 0 {
         log::debug!(
