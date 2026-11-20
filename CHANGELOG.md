@@ -23,7 +23,8 @@ Changes since 1.26.1.
   invisible text layer (render mode 3 or 7, as OCR layers are written), one where more than a tenth of the glyphs do not
   decode, or one mostly outside math fonts on a page with next to no math
   fonts is reported and left empty. Fractions, radicals, matrices and
-  multi-line displays are not rebuilt (#677).
+  multi-line displays are not rebuilt
+  ([#677](https://github.com/firecrawl/pdf-inspector/pull/677)).
 
 ## [1.26.1] - 2026-11-15
 
