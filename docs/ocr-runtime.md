@@ -11,7 +11,7 @@ The reproducible runtime path uses these builds:
 
 - [Firecrawl PDFium `native-v7988`](https://github.com/firecrawl/pdfium-rs/releases/tag/native-v7988),
   containing PDFium `153.0.7988.0`
-- [ONNX Runtime `1.27.0`](https://github.com/microsoft/onnxruntime/releases/tag/v1.27.0)
+- [ONNX Runtime `1.27.0`](https://pypi.org/project/onnxruntime/1.27.0/)
 - PP-OCRv6 Small artifact revision `oar-ocr-v0.7.0`
 
 Use these versions for the reproducible path. Other compatible shared-library
@@ -19,25 +19,35 @@ builds may work, but are not part of the release smoke test.
 
 ## Install the shared libraries
 
-Download and extract the matching archives:
+Download and extract the matching archives. The ONNX Runtime v1.27.0 GitHub
+release archives are no longer available, so take the shared library from the
+`onnxruntime` 1.27.0 wheel on PyPI. A wheel is a zip file; the library is under
+`onnxruntime/capi/`:
 
-| Platform | PDFium asset | ONNX Runtime asset |
-|---|---|---|
-| Linux x64 | `firecrawl-pdfium-linux-x64.tgz` | `onnxruntime-linux-x64-1.27.0.tgz` |
-| Linux ARM64 | `firecrawl-pdfium-linux-arm64.tgz` | `onnxruntime-linux-aarch64-1.27.0.tgz` |
-| macOS Apple Silicon | `firecrawl-pdfium-mac-arm64.tgz` | `onnxruntime-osx-arm64-1.27.0.tgz` |
-| Windows x64 | `firecrawl-pdfium-win-x64.tgz` | `onnxruntime-win-x64-1.27.0.zip` |
+| Platform | PDFium asset | ONNX Runtime wheel | Library in the wheel |
+|---|---|---|---|
+| Linux x64 | `firecrawl-pdfium-linux-x64.tgz` | `onnxruntime-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` | `libonnxruntime.so.1.27.0` |
+| Linux ARM64 | `firecrawl-pdfium-linux-arm64.tgz` | `onnxruntime-1.27.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl` | `libonnxruntime.so.1.27.0` |
+| macOS Apple Silicon | `firecrawl-pdfium-mac-arm64.tgz` | `onnxruntime-1.27.0-cp312-cp312-macosx_14_0_arm64.whl` | `libonnxruntime.1.27.0.dylib` |
+| Windows x64 | `firecrawl-pdfium-win-x64.tgz` | `onnxruntime-1.27.0-cp312-cp312-win_amd64.whl` | `onnxruntime.dll` |
+
+For example, on Linux x64:
+
+```bash
+unzip -j onnxruntime-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+  'onnxruntime/capi/libonnxruntime.so*' -d onnxruntime
+```
 
 The PDFium release publishes `SHA256SUMS`, build provenance, license files,
-and an SPDX document for every platform archive. GitHub publishes a SHA-256
-digest with each ONNX Runtime asset.
+and an SPDX document for every platform archive. PyPI publishes a SHA-256
+digest with each ONNX Runtime wheel.
 
 Point pdf-inspector at the extracted shared libraries when they are not on the
 platform library search path:
 
 ```bash
 export PDFIUM_LIB_PATH=/absolute/path/to/libpdfium.so
-export ORT_DYLIB_PATH=/absolute/path/to/libonnxruntime.so
+export ORT_DYLIB_PATH=/absolute/path/to/libonnxruntime.so.1.27.0
 pdf2md scan.pdf --ocr auto --json
 ```
 
@@ -52,7 +62,7 @@ pdf2md scan.pdf --ocr auto --json
 
 The native extraction packages also support platforms without these exact
 runtime assets. In particular, the Python package has an Intel macOS wheel,
-but ONNX Runtime 1.27.0 does not publish an Intel macOS archive; local OCR on
+but ONNX Runtime 1.27.0 does not publish an Intel macOS build; local OCR on
 that target requires a compatible custom ONNX Runtime build.
 
 The full OCR path is exercised end to end on Linux x64 in CI. macOS and
