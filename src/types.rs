@@ -521,11 +521,12 @@ pub struct TextItem {
     /// text by it. The mode is graphics state: it holds across text objects,
     /// `q`/`Q` save and restore it, and a Form XObject starts with the mode
     /// it was invoked under; a `Tr` whose operand is not an integer in
-    /// `0..=7` is ignored, as renderers ignore it. Reporting the mode leaves
-    /// which runs are extracted exactly as before: invisible text is neither
-    /// dropped nor added because of it. `None` for items that don't come
-    /// from a content-stream show operator (images, links, form fields,
-    /// OCR); an item merged from several runs keeps its first run's value.
+    /// `0..=7` is ignored, as renderers ignore it. Mode 3 is left out of the
+    /// extracted text unless invisible text was requested, including when
+    /// the mode was set in an earlier text object. `None` for items that
+    /// don't come from a content-stream show operator (images, links, form
+    /// fields, OCR); an item merged from several runs keeps its first run's
+    /// value.
     pub render_mode: Option<u8>,
     /// Whether the text is underlined (drawn rule/thin rect under the
     /// baseline — PDFs have no underline font flag, so this is detected

@@ -968,7 +968,7 @@ class TestPositionedTextWithRotations:
 
 
 def paint_pdf() -> bytes:
-    """A one-page PDF with a red run, a stroked blue run, a run shown under a
+    """A one-page PDF with a red run, a stroked blue run, a run hidden by a
     ``3 Tr`` set before its text object, a line shown with ``"``, a Form
     XObject's text under the page's green fill, an image, a link annotation, a
     filled-in form field and a few body lines. Its information dictionary
@@ -1035,8 +1035,8 @@ class TestTextPaint:
         items = pdf_inspector.extract_text_with_positions_bytes(paint_pdf())
         assert self.paint_of(items, "Red run") == ((255, 0, 0), (0, 0, 0), 0)
         assert self.paint_of(items, "Outlined run") == ((255, 0, 0), (0, 0, 255), 1)
-        # Extracted as it always was, and reported as painting nothing.
-        assert self.paint_of(items, "Invisible run") == ((0, 0, 0), (0, 0, 255), 3)
+        # `3 Tr` before the text object hides the run, the same as a viewer.
+        assert not any(item.text == "Invisible run" for item in items)
         assert self.paint_of(items, "Quoted run") == ((0, 0, 0), (0, 0, 255), 0)
         assert self.paint_of(items, "Form run") == ((0, 255, 0), (0, 0, 255), 0)
 
