@@ -130,7 +130,7 @@ pub(crate) fn get_page_xobjects(
 }
 
 /// Get XObjects from a Form XObject's Resources
-fn get_form_xobjects(
+pub(crate) fn get_form_xobjects(
     doc: &Document,
     form_dict: &lopdf::Dictionary,
 ) -> HashMap<String, XObjectType> {
@@ -154,7 +154,7 @@ fn get_form_xobjects(
 }
 
 /// Collect XObject entries from a Resources dictionary
-fn collect_xobjects_from_dict(
+pub(crate) fn collect_xobjects_from_dict(
     doc: &Document,
     resources: &lopdf::Dictionary,
     xobject_types: &mut HashMap<String, XObjectType>,

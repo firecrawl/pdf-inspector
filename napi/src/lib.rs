@@ -797,7 +797,9 @@ impl Task for ExtractTextWithPositionsTask {
         let position = self.position;
         catch_panic(
             "extract_text_with_positions",
-            panic::AssertUnwindSafe(move || extract_text_with_positions_impl(&bytes, pages, position)),
+            panic::AssertUnwindSafe(move || {
+                extract_text_with_positions_impl(&bytes, pages, position)
+            }),
         )
     }
 
@@ -1019,6 +1021,78 @@ pub fn extract_text_in_regions(
             pdf_inspector::extract_text_in_regions_mem_with_options(&bytes, &regions, position)
                 .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
         Ok(to_page_region_texts(results))
+    })
+}
+
+/// LaTeX read for one formula region from the PDF's text layer.
+#[napi(object)]
+pub struct MathRegionLatexJs {
+    /// One line of LaTeX without delimiters; empty unless `gate` is `"pass"`.
+    pub latex: String,
+    /// `"pass"`, or why the text layer was not read: `"no_glyphs"`,
+    /// `"invisible"` (an OCR layer in render mode 3 or 7), `"unmapped"`
+    /// (over a tenth of the glyphs do not decode), `"non_math_fonts"` (neither
+    /// the region nor its page is set in math fonts).
+    pub gate: String,
+    /// Visible glyphs whose centre falls in the region.
+    pub glyphs: u32,
+}
+
+/// Formula regions of one page, parallel to the bboxes given.
+#[napi(object)]
+pub struct PageMathRegionsJs {
+    pub page: u32,
+    pub regions: Vec<MathRegionLatexJs>,
+}
+
+/// Read each region as a formula from the PDF's own text layer and write it
+/// as LaTeX: sub- and superscripts from glyph baselines and sizes, limits of
+/// large operators, accents, and delimiters built from pieces, on one line.
+/// Fractions, radicals, matrices and multi-line displays are not rebuilt.
+///
+/// `pageRegions` takes 0-based pages and bboxes as for
+/// [`extractTextInRegions`]; a glyph belongs to a region when its centre lies
+/// inside it, with 1pt of slack along the baseline and 3pt across it. Only
+/// `frame` is read from `options`; its other fields are ignored.
+#[napi]
+pub fn extract_math_latex_in_regions(
+    buffer: Buffer,
+    page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
+) -> Result<Vec<PageMathRegionsJs>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let regions = parse_page_regions(&page_regions);
+    let frame = match options.as_ref().and_then(|options| options.frame.as_deref()) {
+        None | Some("sheet") => pdf_inspector::PositionFrame::Sheet,
+        Some("display") => pdf_inspector::PositionFrame::Display,
+        Some(other) => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "extract_math_latex_in_regions: unknown frame {other:?}; expected \"sheet\" or \"display\""
+                ),
+            ))
+        }
+    };
+
+    catch_panic("extract_math_latex_in_regions", move || {
+        let results = pdf_inspector::extract_math_latex_in_regions_mem(&bytes, &regions, frame)
+            .map_err(|e| to_napi_err(e, "extract_math_latex_in_regions"))?;
+        Ok(results
+            .into_iter()
+            .map(|page| PageMathRegionsJs {
+                page: page.page,
+                regions: page
+                    .regions
+                    .into_iter()
+                    .map(|region| MathRegionLatexJs {
+                        latex: region.latex,
+                        gate: region.gate.as_str().to_string(),
+                        glyphs: region.glyphs as u32,
+                    })
+                    .collect(),
+            })
+            .collect())
     })
 }
 

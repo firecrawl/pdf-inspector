@@ -11,6 +11,7 @@ pub(crate) mod fonts;
 pub(crate) mod geometry;
 mod layout;
 mod links;
+pub(crate) mod math_glyphs;
 pub(crate) mod page_box;
 mod reading_order;
 mod scripts;
