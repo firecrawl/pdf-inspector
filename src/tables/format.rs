@@ -2,6 +2,30 @@
 
 use super::{Table, TableKind};
 
+fn escape_cell_html(text: &str) -> String {
+    const SCRIPT_TAGS: [&str; 4] = ["<sup>", "</sup>", "<sub>", "</sub>"];
+    let mut escaped = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(tag) = SCRIPT_TAGS.iter().find(|tag| rest.starts_with(*tag)) {
+            escaped.push_str(tag);
+            rest = &rest[tag.len()..];
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    escaped
+}
+
 pub fn table_to_markdown(table: &Table) -> String {
     if table.cells.is_empty() || table.cells[0].is_empty() {
         return String::new();
@@ -32,7 +56,7 @@ pub fn table_to_markdown(table: &Table) -> String {
     for (row_idx, row) in cleaned_cells.iter().enumerate() {
         output.push('|');
         for cell in row.iter() {
-            output.push_str(cell);
+            output.push_str(&escape_cell_html(cell));
             output.push('|');
         }
         output.push('\n');
@@ -51,7 +75,7 @@ pub fn table_to_markdown(table: &Table) -> String {
     if !footnotes.is_empty() {
         output.push('\n');
         for footnote in footnotes {
-            output.push_str(&footnote);
+            output.push_str(&escape_cell_html(footnote));
             output.push('\n');
         }
     }
@@ -126,13 +150,13 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
         }
 
         if !title.is_empty() {
-            output.push_str(&title);
+            output.push_str(&escape_cell_html(title));
         }
         if let Some(page) = trailing {
             if !title.is_empty() {
                 output.push('\t');
             }
-            output.push_str(page);
+            output.push_str(&escape_cell_html(page));
         }
         output.push('\n');
     }
@@ -140,7 +164,7 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
     if !footnotes.is_empty() {
         output.push('\n');
         for footnote in footnotes {
-            output.push_str(footnote);
+            output.push_str(&escape_cell_html(footnote));
             output.push('\n');
         }
     }
@@ -931,6 +955,25 @@ mod tests {
         assert!(md.contains("|---|"));
         assert!(md.contains("|Alice|"));
         assert!(md.contains("|Bob|"));
+    }
+
+    #[test]
+    fn table_markdown_escapes_literal_html_and_preserves_script_tags() {
+        let table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0],
+            cells: vec![vec![
+                "<u>x</u> & y".into(),
+                "V<sub>f</sub>".into(),
+            ]],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        let markdown = table_to_markdown(&table);
+        assert!(
+            markdown.contains("|&lt;u&gt;x&lt;/u&gt; &amp; y|V<sub>f</sub>|"),
+            "{markdown}"
+        );
     }
 
     #[test]
