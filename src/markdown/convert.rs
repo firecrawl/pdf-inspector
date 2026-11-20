@@ -922,6 +922,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 if p >= line.page {
                     break;
                 }
+                if options.include_page_numbers {
+                    output.push_str(&format!("<!-- Page {} -->\n\n", p));
+                }
                 flush_page_tables_and_images(
                     p,
                     &page_blocks,
@@ -1349,6 +1352,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     for &p in &all_content_pages {
         if p <= current_page {
             continue;
+        }
+        if options.include_page_numbers {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            output.push_str(&format!("\n\n<!-- Page {} -->\n\n", p));
         }
         flush_page_tables_and_images(
             p,
