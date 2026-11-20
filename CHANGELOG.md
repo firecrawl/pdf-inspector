@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Right-to-left word fragments (the Arabic definite article "al" and
+  similar prefixes) rendered slightly raised beside a word are fused into
+  their anchor instead of being emitted as a separate `<sup>`/`<sub>`
+  item. `المادة` now reads as one searchable word instead of splitting
+  into "ال" + "مادة" and detaching "ال" into `<sup>ال</sup>`.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
