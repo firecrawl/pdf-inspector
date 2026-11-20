@@ -30,6 +30,14 @@ Changes since 1.26.1.
 
 Changes since 1.26.0.
 
+### Added
+
+- `load_document_mem`, `extract_text_with_positions_from_doc` and
+  `detect_pdf_type_from_doc` (Rust only) let a caller that also reads the
+  `lopdf::Document` itself, such as its outline or page boxes, parse the
+  file once instead of once per function. `pdf_inspector::lopdf`
+  re-exports the `lopdf` the document comes from.
+
 ### Fixed
 
 - A word space painted as its own run is kept when the next word is

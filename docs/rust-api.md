@@ -545,6 +545,9 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
 | `extract_text_with_positions_and_rotations_mem_in_frame(bytes, pages, frame)` | The same with a page filter and a frame choice |
 | `extract_text_with_positions_and_rotations_mem_with_options(bytes, pages, options)` | The same with a `PositionOptions` |
+| `load_document_mem(bytes, password)` | Rust only. The `lopdf::Document` the `_mem` functions read, loaded with their header check, repairs and decryption, for the `_from_doc` functions and for a caller that reads the document itself (its outline, page boxes or annotations). `pdf_inspector::lopdf` re-exports the `lopdf` it comes from |
+| `extract_text_with_positions_from_doc(doc, pages, options)` | Rust only. `extract_text_with_positions_mem_with_options` on a loaded document, so the file is parsed once |
+| `detect_pdf_type_from_doc(doc, config)` | Rust only. `detect_pdf_type_mem_with_config` on a loaded document |
 | `extract_text_in_regions_mem(bytes, page_regions)` | Text inside top-left region rects (sheet frame) |
 | `extract_text_in_regions_mem_in_frame(bytes, page_regions, frame)` | The same with region rects read in the sheet or display frame |
 | `extract_text_in_regions_mem_with_options(bytes, page_regions, options)` | The same with a `PositionOptions` |
