@@ -790,7 +790,7 @@ pub(crate) fn decode_text_string(bytes: &[u8]) -> String {
 /// Codes 0x18..=0x1F are spacing accents, 0x80..=0x9E punctuation,
 /// ligatures and letters, and 0xA0 the euro sign; every other code is its
 /// Latin-1 character, the undefined 0x7F, 0x9F and 0xAD included.
-fn pdf_doc_encoding_char(byte: u8) -> char {
+pub(crate) fn pdf_doc_encoding_char(byte: u8) -> char {
     const ACCENTS: [char; 8] = [
         '\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}',
         '\u{02DC}',
