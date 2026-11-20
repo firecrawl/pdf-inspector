@@ -107,6 +107,13 @@ pub struct DetectionConfig {
     pub min_text_ops_per_page: u32,
     /// Threshold ratio of text pages to total pages for classification
     pub text_page_ratio_threshold: f32,
+    /// Read a page whose only text is an invisible layer under a covering
+    /// image (an OCR layer) as a text page, and let extraction decide each
+    /// scan page it reads: a page whose layer it keeps returns that layer,
+    /// and a page that shows at most a stamp and keeps no layer is listed
+    /// for OCR. Detection itself still lists every page whose only text is
+    /// a hidden layer. Off by default.
+    pub read_invisible_text_layer: bool,
 }
 
 impl Default for DetectionConfig {
@@ -117,6 +124,7 @@ impl Default for DetectionConfig {
             strategy: ScanStrategy::Sample(8),
             min_text_ops_per_page: 3,
             text_page_ratio_threshold: 0.6,
+            read_invisible_text_layer: false,
         }
     }
 }
@@ -288,7 +296,7 @@ pub(crate) fn detect_from_document(
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
                 && !analysis.has_only_type3_fonts
-                && !analysis.has_invisible_text_layer
+                && (config.read_invisible_text_layer || !analysis.has_invisible_text_layer)
             {
                 pages_with_text += 1;
             }
@@ -864,6 +872,12 @@ fn resolve_with_shadowing(
             }
         }
     }
+}
+
+/// Whether the images a page's content draws cover the page — see
+/// `PageAnalysis::has_covering_image`.
+pub(crate) fn page_has_covering_image(doc: &Document, page_id: ObjectId) -> bool {
+    content_scan::page_executed_content(doc, page_id).covers_page
 }
 
 /// Analyze a page's content stream for text operators and images
