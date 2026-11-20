@@ -19,6 +19,22 @@ pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
 /// runs a few MB at most; the bound is deliberately far above that.
 pub(crate) const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Decompress `stream` bounded by `limit` bytes. A filtered stream that
+/// inflates beyond `limit` is rejected with `None` before allocating further.
+/// A stream without a filter, or one that fails decoding for another reason,
+/// is read as its raw bytes if they fit within `limit`.
+pub(crate) fn decompressed_within(stream: &lopdf::Stream, limit: usize) -> Option<Vec<u8>> {
+    let raw_within = || (stream.content.len() <= limit).then(|| stream.content.clone());
+    if stream.dict.get(b"Filter").is_err() {
+        return raw_within();
+    }
+    match stream.decompressed_content_with_limit(limit) {
+        Ok(content) => Some(content),
+        Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })) => None,
+        Err(_) => raw_within(),
+    }
+}
+
 /// Decode `data` unless it contains more than `max_operations` operators.
 ///
 /// Returns `Ok(None)` when the stream exceeds the cap, so callers can skip
