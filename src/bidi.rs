@@ -752,9 +752,10 @@ fn joins_number(c: char) -> bool {
 /// neighbours it has on the page — a bracket glyph may be either of the
 /// two characters that mirror to it, so its place in the text is not its
 /// own to tell — and a run of such items between two lettered items sits
-/// between the same two items in the reading order, turned round with
-/// them when they are. Each item then takes the next stretch of the
-/// logical line, as long as its own text, so a bracket pair split across
+/// between the same two items in the reading order, using resolved
+/// positions to place it among any intervening items, and turned round
+/// with its neighbours when they are. Each item then takes the next stretch
+/// of the logical line, as long as its own text, so a bracket pair split across
 /// runs — `(IFRS` and `16)` painted as separate words — keeps both runs
 /// whole. An item of combining marks alone — a point or a vowel sign shown
 /// apart from its letter, over the lettered item before it in screen order
@@ -812,8 +813,10 @@ pub(crate) fn logical_line_order<T>(
     // Where each item's letters and digits land in the logical line.
     let is_strong = |c: char| c.is_alphanumeric() && !is_combining_mark(c);
     let mut strong_positions: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
+    let mut first_positions = vec![None; items.len()];
     for (at, VisualChar { ch, item }) in logical.iter().enumerate() {
         if let Some(index) = item {
+            first_positions[*index].get_or_insert(at);
             if is_strong(*ch) {
                 strong_positions[*index].push(at);
             }
@@ -862,31 +865,43 @@ pub(crate) fn logical_line_order<T>(
                 }
             }
         }
+        // A sole lettered neighbour is both first and last in `reading`.
+        // Use resolved character positions to decide which side an edge
+        // punctuation run belongs on before partitioning the logical text.
+        let run_position = run
+            .iter()
+            .filter_map(|&i| first_positions[i])
+            .min()
+            .expect("nonempty punctuation run has logical positions");
         let place = |i: usize| reading.iter().position(|&r| r == i).unwrap_or(0);
         let (insert_at, reversed) = match (left, right) {
-            // Between two lettered items: right after the one read first,
-            // turned round when the stretch reads right to left.
+            // Stay between the same lettered neighbours, but not necessarily
+            // right after the first: a neighbour can be one glyph of a word
+            // whose remaining glyphs precede the punctuation in logical order.
             (Some(l), Some(r)) => {
                 let (pl, pr) = (place(l), place(r));
-                if pl < pr {
-                    (pl + 1, false)
-                } else {
-                    (pr + 1, true)
-                }
+                let (first, last) = (pl.min(pr), pl.max(pr));
+                let insert_at = (first + 1..last)
+                    .find(|&at| {
+                        let positions = &strong_positions[reading[at]];
+                        !positions.is_empty() && positions[positions.len() / 2] > run_position
+                    })
+                    .unwrap_or(last);
+                (insert_at, pl > pr)
             }
             // At the page's left edge: the start of the reading when the
-            // neighbour is read first, else its very end, turned round.
+            // run resolves before its neighbour, else its very end, turned round.
             (None, Some(r)) => {
-                if place(r) == 0 {
+                if run_position < strong_positions[r][0] {
                     (0, false)
                 } else {
                     (reading.len(), true)
                 }
             }
             // At the page's right edge: the end of the reading when the
-            // neighbour is read last, else its very start, turned round.
+            // run resolves after its neighbour, else its very start, turned round.
             (Some(l), None) => {
-                if place(l) + 1 == reading.len() {
+                if run_position > strong_positions[l][0] {
                     (reading.len(), false)
                 } else {
                     (0, true)
@@ -1256,6 +1271,135 @@ mod tests {
                 (1, "16)".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn punctuation_at_rtl_line_edges_keeps_letters_in_their_own_run() {
+        let word = "\u{05D0}\u{05D1}\u{05D2}\u{05D3}";
+        let visual_word = "\u{05D3}\u{05D2}\u{05D1}\u{05D0}";
+        for rtl_base in [false, true] {
+            for visual in [false, true] {
+                for trailing in [false, true] {
+                    let text = if visual { visual_word } else { word };
+                    let items = if trailing {
+                        [(text, 50.0f32, 24.0f32), (", ", 82.0, 6.0)]
+                    } else {
+                        [(", ", 40.0f32, 6.0f32), (text, 50.0, 24.0)]
+                    };
+                    let order = logical_line_order(
+                        &items,
+                        |i| i.0,
+                        |i| (i.1, i.2),
+                        |_| 12.0,
+                        |_| visual,
+                        None,
+                        rtl_base,
+                    );
+                    let word_index = usize::from(!trailing);
+                    assert_eq!(
+                        order
+                            .iter()
+                            .find(|(index, _)| *index == word_index)
+                            .unwrap()
+                            .1,
+                        word,
+                        "rtl_base={rtl_base}, visual={visual}, trailing={trailing}: {order:?}",
+                    );
+                    let punctuation = &order
+                        .iter()
+                        .find(|(index, _)| *index != word_index)
+                        .unwrap()
+                        .1;
+                    assert_eq!(punctuation.trim(), ",", "{order:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_beside_glyphwise_hebrew_keeps_each_fragment_intact() {
+        for rtl_base in [false, true] {
+            for visual in [false, true] {
+                for trailing in [false, true] {
+                    let mut texts = vec!["ד", "ג", "ב", "א"];
+                    if trailing {
+                        texts.extend([", ", "ABC"]);
+                    } else {
+                        texts.splice(0..0, ["ABC", ", "]);
+                    }
+                    let items: Vec<_> = texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &text)| (text, i as f32 * 24.0, 24.0))
+                        .collect();
+                    let order = logical_line_order(
+                        &items,
+                        |i| i.0,
+                        |i| (i.1, i.2),
+                        |_| 12.0,
+                        |_| visual,
+                        None,
+                        rtl_base,
+                    );
+                    for (index, text) in &order {
+                        assert_eq!(
+                            text.trim(),
+                            texts[*index].trim(),
+                            "rtl_base={rtl_base}, visual={visual}, trailing={trailing}: {order:?}"
+                        );
+                    }
+                    let text: String = order.iter().map(|(_, text)| text.as_str()).collect();
+                    assert!(text.contains("אבגד"), "{text:?}");
+                    assert_eq!(text.matches(',').count(), 1, "{text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_beside_glyphwise_latin_keeps_each_fragment_intact() {
+        for rtl_base in [false, true] {
+            for visual in [false, true] {
+                for trailing in [false, true] {
+                    let hebrew = if visual { "בא" } else { "אב" };
+                    let mut texts = vec!["A", "B", "C"];
+                    if trailing {
+                        texts.extend([", ", hebrew]);
+                    } else {
+                        texts.splice(0..0, [hebrew, ", "]);
+                    }
+                    let items: Vec<_> = texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &text)| (text, i as f32 * 24.0, 24.0))
+                        .collect();
+                    let order = logical_line_order(
+                        &items,
+                        |i| i.0,
+                        |i| (i.1, i.2),
+                        |_| 12.0,
+                        |_| visual,
+                        None,
+                        rtl_base,
+                    );
+                    for (index, text) in &order {
+                        let expected = if texts[*index] == hebrew {
+                            "אב"
+                        } else {
+                            texts[*index].trim()
+                        };
+                        assert_eq!(
+                            text.trim(),
+                            expected,
+                            "rtl_base={rtl_base}, visual={visual}, trailing={trailing}: {order:?}"
+                        );
+                    }
+                    let text: String = order.iter().map(|(_, text)| text.as_str()).collect();
+                    assert!(text.contains("ABC"), "{text:?}");
+                    assert_eq!(text.matches(',').count(), 1, "{text:?}");
+                }
+            }
+        }
     }
 
     #[test]
