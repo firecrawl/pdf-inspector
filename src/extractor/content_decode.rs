@@ -93,7 +93,7 @@ fn count_content_operators(data: &[u8], limit: usize) -> usize {
     count
 }
 
-fn is_content_space(b: u8) -> bool {
+pub(super) fn is_content_space(b: u8) -> bool {
     // PDF whitespace (ISO 32000): NUL, tab, LF, FF, CR, space. Names must
     // stop on these so a following operator is not absorbed into `/Name`.
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
@@ -193,6 +193,165 @@ fn skip_inline_image_after_bi(data: &[u8], mut i: usize) -> usize {
         return i + pos + 3;
     }
     i
+}
+
+pub(super) fn is_inline_image_start(data: &[u8], i: usize) -> bool {
+    data[i..].starts_with(b"BI")
+        && data
+            .get(i + 2)
+            .is_none_or(|&b| is_content_space(b) || b == b'/')
+        && (i == 0 || is_content_space(data[i - 1]) || matches!(data[i - 1], b')' | b'>' | b']'))
+}
+
+/// Offset just past the `EI` that closes the inline image whose `BI` ends at
+/// `after_bi`. Data with a known length is skipped by that length, as lopdf
+/// reads it, so an `EI` lookalike among the data bytes does not end it early.
+pub(super) fn inline_image_end(data: &[u8], after_bi: usize) -> Option<usize> {
+    let (entries, data_start) = inline_image_header(data, after_bi)?;
+    let search_from = inline_image_data_len(&entries)
+        .and_then(|len| data_start.checked_add(len))
+        .filter(|&data_end| data_end <= data.len())
+        .unwrap_or(data_start);
+    let ei = (search_from - 1..data.len()).find(|&i| {
+        is_content_space(data[i])
+            && data[i + 1..].starts_with(b"EI")
+            && data
+                .get(i + 3)
+                .is_none_or(|&b| is_content_space(b) || is_delimiter(b))
+    })?;
+    Some(ei + 3)
+}
+
+fn inline_image_header(data: &[u8], after_bi: usize) -> Option<(Vec<&[u8]>, usize)> {
+    let mut entries = Vec::new();
+    let mut i = after_bi;
+    loop {
+        skip_content_space(data, &mut i);
+        let start = i;
+        match *data.get(i)? {
+            b'%' => {
+                skip_comment(data, &mut i);
+                continue;
+            }
+            b'/' => skip_name(data, &mut i),
+            b'(' | b'<' | b'[' => i = skip_object(data, i),
+            _ if entries.len() % 2 == 0 => {
+                if !data[start..].starts_with(b"ID") {
+                    return None;
+                }
+                let data_follows_directly = !is_content_space(*data.get(start + 2)?);
+                if data_follows_directly && !has_ascii_filter(&entries) {
+                    return None;
+                }
+                let data_start = start + if data_follows_directly { 2 } else { 3 };
+                return Some((entries, data_start));
+            }
+            _ => {
+                while i < data.len() && !is_content_space(data[i]) && !is_delimiter(data[i]) {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+            }
+        }
+        entries.push(&data[start..i]);
+    }
+}
+
+fn skip_object(data: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < data.len() {
+        match data[i] {
+            b'(' => i = skip_literal_string(data, i),
+            b'<' if data.get(i + 1) != Some(&b'<') => i = skip_hex_string(data, i),
+            b'%' => skip_comment(data, &mut i),
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'<' => {
+                depth += 1;
+                i += 2;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'>' => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    i.min(data.len())
+}
+
+fn inline_image_entry<'a>(
+    entries: &[&'a [u8]],
+    abbreviation: &[u8],
+    name: &[u8],
+) -> Option<&'a [u8]> {
+    let value_of = |key: &[u8]| {
+        entries
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .find(|[entry_key, _]| *entry_key == key)
+            .map(|[_, value]| *value)
+    };
+    value_of(abbreviation).or_else(|| value_of(name))
+}
+
+fn first_name_in_array(value: &[u8]) -> Option<&[u8]> {
+    let elements = value.strip_prefix(b"[")?;
+    let mut start = 0;
+    skip_content_space(elements, &mut start);
+    let mut end = start;
+    skip_name(elements, &mut end);
+    elements.get(start..end)
+}
+
+fn has_ascii_filter(entries: &[&[u8]]) -> bool {
+    inline_image_entry(entries, b"/F", b"/Filter").is_some_and(|filter| {
+        matches!(
+            first_name_in_array(filter).unwrap_or(filter),
+            b"/A85" | b"/ASCII85Decode" | b"/AHx" | b"/ASCIIHexDecode"
+        )
+    })
+}
+
+fn inline_image_data_len(entries: &[&[u8]]) -> Option<usize> {
+    let value = |abbreviation: &[u8], name: &[u8]| inline_image_entry(entries, abbreviation, name);
+    let integer = |token: &[u8]| std::str::from_utf8(token).ok()?.parse::<usize>().ok();
+
+    if let Some(length) = value(b"/L", b"/Length") {
+        return integer(length);
+    }
+    if value(b"/F", b"/Filter").is_some() {
+        return None;
+    }
+    let width = integer(value(b"/W", b"/Width")?)?;
+    let height = integer(value(b"/H", b"/Height")?)?;
+    let bits_per_pixel = if value(b"/IM", b"/ImageMask") == Some(b"true") {
+        1
+    } else {
+        let color_space = value(b"/CS", b"/ColorSpace")?;
+        let components: usize = match color_space {
+            b"/G" | b"/DeviceGray" | b"/CalGray" => 1,
+            b"/RGB" | b"/DeviceRGB" | b"/CalRGB" => 3,
+            b"/CMYK" | b"/DeviceCMYK" => 4,
+            _ if matches!(first_name_in_array(color_space), Some(b"/I" | b"/Indexed")) => 1,
+            _ => return None,
+        };
+        components.checked_mul(integer(value(b"/BPC", b"/BitsPerComponent")?)?)?
+    };
+    height.checked_mul(width.checked_mul(bits_per_pixel)?.div_ceil(8))
 }
 
 #[cfg(test)]

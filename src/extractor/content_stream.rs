@@ -36,7 +36,9 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 ///
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
-/// (parentheses) are NOT stripped — only top-level comments.
+/// (parentheses) are NOT stripped — only top-level comments.  Inline image
+/// data (`BI ... ID <data> EI`) is binary, so a `%` byte in it is not a
+/// comment either and the image is copied through unchanged.
 pub(crate) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
@@ -77,6 +79,19 @@ pub(crate) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
             b'>' if in_hex_string => {
                 in_hex_string = false;
                 result.push(b);
+            }
+            b'B' if in_string == 0
+                && !in_hex_string
+                && super::content_decode::is_inline_image_start(data, i) =>
+            {
+                match super::content_decode::inline_image_end(data, i + 2) {
+                    Some(end) => {
+                        result.extend_from_slice(&data[i..end]);
+                        i = end;
+                        continue;
+                    }
+                    None => result.push(b),
+                }
             }
             b'%' if in_string == 0 && !in_hex_string => {
                 // Skip until end of line
@@ -4627,6 +4642,93 @@ end"#;
         let input = b"(x\\\\) Tj % comment\nET\n";
         let output = strip_pdf_comments(input);
         assert_eq!(output, b"(x\\\\) Tj  \nET\n");
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_unfiltered_inline_image_data() {
+        let input =
+            b"q BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q % real comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(
+            output,
+            b"q BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q  \nET\n"
+        );
+    }
+
+    #[test]
+    fn strip_pdf_comments_uses_declared_length_over_an_ei_lookalike() {
+        let input = b"BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\nEI\n%\xff\nEI Q\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_filtered_inline_image_data() {
+        let input =
+            b"BI /W 55 /H 25 /BPC 8 /CS/RGB /F/DCT ID\n\xff\xd8%\x00(\x01\nEI Q % real comment\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(
+            output,
+            b"BI /W 55 /H 25 /BPC 8 /CS/RGB /F/DCT ID\n\xff\xd8%\x00(\x01\nEI Q  \n"
+        );
+    }
+
+    #[test]
+    fn strip_pdf_comments_ignores_bi_inside_strings_and_names() {
+        let input = b"(BI ) Tj /BI gs % comment\nET\n";
+        let output = strip_pdf_comments(input);
+        assert_eq!(output, b"(BI ) Tj /BI gs  \nET\n");
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_an_inline_image_with_no_space_after_bi() {
+        let input = b"BI/W 2/H 1/BPC 8/CS/RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_uses_the_length_entry_of_a_filtered_inline_image() {
+        let input = b"BI /W 9 /H 9 /BPC 8 /CS /RGB /F /DCT /L 6 ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_sizes_an_indexed_inline_image_past_its_lookup_table() {
+        let input = b"BI /W 6 /H 1 /BPC 8 /CS [/I /RGB 1 ( ID /W 9 )] ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_skips_a_comment_in_an_inline_image_header() {
+        let input = b"BI /W 2 /H 1 % not ID yet\n/BPC 8 /CS /RGB ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_prefers_the_abbreviated_inline_image_key() {
+        let input = b"BI /Width 9 /W 2 /H 1 /BPC 8 /CS /RGB ID\n\nEI\n%\xff\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_ascii_inline_image_data_that_follows_id_directly() {
+        let input = b"BI /W 2 /H 1 /BPC 8 /CS /RGB /F /A85 ID%-ZrA~>\nEI Q\n";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn strip_pdf_comments_keeps_an_inline_image_that_ends_the_stream() {
+        let input = b"BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI";
+        assert_eq!(strip_pdf_comments(input), input.to_vec());
+    }
+
+    #[test]
+    fn text_after_an_inline_image_with_a_percent_byte_is_extracted() {
+        let items = extract_simple_items(
+            b"q 10 0 0 1 0 0 cm BI /W 2 /H 1 /BPC 8 /CS /RGB ID\n\xe3%\x1b\xff\xff\xff\nEI Q\nBT /F1 12 Tf 72 700 Td (Hello) Tj ET\n",
+        );
+        let text: String = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(text, "Hello");
     }
 
     #[test]
