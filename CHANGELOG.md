@@ -30,6 +30,13 @@ Changes since 1.26.1.
 
 Changes since 1.26.0.
 
+### Added
+
+- `PositionOptions::include_invisible` keeps invisible (render mode 3)
+  text in the positioned-text and region functions, such as the OCR layer
+  a scanner writes behind a page image. Its items carry `render_mode`
+  `Some(3)`. Off by default, so the output is unchanged without it.
+
 ### Fixed
 
 - A word space painted as its own run is kept when the next word is
