@@ -438,6 +438,43 @@ pub struct StructTable {
     pub rows: Vec<StructTableRow>,
 }
 
+pub(crate) type TaggedTableCellIndex = HashMap<u32, HashMap<i64, usize>>;
+
+/// Sparse tables with complete tagged headers need their cell tags during both
+/// text extraction and Markdown table detection.
+pub(crate) fn is_sparse_tagged_table(table: &StructTable) -> bool {
+    let Some((header, body)) = table.rows.split_first() else {
+        return false;
+    };
+    let width = header.cells.len();
+    width >= 2
+        && header
+            .cells
+            .iter()
+            .all(|cell| cell.is_header && !cell.mcids.is_empty())
+        && body.iter().all(|row| row.cells.len() <= width)
+        && body.iter().any(|row| row.cells.len() < width)
+}
+
+/// Index the marked-content IDs in tables with a complete header and shorter body rows.
+pub(crate) fn index_sparse_tagged_table_cells(tables: &[StructTable]) -> TaggedTableCellIndex {
+    let mut index: TaggedTableCellIndex = HashMap::new();
+    let mut cell_id = 0;
+    for table in tables.iter().filter(|table| is_sparse_tagged_table(table)) {
+        for cell in table.rows.iter().flat_map(|row| &row.cells) {
+            for &(mcid, page) in &cell.mcids {
+                index
+                    .entry(page)
+                    .or_default()
+                    .entry(mcid)
+                    .or_insert(cell_id);
+            }
+            cell_id += 1;
+        }
+    }
+    index
+}
+
 fn collect_tables(
     elements: &[StructElement],
     obj_to_page: &HashMap<ObjectId, u32>,
