@@ -462,26 +462,9 @@ pub(crate) type DocumentExtraction = (
     CMapCoverageByFont,
 );
 
-/// Extract positioned text, rectangles, and line segments from a pre-loaded document.
-///
-/// Also returns per-page adaptive join thresholds for Canva-style pages.
-pub(crate) fn extract_positioned_text_from_doc(
-    doc: &Document,
-    font_cmaps: &FontCMaps,
-    page_filter: Option<&HashSet<u32>>,
-) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_impl(
-        doc,
-        font_cmaps,
-        page_filter,
-        TextExtractionOptions::default(),
-        None,
-        CoordinateFrame::UserSpace,
-    )
-}
-
-/// [`extract_positioned_text_from_doc`] with every page's geometry shifted
-/// into the visible-page-box frame — what the public position APIs return.
+/// Extract positioned text from a pre-loaded document with every page's
+/// geometry shifted into the visible-page-box frame — what public position
+/// APIs return.
 /// A page whose frame was turned (see `PageRotation`) gets the equivalently
 /// turned shift, so its items, links and form fields agree with region
 /// bounds computed from the visible box.
@@ -643,14 +626,18 @@ fn extract_positioned_text_with_folio_context_impl(
 pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
-    required_pages: &HashSet<u32>,
+    required_pages: Option<&HashSet<u32>>,
+    tagged_table_cells: &crate::structure_tree::TaggedTableCellIndex,
 ) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
         None,
-        TextExtractionOptions::default(),
-        Some(required_pages),
+        TextExtractionOptions {
+            tagged_table_cells: Some(tagged_table_cells),
+            ..TextExtractionOptions::default()
+        },
+        required_pages,
         CoordinateFrame::UserSpace,
     )
 }
@@ -5422,8 +5409,15 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations, _) =
-            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        let ((items, _, _), _, _, page_rotations, _) = extract_positioned_text_impl(
+            &doc,
+            &font_cmaps,
+            None,
+            TextExtractionOptions::default(),
+            None,
+            CoordinateFrame::UserSpace,
+        )
+        .unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items
             .iter()

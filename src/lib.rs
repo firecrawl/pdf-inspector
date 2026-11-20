@@ -635,6 +635,17 @@ fn extract_pages_markdown_mem_impl(
     let _ = (repairs, render_repairs);
     let font_cmaps = FontCMaps::from_doc(&doc);
 
+    // Sparse tables use the tagged header positions to preserve the column of
+    // each cell. Build their index before extraction joins adjacent text runs.
+    let sparse_tagged_tables = structure_tree::StructTree::from_doc(&doc)
+        .map(|tree| {
+            let mut tables = tree.extract_tables(&doc.get_pages());
+            tables.retain(structure_tree::is_sparse_tagged_table);
+            tables
+        })
+        .unwrap_or_default();
+    let tagged_table_cells = structure_tree::index_sparse_tagged_table_cells(&sparse_tagged_tables);
+
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
     // unselected page cannot make a valid requested page fail, but errors on a
     // requested page retain the normal extraction semantics.
@@ -645,15 +656,12 @@ fn extract_pages_markdown_mem_impl(
             .collect()
     });
     let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
-        if let Some(required_pages) = required_pages.as_ref() {
-            extractor::extract_positioned_text_for_document_analysis(
-                &doc,
-                &font_cmaps,
-                required_pages,
-            )?
-        } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
-        };
+        extractor::extract_positioned_text_for_document_analysis(
+            &doc,
+            &font_cmaps,
+            required_pages.as_ref(),
+            &tagged_table_cells,
+        )?;
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -794,7 +802,7 @@ fn extract_pages_markdown_mem_impl(
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
-                    struct_tables: &[],
+                    struct_tables: &sparse_tagged_tables,
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
