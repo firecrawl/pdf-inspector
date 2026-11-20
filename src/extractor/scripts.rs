@@ -8,6 +8,7 @@
 //! single item flagged with [`TextItem::baseline_shift`]. Line grouping and
 //! rendering (`TextItem::line_y`, `TextLine::text`) consume those results.
 
+use crate::text_utils::is_rtl_char;
 use crate::types::{ItemType, TextItem};
 use std::collections::HashMap;
 
@@ -425,6 +426,20 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             && fusable_anchor_edge(anchor, run.anchor_on_left)
             && !run_of_glyph.contains_key(&run.anchor);
 
+        // Arabic/Hebrew word fragments (the definite article "al", prefixes)
+        // rendered slightly raised beside a word belong to that word: fuse them
+        // into the anchor instead of emitting a stray <sup>/<sub>, so "المادة"
+        // stays one searchable word rather than "ال" + "مادة".
+        let rtl_letters = run
+            .glyphs
+            .iter()
+            .any(|&g| items[g].text.chars().any(is_rtl_char));
+        let fuse_rtl = !digit_only
+            && rtl_letters
+            && marks_ok
+            && fusable_anchor_edge(anchor, run.anchor_on_left)
+            && !run_of_glyph.contains_key(&run.anchor);
+
         let legacy_symbol_rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
         if fuse {
             // Direction from the baseline offset (y-up): raised → superscript
@@ -443,6 +458,32 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             anchor.legacy_symbol_rewrite |= legacy_symbol_rewrite;
             // The fused item spans the union of word and marker: a kerned
             // marker may end inside the word's advance or start before it.
+            let anchor_right = item_right(anchor);
+            if run.anchor_on_left {
+                anchor.text.push_str(&mapped);
+                anchor.width = anchor_right.max(run_right) - anchor.x;
+            } else {
+                anchor.text = mapped + &anchor.text;
+                let left = anchor.x.min(run_left);
+                anchor.width = anchor_right.max(run_right) - left;
+                anchor.x = left;
+            }
+            for &g in &run.glyphs {
+                remove[g] = true;
+            }
+        } else if fuse_rtl {
+            // Arabic/Hebrew word fragment fused into its anchor word: no
+            // <sup>/<sub>, just concatenation in reading order so "ال" + "مادة"
+            // becomes the single searchable word "المادة".
+            let mapped: String = run
+                .glyphs
+                .iter()
+                .map(|&g| items[g].text.as_str())
+                .collect();
+            let run_left = items[run.glyphs[0]].x;
+            let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
+            let anchor = &mut items[run.anchor];
+            anchor.legacy_symbol_rewrite |= legacy_symbol_rewrite;
             let anchor_right = item_right(anchor);
             if run.anchor_on_left {
                 anchor.text.push_str(&mapped);
