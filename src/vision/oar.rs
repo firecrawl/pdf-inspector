@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use image::RgbImage;
+#[cfg(feature = "ocr-directml")]
+use oar_ocr::core::config::onnx::OrtExecutionProvider;
 use oar_ocr::core::config::onnx::OrtSessionConfig;
 use oar_ocr::domain::tasks::TextDetectionConfig;
 use oar_ocr::oarocr::{EdgeProcessor, TextCroppingProcessor};
@@ -501,11 +503,80 @@ fn polygon_height(polygon: &BoundingBox) -> f32 {
     }
 }
 
+/// Chooses the ONNX Runtime execution provider for OCR sessions.
+///
+/// Upstream builds oar-ocr with `["simd"]` only and never calls
+/// `with_execution_providers`, so every session lands on the CPU provider.
+/// With the `ocr-directml` Cargo feature, `PDF_INSPECTOR_OCR_EP=directml[:N]`
+/// requests DirectML on adapter N, with the CPU provider as fallback.
+///
+/// CPU is the default in every case, so a build without the feature, or a
+/// machine without the DirectML runtime, behaves exactly like upstream.
+///
+/// The adapter index is the DirectML/DXGI `EnumAdapters1` order, which need
+/// not match `nvidia-smi` or Task Manager ordering -- on a hybrid laptop the
+/// integrated GPU often enumerates first. Set N explicitly rather than
+/// assuming. DirectML also needs a DirectML-enabled onnxruntime.dll and
+/// DirectML.dll (Windows ships the latter in System32) on the search path.
+#[cfg(feature = "ocr-directml")]
+const OCR_EP_ENV: &str = "PDF_INSPECTOR_OCR_EP";
+
+/// Parses a `PDF_INSPECTOR_OCR_EP` value into a DirectML adapter index, or
+/// `None` to stay on the CPU provider.
+///
+/// Split out from [`requested_directml_device`] so the parsing rules are
+/// testable without touching the process environment.
+///
+/// Accepted: `directml`, `dml`, `directml:N`, `dml:N` -- case-insensitive,
+/// surrounding whitespace ignored. Malformed and negative adapter ids are
+/// rejected rather than coerced: a typo like `directml:1x` must not silently
+/// run OCR on adapter 0, which on a multi-GPU machine can be a different
+/// device than the one intended.
+#[cfg(feature = "ocr-directml")]
+fn parse_directml_device(value: &str) -> Option<i32> {
+    let (name, arg) = match value.split_once(':') {
+        Some((name, arg)) => (name, Some(arg)),
+        None => (value, None),
+    };
+    if !matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "directml" | "dml"
+    ) {
+        return None;
+    }
+    match arg {
+        None => Some(0),
+        Some(device) => device.trim().parse::<i32>().ok().filter(|id| *id >= 0),
+    }
+}
+
+/// DirectML adapter requested through `PDF_INSPECTOR_OCR_EP`, or `None` to
+/// stay on the CPU provider.
+#[cfg(feature = "ocr-directml")]
+fn requested_directml_device() -> Option<i32> {
+    parse_directml_device(&std::env::var(OCR_EP_ENV).ok()?)
+}
+
 fn ocr_session_config(intra_threads: usize) -> OrtSessionConfig {
-    OrtSessionConfig::new()
+    let config = OrtSessionConfig::new()
         .with_intra_threads(intra_threads.max(1))
         .with_inter_threads(1)
-        .with_parallel_execution(false)
+        .with_parallel_execution(false);
+
+    #[cfg(feature = "ocr-directml")]
+    if let Some(device_id) = requested_directml_device() {
+        return config.with_execution_providers(vec![
+            // Order is load-bearing: `has_accelerator_provider()` inspects only
+            // the first entry, and a CPU provider listed first claims nearly
+            // every node before the accelerator gets a chance.
+            OrtExecutionProvider::DirectML {
+                device_id: Some(device_id),
+            },
+            OrtExecutionProvider::CPU,
+        ]);
+    }
+
+    config
 }
 
 fn load_onnx_runtime() -> Result<(), OarOcrError> {
@@ -890,5 +961,34 @@ mod tests {
         assert!((1..=3).contains(&concurrency));
         assert!(intra_threads_per_pipeline(2) == 2);
         assert!((1..=4).contains(&intra_threads_per_pipeline(1)));
+    }
+
+    #[cfg(feature = "ocr-directml")]
+    #[test]
+    fn directml_env_parsing_accepts_only_well_formed_values() {
+        use super::parse_directml_device;
+
+        // A bare provider name means adapter 0.
+        assert_eq!(parse_directml_device("directml"), Some(0));
+        assert_eq!(parse_directml_device("dml"), Some(0));
+        assert_eq!(parse_directml_device("DML"), Some(0));
+        assert_eq!(parse_directml_device("directml:1"), Some(1));
+        assert_eq!(parse_directml_device("DML:2"), Some(2));
+        assert_eq!(parse_directml_device("  directml : 3 "), Some(3));
+
+        // Malformed and negative indexes must fall back to CPU instead of
+        // silently selecting adapter 0, which on a multi-GPU machine may be a
+        // different device than the one intended.
+        assert_eq!(parse_directml_device("directml:1x"), None);
+        assert_eq!(parse_directml_device("directml:-1"), None);
+        assert_eq!(parse_directml_device("directml:"), None);
+        assert_eq!(parse_directml_device("directml:  "), None);
+        assert_eq!(parse_directml_device("directml:0x1"), None);
+
+        // Unrecognised providers and the empty value stay on CPU.
+        assert_eq!(parse_directml_device(""), None);
+        assert_eq!(parse_directml_device("cpu"), None);
+        assert_eq!(parse_directml_device("random"), None);
+        assert_eq!(parse_directml_device("cuda:0"), None);
     }
 }
