@@ -118,6 +118,7 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
             render_mode: item.render_mode,
             is_underline: item.is_underline,
             is_strikeout: item.is_strikeout,
+            layout_strikeout: item.layout_strikeout,
             rotation: item.rotation,
             advance_known: item.advance_known,
             item_type: item.item_type.clone(),

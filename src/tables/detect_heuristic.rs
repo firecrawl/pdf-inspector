@@ -160,6 +160,7 @@ fn merge_adjacent_items_preserving(
                 render_mode: first_item.render_mode,
                 is_underline: first_item.is_underline,
                 is_strikeout: first_item.is_strikeout,
+                layout_strikeout: first_item.layout_strikeout,
                 rotation: first_item.rotation,
                 advance_known: first_item.advance_known,
                 item_type: first_item.item_type.clone(),
@@ -559,6 +560,24 @@ pub(crate) fn detect_tables_with_page_width(
     if items.len() < 6 {
         return vec![];
     }
+    // Redline evidence reads the layout strikeout: strikes kept only as
+    // decorations must not move table detection.
+    let layout_items: Vec<TextItem>;
+    let items = if items
+        .iter()
+        .any(|item| item.is_strikeout != item.layout_strikeout)
+    {
+        layout_items = items
+            .iter()
+            .map(|item| TextItem {
+                is_strikeout: item.layout_strikeout,
+                ..item.clone()
+            })
+            .collect();
+        &layout_items[..]
+    } else {
+        items
+    };
     // Compute these before consolidation: adjacent old/new text can merge and
     // inherit only the first fragment's decoration flags.
     let redline_regions = redline_edit_regions(items, page_width);
@@ -2642,6 +2661,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: crate::types::ItemType::Text,
@@ -2991,6 +3011,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -3144,6 +3165,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: strikeout,
+            layout_strikeout: strikeout,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,

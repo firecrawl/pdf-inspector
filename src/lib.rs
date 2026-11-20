@@ -40,6 +40,7 @@ mod form_bbox_repair;
 pub mod glyph_names;
 mod mac_glyph_order;
 pub mod markdown;
+pub mod math;
 mod overlong_numerals;
 pub mod process_mode;
 pub mod structure_tree;
@@ -68,6 +69,7 @@ pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
+pub use math::{extract_math_latex_in_regions_mem, MathGate, MathRegionLatex, PageMathRegions};
 pub use process_mode::ProcessMode;
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
@@ -1005,6 +1007,7 @@ mod ocr_header_footer_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: types::ItemType::Text,
@@ -5959,6 +5962,7 @@ mod text_cluster_column_undercount_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -6246,6 +6250,7 @@ mod table_candidate_selection_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -7282,6 +7287,7 @@ mod tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
@@ -8500,6 +8506,7 @@ mod rotated_run_region_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            layout_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
         }

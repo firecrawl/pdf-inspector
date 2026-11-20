@@ -535,6 +535,12 @@ pub struct TextItem {
     /// glyphs at mid x-height). Same geometric detection as underline,
     /// different vertical window; see `extractor::underline`.
     pub is_strikeout: bool,
+    /// The strikeout that layout heuristics read as redline evidence (heuristic
+    /// table detection). It equals `is_strikeout` except on strikes kept from
+    /// a set of repeated same-width rules or inside a ruled table: those are
+    /// emitted as decorations but leave the page's layout as it was without
+    /// them.
+    pub layout_strikeout: bool,
     /// Type of item (text, image, link)
     pub item_type: ItemType,
     /// Marked Content ID from the content stream's BDC/BMC operator.
@@ -1014,6 +1020,7 @@ mod formatting_tests {
             render_mode: None,
             is_underline: false,
             is_strikeout: strikeout,
+            layout_strikeout: strikeout,
             rotation: 0.0,
             advance_known: true,
             item_type: ItemType::Text,
