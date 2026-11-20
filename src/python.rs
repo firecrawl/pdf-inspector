@@ -2,7 +2,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::detector::PdfType;
 use crate::types::ItemType;
@@ -24,6 +24,11 @@ pub struct PyPdfResult {
     /// Total number of pages.
     #[pyo3(get)]
     pub page_count: u32,
+    /// Estimated raster coverage for analyzed 1-indexed pages. Pages not
+    /// analyzed under the scan strategy are absent; `None` means traversal
+    /// was incomplete. Values are approximate fractions from 0.0 to 1.0.
+    #[pyo3(get)]
+    pub raster_coverage_by_page: BTreeMap<u32, Option<f32>>,
     /// Processing time in milliseconds.
     #[pyo3(get)]
     pub processing_time_ms: u64,
@@ -581,6 +586,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pdf_type: pdf_type_str(r.pdf_type),
         markdown: r.markdown,
         page_count: r.page_count,
+        raster_coverage_by_page: r.raster_coverage_by_page,
         processing_time_ms: r.processing_time_ms,
         pages_needing_ocr: r.pages_needing_ocr,
         ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),

@@ -30,6 +30,12 @@ Changes since 1.26.1.
 
 Changes since 1.26.0.
 
+### Added
+
+- `raster_coverage_by_page` in Rust and Python results: approximate drawn-image
+  coverage for pages analyzed by the selected scan strategy, independent of
+  page classification and OCR recommendations.
+
 ### Fixed
 
 - A word space painted as its own run is kept when the next word is
