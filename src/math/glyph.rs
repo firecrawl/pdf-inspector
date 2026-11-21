@@ -176,16 +176,21 @@ fn cmex_extent(code: u32) -> (f32, f32) {
     (0.04, depth - 0.04)
 }
 
+/// The stem TeX draws in front of an arrow to make `\mapsto` (OMS 0x37),
+/// carried as a private character until [`crate::math::latex`] joins it
+/// with the arrow that follows.
+pub(crate) const MAPSTO_STEM: char = '\u{F0000}';
+
 /// The character a code of TeX's math italic (OML), math symbol (OMS) or
 /// AMS symbol encoding draws, for fonts whose subset leaves the glyph
 /// unnamed.
 fn tex_encoding(key: &str, code: u32) -> Option<char> {
     const OML: &str = concat!(
-        "ΓΔΘΛΞΠΣΥΦΨΩαβγδϵζηθικλμνξπρστυϕχψωεϑϖϱςφ↼↽⇀⇁↩↪▷◁0123456789.,</>⋆",
+        "ΓΔΘΛΞΠΣΥΦΨΩαβγδϵζηθικλμνξπρστυϕχψωεϑϖϱςφ↼↽⇀⇁↪↩▷◁0123456789.,</>⋆",
         "∂ABCDEFGHIJKLMNOPQRSTUVWXYZ♭♮♯⌣⌢ℓabcdefghijklmnopqrstuvwxyzıȷ℘\u{20D7}⁀"
     );
     const OMS: &str = concat!(
-        "−·×∗÷⋄±∓⊕⊖⊗⊘⊙◯∘•≍≡⊆⊇≤≥⪯⪰∼≈⊂⊃≪≫≺≻←→↑↓↔↗↘≃⇐⇒⇑⇓⇔↖↙∝′∞∈∋△▽\u{338}↦∀∃¬∅ℜℑ⊤⊥",
+        "−·×∗÷⋄±∓⊕⊖⊗⊘⊙◯∘•≍≡⊆⊇≤≥⪯⪰∼≈⊂⊃≪≫≺≻←→↑↓↔↗↘≃⇐⇒⇑⇓⇔↖↙∝′∞∈∋△▽\u{338}\u{F0000}∀∃¬∅ℜℑ⊤⊥",
         "ℵABCDEFGHIJKLMNOPQRSTUVWXYZ∪∩⊎∧∨⊢⊣⌊⌋⌈⌉{}⟨⟩|‖↕⇕\\≀√⨿∇∫⊔⊓⊑⊒§†‡¶♣♢♡♠"
     );
     const MSAM: &str = "⊡⊞⊠□■⋅◊";
@@ -279,7 +284,8 @@ mod tests {
         assert_eq!(glyph("LOSMWZ+CMSY10", "2", 0x32), "∈");
         assert_eq!(glyph("LOSMWZ+CMSY10", "j", 0x6A), "|");
         assert_eq!(glyph("LOSMWZ+CMSY10", "f", 0x66), "{");
-        assert_eq!(glyph("LOSMWZ+CMSY10", "7", 0x37), "↦");
+        assert_eq!(glyph("LOSMWZ+CMSY10", "7", 0x37), MAPSTO_STEM.to_string());
+        assert_eq!(glyph("KYAZXS+CMMI10", ",", 0x2C), "↪");
         assert_eq!(glyph("LOSMWZ+CMSY10", "N", 0x4E), "N");
         assert_eq!(glyph("LOSMWZ+CMSY10", "∈", 0x32), "∈");
         assert_eq!(glyph("KYAZXS+CMMI10", "@", 0x40), "∂");

@@ -151,17 +151,19 @@ impl<'a> FontContext<'a> {
             }
             match font_dict.get(b"ToUnicode") {
                 Ok(Object::Reference(obj_ref)) => {
-                    with_tounicode.insert(resource_name.clone());
+                    if font_cmaps.get_by_obj(obj_ref.0).is_some() {
+                        with_tounicode.insert(resource_name.clone());
+                    }
                     tounicode_refs.insert(resource_name.clone(), obj_ref.0);
                 }
                 Ok(Object::Stream(s)) => {
-                    with_tounicode.insert(resource_name.clone());
                     let data = s
                         .decompressed_content()
                         .unwrap_or_else(|_| s.content.clone());
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
+                        with_tounicode.insert(resource_name.clone());
                         inline_cmaps.insert(resource_name.clone(), entry);
                     }
                 }
