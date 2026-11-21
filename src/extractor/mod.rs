@@ -12,16 +12,18 @@ mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
 
+use crate::text_quality::is_garbage_text;
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
-use crate::PdfError;
+use crate::{non_placeholder_alnum, PdfError, OCR_LAYER_MIN_ALNUM};
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use content_stream::extract_page_text_items;
+pub(crate) use content_stream::PageVecSizes;
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -31,12 +33,14 @@ pub(crate) use fonts::FontStyleCache;
 pub(crate) use layout::detect_columns;
 #[cfg(test)]
 use layout::filter_markdown_page_numbers;
-pub(crate) use layout::filter_markdown_page_numbers_with_removed_pages;
 pub(crate) use layout::group_into_lines_with_thresholds;
 pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_charts;
 pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_regions;
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
+pub(crate) use layout::{
+    filter_markdown_page_numbers_with_removed_pages, markdown_page_number_removals,
+};
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
 pub(crate) use xobjects::FormWalkBudget;
 
@@ -250,6 +254,197 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
 }
 
+/// One page's extraction: text, geometry, links, the letter-spacing
+/// join threshold, and whether the page uses glyph-id-encoded fonts.
+/// Off-box content from imposed spreads is clipped exactly as the
+/// whole-document path clips it.
+pub(crate) struct PageUnit {
+    pub(crate) items: Vec<TextItem>,
+    pub(crate) rects: Vec<crate::types::PdfRect>,
+    pub(crate) lines: Vec<crate::types::PdfLine>,
+    pub(crate) has_gid_fonts: bool,
+    pub(crate) letterspace_threshold: f32,
+}
+
+/// Extract one page. The style cache is document-scoped (font
+/// programs are shared across pages); everything else is per page.
+pub(crate) fn extract_page_unit(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    page_vec_sizes: &mut PageVecSizes,
+) -> Result<PageUnit, PdfError> {
+    let mut form_budget = FormWalkBudget::new();
+    let (mut extraction, mut has_gid_fonts, mut coords_rotated, skipped_invisible) =
+        extract_page_text_items(
+            doc,
+            page_id,
+            page_num,
+            font_cmaps,
+            include_invisible,
+            style_cache,
+            &mut form_budget,
+            page_vec_sizes,
+        )?;
+    // A scan carries its OCR text as an invisible (Tr 3) layer behind the
+    // page image, so a page with no visible text is read with that layer
+    // included. A page with any visible text keeps the visible pass, since
+    // adopting the layer there could repeat the same words.
+    let has_visible_text = extraction
+        .0
+        .iter()
+        .any(|it| !matches!(it.item_type, ItemType::Image) && !it.text.trim().is_empty());
+    if skipped_invisible && !has_visible_text {
+        if let Ok((layer, gid, rotated, _)) = extract_page_text_items(
+            doc,
+            page_id,
+            page_num,
+            font_cmaps,
+            true,
+            style_cache,
+            &mut form_budget,
+            page_vec_sizes,
+        ) {
+            let text: String = layer
+                .0
+                .iter()
+                .filter(|it| !matches!(it.item_type, ItemType::Image))
+                .map(|it| it.text.as_str())
+                .collect();
+            if non_placeholder_alnum(&layer.0) >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&text) {
+                extraction = layer;
+                has_gid_fonts = gid;
+                coords_rotated = rotated;
+            }
+        }
+    }
+    let (mut items, mut rects, mut lines) = extraction;
+    // Clip to the visible page box: single-page extracts and imposed
+    // spreads keep neighboring pages' content in the stream, positioned
+    // outside the CropBox. Extracting it interleaves invisible text into
+    // the page and poisons font statistics. Rotated pages are left alone
+    // — their item coordinates are already transformed out of box space.
+    let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
+    if !coords_rotated {
+        if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
+            const TOL: f32 = 6.0;
+            let outside = |it: &TextItem| {
+                let cx = it.x + it.width / 2.0;
+                !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
+            };
+            // Only clip when the off-page material reads as coherent text
+            // (neighboring-page paragraphs). Curved/rotated display text
+            // leaves short glyph fragments with artifact coordinates
+            // outside the box, and those must stay.
+            let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
+            // Judge by character mass: paragraphs are dominated by long
+            // word runs even when interleaved with short math fragments,
+            // while glyph-confetti is short items through and through.
+            let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
+            let wordy_chars: usize = off
+                .iter()
+                .map(|it| it.text.trim().chars().count())
+                .filter(|&n| n >= 4)
+                .sum();
+            // Genuine neighboring-page content is cleanly separated from
+            // on-page text. When an off-page item continues an on-page
+            // line (same baseline, near-adjacent x), the coordinates are
+            // artifacts of transforms we mis-model — don't clip those.
+            let straddles = off.iter().any(|o| {
+                items.iter().any(|i| {
+                    !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
+                })
+            });
+            let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
+                let before = items.len();
+                items.retain(|it| !outside(it));
+                if items.len() < before {
+                    debug!(
+                        "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
+                        page_num,
+                        before - items.len(),
+                        bx0,
+                        by0,
+                        bx1,
+                        by1
+                    );
+                    // Only prune off-page geometry when off-page text
+                    // existed — same neighboring-page content.
+                    let overlaps = |x: f32, y: f32, w: f32, h: f32| {
+                        let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
+                        let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
+                        x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
+                    };
+                    rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                    clipped_box = Some((bx0, by0, bx1, by1));
+                    lines.retain(|l| {
+                        overlaps(
+                            l.x1.min(l.x2),
+                            l.y1.min(l.y2),
+                            (l.x2 - l.x1).abs(),
+                            (l.y2 - l.y1).abs(),
+                        )
+                    });
+                }
+            }
+        }
+    }
+    let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
+    suppress_table_underlines(&mut items, &rects, &lines, page_num);
+    debug!(
+        "page {}: {} text items, {} rects, {} lines{}",
+        page_num,
+        items.len(),
+        rects.len(),
+        lines.len(),
+        if has_gid_fonts {
+            " [gid-encoded fonts]"
+        } else {
+            ""
+        }
+    );
+    if log::log_enabled!(log::Level::Trace) {
+        for item in &items {
+            log::trace!(
+                "  p={} x={:7.1} y={:7.1} w={:7.1} fs={:5.1} font={:6} {:?}",
+                page_num,
+                item.x,
+                item.y,
+                item.width,
+                item.font_size,
+                item.font,
+                trace_text_preview(&item.text, 80)
+            );
+        }
+    }
+
+    // Extract hyperlinks from page annotations
+    let mut links = extract_page_links(doc, page_id, page_num);
+    // Annotations from the neighboring page are off-box too.
+    if let Some((bx0, by0, bx1, by1)) = clipped_box {
+        links.retain(|it| {
+            let cx = it.x + it.width / 2.0;
+            // Center-y, not it.y: link items carry an annotation rect,
+            // so y is a box edge — unlike text items, where y is a
+            // baseline and testing it directly is the natural semantics.
+            let cy = it.y + it.height / 2.0;
+            cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && cy >= by0 - 6.0 && cy <= by1 + 6.0
+        });
+    }
+    items.extend(links);
+    Ok(PageUnit {
+        items,
+        rects,
+        lines,
+        has_gid_fonts,
+        letterspace_threshold: threshold,
+    })
+}
+
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
@@ -271,161 +466,41 @@ fn extract_positioned_text_impl(
     let page_id_to_num: HashMap<ObjectId, u32> =
         pages.iter().map(|(num, &id)| (id, *num)).collect();
 
+    let mut page_vec_sizes = PageVecSizes::default();
     for (page_num, &page_id) in pages.iter() {
         if let Some(filter) = page_filter {
             if !filter.contains(page_num) {
                 continue;
             }
         }
-        let page_result = extract_page_text_items(
+        let unit = match extract_page_unit(
             doc,
             page_id,
             *page_num,
             font_cmaps,
             include_invisible,
             &mut style_cache,
-            &mut FormWalkBudget::new(),
-        );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
-            match page_result {
-                Ok(extraction) => extraction,
-                Err(error)
-                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
-                {
-                    debug!(
-                        "page {}: skipping context-only extraction error: {}",
-                        page_num, error
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-        // Clip to the visible page box: single-page extracts and imposed
-        // spreads keep neighboring pages' content in the stream, positioned
-        // outside the CropBox. Extracting it interleaves invisible text into
-        // the page and poisons font statistics. Rotated pages are left alone
-        // — their item coordinates are already transformed out of box space.
-        let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        if !coords_rotated {
-            if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
-                const TOL: f32 = 6.0;
-                let outside = |it: &TextItem| {
-                    let cx = it.x + it.width / 2.0;
-                    !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
-                };
-                // Only clip when the off-page material reads as coherent text
-                // (neighboring-page paragraphs). Curved/rotated display text
-                // leaves short glyph fragments with artifact coordinates
-                // outside the box, and those must stay.
-                let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
-                // Judge by character mass: paragraphs are dominated by long
-                // word runs even when interleaved with short math fragments,
-                // while glyph-confetti is short items through and through.
-                let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
-                let wordy_chars: usize = off
-                    .iter()
-                    .map(|it| it.text.trim().chars().count())
-                    .filter(|&n| n >= 4)
-                    .sum();
-                // Genuine neighboring-page content is cleanly separated from
-                // on-page text. When an off-page item continues an on-page
-                // line (same baseline, near-adjacent x), the coordinates are
-                // artifacts of transforms we mis-model — don't clip those.
-                let straddles = off.iter().any(|o| {
-                    items.iter().any(|i| {
-                        !outside(i)
-                            && (i.y - o.y).abs() <= 2.0
-                            && (o.x - (i.x + i.width)).abs() <= 10.0
-                    })
-                });
-                let coherent =
-                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
-                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
-                    let before = items.len();
-                    items.retain(|it| !outside(it));
-                    if items.len() < before {
-                        debug!(
-                            "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
-                            page_num,
-                            before - items.len(),
-                            bx0,
-                            by0,
-                            bx1,
-                            by1
-                        );
-                        // Only prune off-page geometry when off-page text
-                        // existed — same neighboring-page content.
-                        let overlaps = |x: f32, y: f32, w: f32, h: f32| {
-                            let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
-                            let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
-                            x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
-                        };
-                        rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
-                        clipped_box = Some((bx0, by0, bx1, by1));
-                        lines.retain(|l| {
-                            overlaps(
-                                l.x1.min(l.x2),
-                                l.y1.min(l.y2),
-                                (l.x2 - l.x1).abs(),
-                                (l.y2 - l.y1).abs(),
-                            )
-                        });
-                    }
-                }
+            &mut page_vec_sizes,
+        ) {
+            Ok(unit) => unit,
+            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+                debug!(
+                    "page {}: skipping context-only extraction error: {}",
+                    page_num, error
+                );
+                continue;
             }
-        }
-        if has_gid_fonts {
+            Err(error) => return Err(error),
+        };
+        if unit.has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
-        let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
-        if threshold > 0.10 {
-            page_thresholds.insert(*page_num, threshold);
+        if unit.letterspace_threshold > 0.10 {
+            page_thresholds.insert(*page_num, unit.letterspace_threshold);
         }
-        suppress_table_underlines(&mut items, &rects, &lines, *page_num);
-        debug!(
-            "page {}: {} text items, {} rects, {} lines{}",
-            page_num,
-            items.len(),
-            rects.len(),
-            lines.len(),
-            if has_gid_fonts {
-                " [gid-encoded fonts]"
-            } else {
-                ""
-            }
-        );
-        if log::log_enabled!(log::Level::Trace) {
-            for item in &items {
-                log::trace!(
-                    "  p={} x={:7.1} y={:7.1} w={:7.1} fs={:5.1} font={:6} {:?}",
-                    page_num,
-                    item.x,
-                    item.y,
-                    item.width,
-                    item.font_size,
-                    item.font,
-                    trace_text_preview(&item.text, 80)
-                );
-            }
-        }
-        all_items.extend(items);
-        all_rects.extend(rects);
-        all_lines.extend(lines);
-
-        // Extract hyperlinks from page annotations
-        let mut links = extract_page_links(doc, page_id, *page_num);
-        // Annotations from the neighboring page are off-box too.
-        if let Some((bx0, by0, bx1, by1)) = clipped_box {
-            links.retain(|it| {
-                let cx = it.x + it.width / 2.0;
-                // Center-y, not it.y: link items carry an annotation rect,
-                // so y is a box edge — unlike text items, where y is a
-                // baseline and testing it directly is the natural semantics.
-                let cy = it.y + it.height / 2.0;
-                cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && cy >= by0 - 6.0 && cy <= by1 + 6.0
-            });
-        }
-        all_items.extend(links);
+        all_items.extend(unit.items);
+        all_rects.extend(unit.rects);
+        all_lines.extend(unit.lines);
     }
 
     // Extract AcroForm field values
@@ -433,6 +508,11 @@ fn extract_positioned_text_impl(
         .into_iter()
         .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
     all_items.extend(form_items);
+    // Page-by-page extension doubles capacity; these vectors outlive
+    // extraction, so the slack is released.
+    all_items.shrink_to_fit();
+    all_rects.shrink_to_fit();
+    all_lines.shrink_to_fit();
 
     Ok((
         (all_items, all_rects, all_lines),

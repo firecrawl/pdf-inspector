@@ -9,7 +9,7 @@ use super::analysis::detect_header_level;
 
 /// Resolve a heading level for a line, considering both struct-tree roles and font heuristics.
 /// Struct-tree headings take priority.
-fn effective_heading_level(
+pub(crate) fn effective_heading_level(
     line: &TextLine,
     base_size: f32,
     heading_tiers: &[f32],

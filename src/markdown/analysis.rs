@@ -223,15 +223,23 @@ fn looks_title_case(t: &str) -> bool {
     let mut content = 0usize;
     let mut capitalized = 0usize;
     for w in t.split_whitespace() {
-        let cleaned: String = w.chars().filter(|c| c.is_alphabetic()).collect();
-        if cleaned.is_empty() {
+        // Compare the word's alphabetic characters against the minor-word
+        // list without materializing them: this runs per candidate line and
+        // used to allocate two strings per word. flat_map(char::to_lowercase)
+        // equals str::to_lowercase here — the two differ only on final
+        // sigma, which can never match an ASCII minor word.
+        let letters = || w.chars().filter(|c| c.is_alphabetic());
+        let Some(first) = letters().next() else {
             continue;
-        }
-        if MINOR.contains(&cleaned.to_lowercase().as_str()) {
+        };
+        let is_minor = MINOR
+            .iter()
+            .any(|minor| letters().flat_map(char::to_lowercase).eq(minor.chars()));
+        if is_minor {
             continue;
         }
         content += 1;
-        if cleaned.chars().next().is_some_and(char::is_uppercase) {
+        if first.is_uppercase() {
             capitalized += 1;
         }
     }

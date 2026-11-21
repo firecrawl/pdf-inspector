@@ -475,7 +475,7 @@ fn is_wrapped_same_style_line(prev: &TextLine, next: &TextLine, para_threshold: 
 ///
 /// Returns the first non-container role found (skipping Document/Part/Sect/Div/NonStruct/Span).
 /// These wrapper roles don't carry useful semantic info for markdown generation.
-fn resolve_line_struct_role(
+pub(crate) fn resolve_line_struct_role(
     line: &TextLine,
     struct_roles: &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
 ) -> Option<StructRole> {
@@ -502,7 +502,7 @@ fn resolve_line_struct_role(
 }
 
 /// Map a StructRole heading variant to a markdown heading level (1–6).
-fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
+pub(crate) fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
     match role {
         StructRole::H => Some(1), // Generic heading → H1
         StructRole::H1 => Some(1),

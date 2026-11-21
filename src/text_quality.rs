@@ -437,33 +437,43 @@ pub(crate) fn is_garbage_text(markdown: &str) -> bool {
     let mut alphanum = 0usize;
     let mut non_alphanum = 0usize;
 
-    let chars: Vec<char> = markdown.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let ch = chars[i];
-        let mut run_end = i + 1;
-        while run_end < chars.len() && chars[run_end] == ch {
-            run_end += 1;
+    // Runs of one repeated character classify as that character times the
+    // run length, so a single forward pass replaces the char buffer this
+    // used to collect — the check runs once per text item and dominated the
+    // extraction's allocation count on text-heavy documents.
+    let mut classify_run = |ch: char, len: usize| {
+        if matches!(ch, '.' | '_' | '·') && len >= 3 {
+            // Decorative leader (TOC dots, blanks): not evidence either way.
+            return;
         }
+        if ch.is_whitespace() {
+            return;
+        }
+        // Skip markdown syntax chars that we add (not from the PDF)
+        if matches!(ch, '#' | '*' | '|' | '-' | '\n') {
+            return;
+        }
+        if ch.is_alphanumeric() {
+            alphanum += len;
+        } else {
+            non_alphanum += len;
+        }
+    };
 
-        let is_decorative_leader = matches!(ch, '.' | '_' | '·') && run_end - i >= 3;
-        if !is_decorative_leader {
-            for &run_ch in &chars[i..run_end] {
-                if run_ch.is_whitespace() {
-                    continue;
+    let mut run: Option<(char, usize)> = None;
+    for ch in markdown.chars() {
+        match &mut run {
+            Some((current, len)) if *current == ch => *len += 1,
+            _ => {
+                if let Some((current, len)) = run.take() {
+                    classify_run(current, len);
                 }
-                // Skip markdown syntax chars that we add (not from the PDF)
-                if matches!(run_ch, '#' | '*' | '|' | '-' | '\n') {
-                    continue;
-                }
-                if run_ch.is_alphanumeric() {
-                    alphanum += 1;
-                } else {
-                    non_alphanum += 1;
-                }
+                run = Some((ch, 1));
             }
         }
-        i = run_end;
+    }
+    if let Some((current, len)) = run {
+        classify_run(current, len);
     }
 
     let total = alphanum + non_alphanum;

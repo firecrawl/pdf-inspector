@@ -308,7 +308,7 @@ impl StructTree {
         let struct_root = resolve_dict(doc, struct_root_obj)?;
 
         // Parse role map: custom tag → standard tag
-        let role_map = parse_role_map(doc, struct_root);
+        let role_map = parse_role_map(doc, &struct_root);
         debug!("structure tree: {} role map entries", role_map.len());
 
         // Seed the cycle guard with the struct-root's own object id so a `/K`
@@ -320,7 +320,7 @@ impl StructTree {
         }
 
         // Parse child elements from /K
-        let children = parse_kids(doc, struct_root, &role_map, None, 0, &mut walk);
+        let children = parse_kids(doc, &struct_root, &role_map, None, 0, &mut walk);
         debug!("structure tree: {} top-level elements", children.len());
 
         if walk.truncated {
@@ -746,7 +746,7 @@ fn process_kid_item(
         }
     }
     let resolved = resolve_obj(doc, item);
-    parse_kid(doc, resolved, role_map, inherited_page, depth, out, walk);
+    parse_kid(doc, &resolved, role_map, inherited_page, depth, out, walk);
     if let Some(id) = ref_id {
         walk.active.remove(&id);
     }
@@ -880,7 +880,7 @@ fn parse_struct_element_dict(
 
     if let Ok(k_obj) = dict.get(b"K") {
         let k_resolved = resolve_obj(doc, k_obj);
-        match k_resolved {
+        match &*k_resolved {
             Object::Integer(mcid) => {
                 if walk.charge() {
                     content_refs.push(MarkedContentRef {
@@ -904,7 +904,7 @@ fn parse_struct_element_dict(
                         _ => None,
                     };
                     let resolved = resolve_obj(doc, item);
-                    match resolved {
+                    match &*resolved {
                         Object::Integer(mcid) => {
                             if walk.charge() {
                                 content_refs.push(MarkedContentRef {
@@ -987,6 +987,9 @@ fn parse_struct_element_dict(
         }
     }
 
+    // The whole tree is alive at once; push-growth slack would be kept per node.
+    content_refs.shrink_to_fit();
+    children.shrink_to_fit();
     out.push(StructElement {
         role,
         alt_text,
@@ -1051,7 +1054,7 @@ fn get_page_ref(doc: &Document, dict: &lopdf::Dictionary) -> Option<ObjectId> {
         Object::Reference(id) => Some(*id),
         _ => {
             let resolved = resolve_obj(doc, pg);
-            if let Object::Reference(id) = resolved {
+            if let Object::Reference(id) = &*resolved {
                 Some(*id)
             } else {
                 None
@@ -1070,18 +1073,25 @@ fn get_text_string(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
 }
 
 /// Resolve an Object reference, returning the target object.
-fn resolve_obj<'a>(doc: &'a Document, obj: &'a Object) -> &'a Object {
+/// Resolves through `Document::get_object_transient`: the walk visits each
+/// struct element once, so objects it parses are released with the subtree
+/// that holds them instead of staying resident for the document's life.
+fn resolve_obj<'a>(doc: &'a Document, obj: &'a Object) -> Cow<'a, Object> {
     match obj {
-        Object::Reference(id) => doc.get_object(*id).unwrap_or(obj),
-        _ => obj,
+        Object::Reference(id) => doc.get_object_transient(*id).unwrap_or(Cow::Borrowed(obj)),
+        _ => Cow::Borrowed(obj),
     }
 }
 
 /// Resolve an Object to a dictionary (handling references).
-fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
+fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<Cow<'a, lopdf::Dictionary>> {
     match obj {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        Object::Dictionary(d) => Some(Cow::Borrowed(d)),
+        Object::Reference(id) => match doc.get_object_transient(*id).ok()? {
+            Cow::Borrowed(object) => object.as_dict().ok().map(Cow::Borrowed),
+            Cow::Owned(Object::Dictionary(d)) => Some(Cow::Owned(d)),
+            Cow::Owned(_) => None,
+        },
         _ => None,
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -765,10 +766,9 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
+            let content = stream
+                .decompressed_content_cow()
+                .unwrap_or_else(|_| Cow::Borrowed(&stream.content));
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
@@ -1045,7 +1045,7 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content() {
+    let data = match stream.decompressed_content_cow() {
         Ok(d) => d,
         Err(_) => return false,
     };
@@ -1304,8 +1304,8 @@ fn scan_xobjects_in_resources(
             match subtype {
                 Some(b"Form") => {
                     let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                        .decompressed_content_cow()
+                        .unwrap_or_else(|_| Cow::Borrowed(&stream.content));
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
                     let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
@@ -2240,7 +2240,7 @@ mod tests {
                 "F1" => Object::Reference(font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2248,7 +2248,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2282,7 +2282,7 @@ mod tests {
                 "F1" => Object::Reference(font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2290,7 +2290,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2337,7 +2337,7 @@ mod tests {
                 "F1" => Object::Reference(font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2345,7 +2345,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2396,7 +2396,7 @@ mod tests {
                 "F1" => Object::Reference(font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2404,7 +2404,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2616,7 +2616,7 @@ mod tests {
                 "F2" => Object::Reference(good_font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2624,7 +2624,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2658,7 +2658,7 @@ mod tests {
                 "F1" => Object::Reference(bad_font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2666,7 +2666,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2697,7 +2697,7 @@ mod tests {
         let resources = dictionary! {
             "Font" => dictionary! { "F1" => Object::Reference(font_id) },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2705,7 +2705,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2738,7 +2738,7 @@ mod tests {
         let resources = dictionary! {
             "Font" => dictionary! { "F1" => Object::Reference(font_id) },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2746,7 +2746,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2774,7 +2774,7 @@ mod tests {
         let resources = dictionary! {
             "Font" => dictionary! { "F1" => Object::Reference(font_id) },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2782,7 +2782,7 @@ mod tests {
                 "Resources" => resources,
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2924,7 +2924,7 @@ mod tests {
                 "F2" => Object::Reference(good_font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2933,7 +2933,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -2986,7 +2986,7 @@ mod tests {
                 "F2" => Object::Reference(good_font_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -2995,7 +2995,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3057,7 +3057,7 @@ mod tests {
         let content_id =
             doc.add_object(Object::Stream(lopdf::Stream::new(dictionary! {}, content)));
 
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3070,7 +3070,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3192,7 +3192,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3201,7 +3201,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3276,7 +3276,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3285,7 +3285,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3343,7 +3343,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3352,7 +3352,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3435,7 +3435,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3444,7 +3444,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3525,7 +3525,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3534,7 +3534,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3601,7 +3601,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3610,7 +3610,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3692,7 +3692,7 @@ mod tests {
                 "XF1" => Object::Reference(xobj_id),
             },
         };
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3701,7 +3701,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3761,7 +3761,7 @@ mod tests {
             content_data.to_vec(),
         )));
 
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3774,7 +3774,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3828,7 +3828,7 @@ mod tests {
             content_data.to_vec(),
         )));
 
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3841,7 +3841,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
@@ -3892,7 +3892,7 @@ mod tests {
         )));
 
         // Page has NO own /Resources — inherits everything from parent
-        doc.objects.insert(
+        doc.set_object(
             page_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Page",
@@ -3900,7 +3900,7 @@ mod tests {
                 "Contents" => Object::Reference(content_id),
             }),
         );
-        doc.objects.insert(
+        doc.set_object(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",

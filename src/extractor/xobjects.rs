@@ -5,12 +5,13 @@ use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
     extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
-    FontStyleCache,
+    FontDecodeSettings, FontDecodeTables, FontStyleCache,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -263,19 +264,24 @@ fn extract_form_xobject_text_inner(
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
-    let content_data = match stream.decompressed_content() {
-        Ok(data) => data,
-        Err(_) => stream.content.clone(),
-    };
+    let content_data = stream
+        .decompressed_content_cow()
+        .unwrap_or_else(|_| Cow::Borrowed(&stream.content));
 
-    // Decode the content stream. Cap before lopdf materializes the operator
-    // vector — the walk budget cannot help if decode itself allocates first.
-    let Ok(Some(content)) = super::content_decode::decode_content_bounded(
+    // Cap before iterating: the pre-count keeps oversized streams from
+    // being walked at all, exactly as it kept them from being decoded.
+    let Some(mut ops) = super::content_decode::stream_content_bounded(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     ) else {
         return extracted;
     };
+    // A stream that fails to parse must leave the shared budget exactly as
+    // it stood here: nested invocations charged from a poisoned prefix
+    // never happened in the decode-first world.
+    let budget_invocations = budget.invocations;
+    let budget_operations = budget.operations;
+    let budget_truncated = budget.truncated;
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
@@ -312,8 +318,8 @@ fn extract_form_xobject_text_inner(
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
                     let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
+                        .decompressed_content_cow()
+                        .unwrap_or_else(|_| Cow::Borrowed(&s.content));
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
@@ -337,6 +343,21 @@ fn extract_form_xobject_text_inner(
             encoding_cache.insert(name, enc);
         }
     }
+    let font_tables = FontDecodeTables {
+        font_cmaps,
+        font_tounicode_refs: &font_tounicode_refs,
+        inline_cmaps: &inline_cmaps,
+        font_encodings: &font_encodings,
+        encoding_cache: &encoding_cache,
+        font_widths: &font_widths,
+    };
+    let resolve_font = |font: &str| {
+        FontDecodeSettings::resolve(
+            font,
+            font_base_names.get(font).map(|s| s.as_str()),
+            &font_tables,
+        )
+    };
 
     // Build XObject map from the Form's own Resources for nested Do
     let form_xobjects = get_form_xobjects(doc, &stream.dict);
@@ -363,6 +384,7 @@ fn extract_form_xobject_text_inner(
 
     // Process the content stream
     let mut current_font = String::new();
+    let mut font_decode = resolve_font(&current_font);
     let mut current_font_size: f32 = 12.0;
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     // Text line matrix (TLM) — Td/TD/T* move relative to the start of the
@@ -378,22 +400,24 @@ fn extract_form_xobject_text_inner(
     // Text state (Tc/Tw/TL/Tf) and the fill colour are part of the graphics
     // state and must be saved/restored by q/Q alongside the CTM.
     #[derive(Clone)]
-    struct GraphicsState {
+    struct GraphicsState<'f> {
         ctm: [f32; 6],
         char_spacing: f32,
         word_spacing: f32,
         text_leading: f32,
         current_font: String,
+        font_decode: FontDecodeSettings<'f>,
         current_font_size: f32,
         fill_is_white: bool,
     }
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
-    for op in &content.operations {
+    while ops.advance() {
+        let (operator, operands) = (ops.operator(), ops.operands());
         if !budget.charge_operation() {
             break;
         }
-        match op.operator.as_str() {
+        match operator {
             "q" => {
                 ctm_stack.push(GraphicsState {
                     ctm,
@@ -401,6 +425,7 @@ fn extract_form_xobject_text_inner(
                     word_spacing,
                     text_leading,
                     current_font: current_font.clone(),
+                    font_decode,
                     current_font_size,
                     fill_is_white,
                 });
@@ -412,22 +437,23 @@ fn extract_form_xobject_text_inner(
                     word_spacing = saved.word_spacing;
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
+                    font_decode = saved.font_decode;
                     current_font_size = saved.current_font_size;
                     fill_is_white = saved.fill_is_white;
                 }
             }
             "cm" => {
-                if op.operands.len() >= 6 {
+                if operands.len() >= 6 {
                     let mut m = [0.0f32; 6];
-                    for (i, operand) in op.operands.iter().take(6).enumerate() {
+                    for (i, operand) in operands.iter().take(6).enumerate() {
                         m[i] = get_number(operand).unwrap_or(0.0);
                     }
                     ctm = multiply_matrices(&m, &ctm);
                 }
             }
             "Do" => {
-                if !op.operands.is_empty() {
-                    if let Ok(name) = op.operands[0].as_name() {
+                if !operands.is_empty() {
+                    if let Ok(name) = operands[0].as_name() {
                         let xobj_name = String::from_utf8_lossy(name).to_string();
                         match form_xobjects.get(&xobj_name) {
                             Some(XObjectType::Form(nested_id)) => {
@@ -488,45 +514,46 @@ fn extract_form_xobject_text_inner(
                 in_text_block = false;
             }
             "Tf" => {
-                if op.operands.len() >= 2 {
-                    if let Ok(name) = op.operands[0].as_name() {
+                if operands.len() >= 2 {
+                    if let Ok(name) = operands[0].as_name() {
                         current_font = String::from_utf8_lossy(name).to_string();
+                        font_decode = resolve_font(&current_font);
                     }
-                    current_font_size = get_number(&op.operands[1]).unwrap_or(12.0);
+                    current_font_size = get_number(&operands[1]).unwrap_or(12.0);
                 }
             }
             "TL" => {
                 // Set text leading (used by T*, ', and ")
-                if let Some(tl) = op.operands.first().and_then(get_number) {
+                if let Some(tl) = operands.first().and_then(get_number) {
                     text_leading = tl;
                 }
             }
             "Tc" => {
-                if let Some(tc) = op.operands.first().and_then(get_number) {
+                if let Some(tc) = operands.first().and_then(get_number) {
                     char_spacing = tc;
                 }
             }
             "Tw" => {
-                if let Some(tw) = op.operands.first().and_then(get_number) {
+                if let Some(tw) = operands.first().and_then(get_number) {
                     word_spacing = tw;
                 }
             }
             "Td" | "TD" => {
                 // Move text position: TLM = T(tx,ty) x TLM; Tm = TLM
-                if op.operands.len() >= 2 {
-                    let tx = get_number(&op.operands[0]).unwrap_or(0.0);
-                    let ty = get_number(&op.operands[1]).unwrap_or(0.0);
+                if operands.len() >= 2 {
+                    let tx = get_number(&operands[0]).unwrap_or(0.0);
+                    let ty = get_number(&operands[1]).unwrap_or(0.0);
                     line_matrix[4] += tx * line_matrix[0] + ty * line_matrix[2];
                     line_matrix[5] += tx * line_matrix[1] + ty * line_matrix[3];
                     text_matrix = line_matrix;
-                    if op.operator == "TD" {
+                    if operator == "TD" {
                         text_leading = -ty;
                     }
                 }
             }
             "Tm" => {
-                if op.operands.len() >= 6 {
-                    for (i, operand) in op.operands.iter().take(6).enumerate() {
+                if operands.len() >= 6 {
+                    for (i, operand) in operands.iter().take(6).enumerate() {
                         text_matrix[i] =
                             get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
                     }
@@ -545,29 +572,29 @@ fn extract_form_xobject_text_inner(
                 text_matrix = line_matrix;
             }
             "g" => {
-                if let Some(gray) = op.operands.first().and_then(get_number) {
+                if let Some(gray) = operands.first().and_then(get_number) {
                     fill_is_white = gray > 0.95;
                 }
             }
             "rg" => {
-                if op.operands.len() >= 3 {
-                    let r = get_number(&op.operands[0]).unwrap_or(0.0);
-                    let g = get_number(&op.operands[1]).unwrap_or(0.0);
-                    let b = get_number(&op.operands[2]).unwrap_or(0.0);
+                if operands.len() >= 3 {
+                    let r = get_number(&operands[0]).unwrap_or(0.0);
+                    let g = get_number(&operands[1]).unwrap_or(0.0);
+                    let b = get_number(&operands[2]).unwrap_or(0.0);
                     fill_is_white = r > 0.95 && g > 0.95 && b > 0.95;
                 }
             }
             "k" => {
-                if op.operands.len() >= 4 {
-                    let c = get_number(&op.operands[0]).unwrap_or(1.0);
-                    let m = get_number(&op.operands[1]).unwrap_or(1.0);
-                    let y = get_number(&op.operands[2]).unwrap_or(1.0);
-                    let k = get_number(&op.operands[3]).unwrap_or(1.0);
+                if operands.len() >= 4 {
+                    let c = get_number(&operands[0]).unwrap_or(1.0);
+                    let m = get_number(&operands[1]).unwrap_or(1.0);
+                    let y = get_number(&operands[2]).unwrap_or(1.0);
+                    let k = get_number(&operands[3]).unwrap_or(1.0);
                     fill_is_white = c < 0.05 && m < 0.05 && y < 0.05 && k < 0.05;
                 }
             }
             "sc" | "scn" => {
-                let nums: Vec<f32> = op.operands.iter().filter_map(get_number).collect();
+                let nums: Vec<f32> = operands.iter().filter_map(get_number).collect();
                 match nums.len() {
                     3 => {
                         fill_is_white = nums[0] > 0.95 && nums[1] > 0.95 && nums[2] > 0.95;
@@ -582,10 +609,10 @@ fn extract_form_xobject_text_inner(
             "Tj" | "'" | "\"" => {
                 // `'` = move to next line then show; `"` = set word/char spacing,
                 // move to next line, then show (string is the last operand).
-                if op.operator != "Tj" {
-                    if op.operator == "\"" && op.operands.len() >= 3 {
-                        word_spacing = get_number(&op.operands[0]).unwrap_or(word_spacing);
-                        char_spacing = get_number(&op.operands[1]).unwrap_or(char_spacing);
+                if operator != "Tj" {
+                    if operator == "\"" && operands.len() >= 3 {
+                        word_spacing = get_number(&operands[0]).unwrap_or(word_spacing);
+                        char_spacing = get_number(&operands[1]).unwrap_or(char_spacing);
                     }
                     let tl = if text_leading != 0.0 {
                         text_leading
@@ -596,7 +623,7 @@ fn extract_form_xobject_text_inner(
                     line_matrix[5] += (-tl) * line_matrix[3];
                     text_matrix = line_matrix;
                 }
-                if let (true, Some(show_operand)) = (in_text_block, op.operands.last()) {
+                if let (true, Some(show_operand)) = (in_text_block, operands.last()) {
                     if fill_is_white {
                         if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(show_operand) {
@@ -616,14 +643,8 @@ fn extract_form_xobject_text_inner(
                     if let Some(text) = extract_text_from_operand(
                         show_operand,
                         &current_font,
-                        font_base_names.get(&current_font).map(|s| s.as_str()),
-                        font_cmaps,
-                        &font_tounicode_refs,
-                        &inline_cmaps,
-                        &font_encodings,
-                        &encoding_cache,
+                        &font_decode,
                         cmap_decisions,
-                        &font_widths,
                     ) {
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
@@ -699,8 +720,8 @@ fn extract_form_xobject_text_inner(
             }
             "TJ" => {
                 // Show text with positioning — split at column-sized gaps
-                if in_text_block && !op.operands.is_empty() {
-                    if let Ok(array) = op.operands[0].as_array() {
+                if in_text_block && !operands.is_empty() {
+                    if let Ok(array) = operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
 
                         let space_threshold = if let Some(fi) = font_info {
@@ -809,14 +830,8 @@ fn extract_form_xobject_text_inner(
                                 if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
-                                    font_base_names.get(&current_font).map(|s| s.as_str()),
-                                    font_cmaps,
-                                    &font_tounicode_refs,
-                                    &inline_cmaps,
-                                    &font_encodings,
-                                    &encoding_cache,
+                                    &font_decode,
                                     cmap_decisions,
-                                    &font_widths,
                                 ) {
                                     current_text.push_str(&text);
                                 }
@@ -909,6 +924,19 @@ fn extract_form_xobject_text_inner(
             }
             _ => {}
         }
+    }
+
+    // A budget break leaves the tail unread; drain it so a poisoned stream
+    // is detected no matter where the budget stopped. On poison the form
+    // contributes nothing and the budget rolls back to its pre-walk state,
+    // matching the decode-first behavior where a failed decode meant no
+    // walk at all.
+    while ops.advance() {}
+    if ops.poisoned() {
+        budget.invocations = budget_invocations;
+        budget.operations = budget_operations;
+        budget.truncated = budget_truncated;
+        return ExtractedText::new();
     }
 
     extracted
@@ -1156,6 +1184,7 @@ mod tests {
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+            &mut crate::extractor::content_stream::PageVecSizes::default(),
         )
         .unwrap();
         assert!(
@@ -1186,6 +1215,7 @@ mod tests {
             false,
             &mut FontStyleCache::new(),
             &mut budget,
+            &mut crate::extractor::content_stream::PageVecSizes::default(),
         )
         .unwrap();
         assert_eq!(first.iter().filter(|item| item.text == "X").count(), 1);
@@ -1199,6 +1229,7 @@ mod tests {
             true,
             &mut FontStyleCache::new(),
             &mut budget,
+            &mut crate::extractor::content_stream::PageVecSizes::default(),
         )
         .unwrap();
         assert!(
@@ -1269,6 +1300,7 @@ mod tests {
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+            &mut crate::extractor::content_stream::PageVecSizes::default(),
         )
         .unwrap();
         items

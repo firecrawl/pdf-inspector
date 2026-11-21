@@ -1,5 +1,5 @@
 [package]
-name = "pdf-inspector"
+name = "pdf-inspector-gov"
 version = "1.17.0"
 edition = "2021"
 # Oldest compiler the crate builds on (slice::as_chunks). Independent of the
@@ -49,7 +49,7 @@ ttf-parser = "0.25"
 # Native builds keep lopdf's parallel parser and CLI logging. Browser WASM is
 # deliberately single-threaded so it works without cross-origin isolation.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-lopdf = { version = "0.42.0", features = ["rayon"] }
+lopdf = { package = "lopdf-gov", version = "=0.42.0", git = "https://github.com/firecrawl/lopdf", rev = "8b50ec047c154b05688262d2b08c35fae3ffe167", features = ["rayon"] }
 rayon = "1.10"
 env_logger = "0.11"
 # Optional native page rendering for OCR pipelines. PDFium is loaded at
@@ -75,7 +75,7 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optio
 # Browser builds use JavaScript randomness for encrypted PDFs and embed the
 # bundled CMaps because there is no filesystem at runtime.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-lopdf = { version = "0.42.0", default-features = false, features = ["wasm_js"] }
+lopdf = { package = "lopdf-gov", version = "=0.42.0", git = "https://github.com/firecrawl/lopdf", rev = "8b50ec047c154b05688262d2b08c35fae3ffe167", default-features = false, features = ["wasm_js"] }
 include_dir = "0.7"
 
 [dev-dependencies]
@@ -92,6 +92,10 @@ render-pdfium = ["vision", "dep:firecrawl-pdfium"]
 # Complete native OCR path. This remains opt-in so default library,
 # renderer-only, and browser consumers do not inherit inference or HTTP/TLS.
 ocr = ["render-pdfium", "ocr-oar", "model-download"]
+
+[[bin]]
+name = "pdf2blocks"
+path = "src/bin/pdf2blocks.rs"
 
 [[bin]]
 name = "pdf2md"

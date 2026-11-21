@@ -11,12 +11,13 @@ use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
     descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
-    CMapDecisionCache, FontStyleCache,
+    CMapDecisionCache, FontDecodeSettings, FontDecodeTables, FontStyleCache,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
@@ -142,6 +143,7 @@ fn rise_adjusted(tm: &[f32; 6], rise: f32) -> [f32; 6] {
 /// gid-encoded glyphs and `skipped_invisible` reports that invisible (Tr 3)
 /// text was present but suppressed — callers can use it to decide whether an
 /// `include_invisible` retry could recover anything at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
@@ -150,12 +152,13 @@ pub(crate) fn extract_page_text_items(
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
+    sizes: &mut PageVecSizes,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
-    let mut rects: Vec<PdfRect> = Vec::new();
+    let mut rects: Vec<PdfRect> = Vec::with_capacity(sizes.rects);
     let mut clip_rects: Vec<PdfRect> = Vec::new();
-    let mut lines: Vec<PdfLine> = Vec::new();
-    let mut underline_lines: Vec<UnderlineLine> = Vec::new();
+    let mut lines: Vec<PdfLine> = Vec::with_capacity(sizes.lines);
+    let mut underline_lines: Vec<UnderlineLine> = Vec::with_capacity(sizes.underline_lines);
     // Indexes of items whose raw decoded text is a multi-character RTL run
     // that may be stored in visual order (see fix_visual_order_rtl), plus a
     // count of show ops whose glyph progression walked right-to-left —
@@ -218,8 +221,8 @@ pub(crate) fn extract_page_text_items(
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
                     let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
+                        .decompressed_content_cow()
+                        .unwrap_or_else(|_| Cow::Borrowed(&s.content));
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
@@ -246,25 +249,42 @@ pub(crate) fn extract_page_text_items(
     }
 
     let mut cmap_decisions = CMapDecisionCache::new();
+    let font_tables = FontDecodeTables {
+        font_cmaps,
+        font_tounicode_refs: &font_tounicode_refs,
+        inline_cmaps: &inline_cmaps,
+        font_encodings: &font_encodings,
+        encoding_cache: &encoding_cache,
+        font_widths: &font_widths,
+    };
+    let resolve_font = |font: &str| {
+        FontDecodeSettings::resolve(
+            font,
+            font_base_names.get(font).map(|s| s.as_str()),
+            &font_tables,
+        )
+    };
 
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
     // Get content
-    let content_data = doc
+    let mut content_data = doc
         .get_page_content(page_id)
         .map_err(|e| PdfError::Parse(e.to_string()))?;
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
     // Content::decode parser, causing it to skip operators like ET and Q.
-    let content_data = strip_pdf_comments(&content_data);
+    if content_data.contains(&b'%') {
+        content_data = strip_pdf_comments(&content_data);
+    }
 
-    let content = match super::content_decode::decode_content_bounded(
+    let mut ops = match super::content_decode::stream_content_bounded(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
-    )? {
-        Some(content) => content,
+    ) {
+        Some(ops) => ops,
         None => {
             log::warn!(
                 "page {}: skipping extraction — content stream exceeds {} operations",
@@ -283,7 +303,7 @@ pub(crate) fn extract_page_text_items(
     let mut skipped_invisible = false;
     let mut line_width: f32 = 1.0;
     #[derive(Clone)]
-    struct SavedGraphicsState {
+    struct SavedGraphicsState<'f> {
         ctm: [f32; 6],
         text_rendering_mode: i32,
         line_width: f32,
@@ -292,12 +312,14 @@ pub(crate) fn extract_page_text_items(
         text_rise: f32,
         text_leading: f32,
         current_font: String,
+        font_decode: FontDecodeSettings<'f>,
         current_font_size: f32,
     }
     let mut gstate_stack: Vec<SavedGraphicsState> = Vec::new();
 
     // Text state tracking
     let mut current_font = String::new();
+    let mut font_decode = resolve_font(&current_font);
     let mut current_font_size: f32 = 12.0;
     let mut text_leading: f32 = 0.0; // TL parameter (in text-space units)
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
@@ -333,9 +355,10 @@ pub(crate) fn extract_page_text_items(
         stack.iter().rev().find_map(|e| e.mcid)
     }
 
-    for op in &content.operations {
-        trace!("{} {:?}", op.operator, op.operands);
-        match op.operator.as_str() {
+    while ops.advance() {
+        let (operator, operands) = (ops.operator(), ops.operands());
+        trace!("{} {:?}", operator, operands);
+        match operator {
             "q" => {
                 // Save graphics state
                 gstate_stack.push(SavedGraphicsState {
@@ -347,6 +370,7 @@ pub(crate) fn extract_page_text_items(
                     text_rise,
                     text_leading,
                     current_font: current_font.clone(),
+                    font_decode,
                     current_font_size,
                 });
             }
@@ -361,25 +385,26 @@ pub(crate) fn extract_page_text_items(
                     text_rise = saved.text_rise;
                     text_leading = saved.text_leading;
                     current_font = saved.current_font;
+                    font_decode = saved.font_decode;
                     current_font_size = saved.current_font_size;
                 }
             }
             "cm" => {
                 // Concatenate matrix to CTM
-                if op.operands.len() >= 6 {
+                if operands.len() >= 6 {
                     let new_matrix = [
-                        get_number(&op.operands[0]).unwrap_or(1.0),
-                        get_number(&op.operands[1]).unwrap_or(0.0),
-                        get_number(&op.operands[2]).unwrap_or(0.0),
-                        get_number(&op.operands[3]).unwrap_or(1.0),
-                        get_number(&op.operands[4]).unwrap_or(0.0),
-                        get_number(&op.operands[5]).unwrap_or(0.0),
+                        get_number(&operands[0]).unwrap_or(1.0),
+                        get_number(&operands[1]).unwrap_or(0.0),
+                        get_number(&operands[2]).unwrap_or(0.0),
+                        get_number(&operands[3]).unwrap_or(1.0),
+                        get_number(&operands[4]).unwrap_or(0.0),
+                        get_number(&operands[5]).unwrap_or(0.0),
                     ];
                     ctm = multiply_matrices(&new_matrix, &ctm);
                 }
             }
             "w" => {
-                if let Some(width) = op.operands.first().and_then(get_number) {
+                if let Some(width) = operands.first().and_then(get_number) {
                     line_width = width;
                 }
             }
@@ -396,65 +421,66 @@ pub(crate) fn extract_page_text_items(
             }
             "Tf" => {
                 // Set font and size
-                if op.operands.len() >= 2 {
-                    if let Ok(name) = op.operands[0].as_name() {
+                if operands.len() >= 2 {
+                    if let Ok(name) = operands[0].as_name() {
                         current_font = String::from_utf8_lossy(name).to_string();
+                        font_decode = resolve_font(&current_font);
                     }
-                    if let Ok(size) = op.operands[1].as_f32() {
+                    if let Ok(size) = operands[1].as_f32() {
                         current_font_size = size;
-                    } else if let Ok(size) = op.operands[1].as_i64() {
+                    } else if let Ok(size) = operands[1].as_i64() {
                         current_font_size = size as f32;
                     }
                 }
             }
             "TL" => {
                 // Set text leading (used by T*, ', and " operators)
-                if let Some(tl) = op.operands.first().and_then(get_number) {
+                if let Some(tl) = operands.first().and_then(get_number) {
                     text_leading = tl;
                 }
             }
             "Tr" => {
                 // Set text rendering mode (3 = invisible / OCR overlay)
-                if let Some(mode) = op.operands.first().and_then(get_number) {
+                if let Some(mode) = operands.first().and_then(get_number) {
                     text_rendering_mode = mode as i32;
                 }
             }
             "Tc" => {
                 // Set character spacing (extra space added after each character)
-                if let Some(tc) = op.operands.first().and_then(get_number) {
+                if let Some(tc) = operands.first().and_then(get_number) {
                     char_spacing = tc;
                 }
             }
             "Tw" => {
                 // Set word spacing (extra space added for each space character)
-                if let Some(tw) = op.operands.first().and_then(get_number) {
+                if let Some(tw) = operands.first().and_then(get_number) {
                     word_spacing = tw;
                 }
             }
             "Ts" => {
                 // Set text rise (baseline shift for superscripts/subscripts)
-                if let Some(ts) = op.operands.first().and_then(get_number) {
+                if let Some(ts) = operands.first().and_then(get_number) {
                     text_rise = ts;
                 }
             }
             "Td" | "TD" => {
                 // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM
                 // tx,ty are in text space — must be scaled by the text line matrix
-                if op.operands.len() >= 2 {
-                    let tx = get_number(&op.operands[0]).unwrap_or(0.0);
-                    let ty = get_number(&op.operands[1]).unwrap_or(0.0);
+                if operands.len() >= 2 {
+                    let tx = get_number(&operands[0]).unwrap_or(0.0);
+                    let ty = get_number(&operands[1]).unwrap_or(0.0);
                     line_matrix[4] += tx * line_matrix[0] + ty * line_matrix[2];
                     line_matrix[5] += tx * line_matrix[1] + ty * line_matrix[3];
                     text_matrix = line_matrix;
-                    if op.operator == "TD" {
+                    if operator == "TD" {
                         text_leading = -ty;
                     }
                 }
             }
             "Tm" => {
                 // Set text matrix
-                if op.operands.len() >= 6 {
-                    for (i, operand) in op.operands.iter().take(6).enumerate() {
+                if operands.len() >= 6 {
+                    for (i, operand) in operands.iter().take(6).enumerate() {
                         text_matrix[i] =
                             get_number(operand).unwrap_or(if i == 0 || i == 3 { 1.0 } else { 0.0 });
                     }
@@ -474,10 +500,10 @@ pub(crate) fn extract_page_text_items(
             }
             "Tj" => {
                 // Show text string
-                if in_text_block && !op.operands.is_empty() {
+                if in_text_block && !operands.is_empty() {
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
-                        get_operand_bytes(&op.operands[0]).map(|raw| {
+                        get_operand_bytes(&operands[0]).map(|raw| {
                             compute_string_width_ts(
                                 raw,
                                 fi,
@@ -507,8 +533,7 @@ pub(crate) fn extract_page_text_items(
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
                     if text_rendering_mode == 3 && !include_invisible {
-                        if op
-                            .operands
+                        if operands
                             .first()
                             .and_then(get_operand_bytes)
                             .is_some_and(|raw| !raw.is_empty())
@@ -522,16 +547,10 @@ pub(crate) fn extract_page_text_items(
                         continue;
                     }
                     if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
+                        &operands[0],
                         &current_font,
-                        font_base_names.get(&current_font).map(|s| s.as_str()),
-                        font_cmaps,
-                        &font_tounicode_refs,
-                        &inline_cmaps,
-                        &font_encodings,
-                        &encoding_cache,
+                        &font_decode,
                         &mut cmap_decisions,
-                        &font_widths,
                     ) {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
@@ -604,8 +623,8 @@ pub(crate) fn extract_page_text_items(
             }
             "TJ" => {
                 // Show text with positioning — split at column-sized gaps
-                if in_text_block && !op.operands.is_empty() {
-                    if let Ok(array) = op.operands[0].as_array() {
+                if in_text_block && !operands.is_empty() {
+                    if let Ok(array) = operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
                         // Numeric-only TJ arrays (pure kerning) show no
                         // text — they must not trigger the invisible retry.
@@ -735,14 +754,8 @@ pub(crate) fn extract_page_text_items(
                                 if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
-                                    font_base_names.get(&current_font).map(|s| s.as_str()),
-                                    font_cmaps,
-                                    &font_tounicode_refs,
-                                    &inline_cmaps,
-                                    &font_encodings,
-                                    &encoding_cache,
+                                    &font_decode,
                                     &mut cmap_decisions,
-                                    &font_widths,
                                 ) {
                                     current_text.push_str(&text);
                                 }
@@ -861,7 +874,7 @@ pub(crate) fn extract_page_text_items(
                 // zero-width and geometric underline/strikeout detection
                 // rejects it (`is_underline_candidate` needs width > 0).
                 let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
-                    op.operands.first().and_then(get_operand_bytes).map(|raw| {
+                    operands.first().and_then(get_operand_bytes).map(|raw| {
                         compute_string_width_ts(
                             raw,
                             fi,
@@ -873,8 +886,7 @@ pub(crate) fn extract_page_text_items(
                 });
                 if text_rendering_mode == 3
                     && !include_invisible
-                    && op
-                        .operands
+                    && operands
                         .first()
                         .and_then(get_operand_bytes)
                         .is_some_and(|raw| !raw.is_empty())
@@ -883,19 +895,13 @@ pub(crate) fn extract_page_text_items(
                 }
                 if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
-                    || op.operands.is_empty())
+                    || operands.is_empty())
                 {
                     if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
+                        &operands[0],
                         &current_font,
-                        font_base_names.get(&current_font).map(|s| s.as_str()),
-                        font_cmaps,
-                        &font_tounicode_refs,
-                        &inline_cmaps,
-                        &font_encodings,
-                        &encoding_cache,
+                        &font_decode,
                         &mut cmap_decisions,
-                        &font_widths,
                     ) {
                         if !text.trim().is_empty() {
                             let combined =
@@ -964,8 +970,8 @@ pub(crate) fn extract_page_text_items(
             }
             "Do" => {
                 // XObject invocation - could be an image or form
-                if !op.operands.is_empty() {
-                    if let Ok(name) = op.operands[0].as_name() {
+                if !operands.is_empty() {
+                    if let Ok(name) = operands[0].as_name() {
                         let xobj_name = String::from_utf8_lossy(name).to_string();
 
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
@@ -1032,8 +1038,8 @@ pub(crate) fn extract_page_text_items(
                 // Begin Marked Content with properties — extract ActualText and MCID
                 let mut actual_text: Option<String> = None;
                 let mut mcid: Option<i64> = None;
-                if op.operands.len() >= 2 {
-                    let dict = match &op.operands[1] {
+                if operands.len() >= 2 {
+                    let dict = match &operands[1] {
                         Object::Dictionary(d) => Some(d.clone()),
                         Object::Reference(id) => doc.get_dictionary(*id).ok().cloned(),
                         _ => None,
@@ -1126,11 +1132,11 @@ pub(crate) fn extract_page_text_items(
             }
             "re" => {
                 // Rectangle operator: collect for table-grid detection
-                if op.operands.len() >= 4 {
-                    let rx = get_number(&op.operands[0]).unwrap_or(0.0);
-                    let ry = get_number(&op.operands[1]).unwrap_or(0.0);
-                    let rw = get_number(&op.operands[2]).unwrap_or(0.0);
-                    let rh = get_number(&op.operands[3]).unwrap_or(0.0);
+                if operands.len() >= 4 {
+                    let rx = get_number(&operands[0]).unwrap_or(0.0);
+                    let ry = get_number(&operands[1]).unwrap_or(0.0);
+                    let rw = get_number(&operands[2]).unwrap_or(0.0);
+                    let rh = get_number(&operands[3]).unwrap_or(0.0);
                     // Transform origin to device space
                     let x_dev = rx * ctm[0] + ry * ctm[2] + ctm[4];
                     let y_dev = rx * ctm[1] + ry * ctm[3] + ctm[5];
@@ -1154,19 +1160,19 @@ pub(crate) fn extract_page_text_items(
             // ── Path construction operators ──────────────────────
             "m" => {
                 // moveto: start a new subpath
-                if op.operands.len() >= 2 {
-                    let px = get_number(&op.operands[0]).unwrap_or(0.0);
-                    let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                if operands.len() >= 2 {
+                    let px = get_number(&operands[0]).unwrap_or(0.0);
+                    let py = get_number(&operands[1]).unwrap_or(0.0);
                     path_subpath_start = Some((px, py));
                     path_current = Some((px, py));
                 }
             }
             "l" => {
                 // lineto: add segment from current point
-                if op.operands.len() >= 2 {
+                if operands.len() >= 2 {
                     if let Some((cx, cy)) = path_current {
-                        let px = get_number(&op.operands[0]).unwrap_or(0.0);
-                        let py = get_number(&op.operands[1]).unwrap_or(0.0);
+                        let px = get_number(&operands[0]).unwrap_or(0.0);
+                        let py = get_number(&operands[1]).unwrap_or(0.0);
                         pending_lines.push((cx, cy, px, py));
                         path_current = Some((px, py));
                     }
@@ -1189,7 +1195,7 @@ pub(crate) fn extract_page_text_items(
             // ── Path painting operators ──────────────────────────
             "S" | "s" => {
                 // stroke / close-and-stroke: emit pending lines
-                if op.operator == "s" {
+                if operator == "s" {
                     // close first
                     if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
                         if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
@@ -1223,7 +1229,7 @@ pub(crate) fn extract_page_text_items(
             }
             "B" | "B*" | "b" | "b*" => {
                 // fill+stroke: emit lines AND clear state
-                if op.operator == "b" || op.operator == "b*" {
+                if operator == "b" || operator == "b*" {
                     // close first
                     if let (Some((cx, cy)), Some((sx, sy))) = (path_current, path_subpath_start) {
                         if (cx - sx).abs() > 0.01 || (cy - sy).abs() > 0.01 {
@@ -1387,6 +1393,12 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    // A stream the whole-stream decoder refuses must fail the page exactly
+    // as it did when decoding preceded extraction.
+    if ops.poisoned() {
+        return Err(PdfError::Parse("invalid content stream".to_string()));
+    }
+
     if form_budget.was_truncated() {
         log::warn!(
             "page {page_num}: Form XObject expansion truncated (invocation or operation budget reached); nested form text may be incomplete"
@@ -1446,12 +1458,26 @@ pub(crate) fn extract_page_text_items(
 
     let items = super::merge_text_items(items);
     let items = super::merge_subscript_items(items);
+    sizes.rects = rects.len();
+    sizes.lines = lines.len();
+    sizes.underline_lines = underline_lines.len();
     Ok((
         (items, rects, lines),
         has_gid_fonts,
         coords_rotated,
         skipped_invisible,
     ))
+}
+
+/// Final accumulator lengths from the most recent page, used to size the
+/// next page's vectors: pages within one document are self-similar, so the
+/// previous page's counts remove most growth-doubling on drawing-heavy
+/// documents. Purely a capacity hint; values never affect output.
+#[derive(Default)]
+pub(crate) struct PageVecSizes {
+    rects: usize,
+    lines: usize,
+    underline_lines: usize,
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
@@ -1657,6 +1683,7 @@ mod tests {
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+            &mut PageVecSizes::default(),
         )
         .unwrap();
         items
@@ -1887,6 +1914,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+            &mut PageVecSizes::default(),
         )
         .unwrap();
         let ((items, rects, lines), _has_gid, _coords_rotated, _skipped_invisible) = result;
@@ -1978,6 +2006,7 @@ BT 30 700 Tm <41> Tj ET";
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+            &mut PageVecSizes::default(),
         )
         .unwrap();
         let text = items
@@ -2054,6 +2083,7 @@ end"#;
             false,
             &mut FontStyleCache::new(),
             &mut FormWalkBudget::new(),
+            &mut PageVecSizes::default(),
         )
         .unwrap();
         items

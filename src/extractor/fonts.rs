@@ -1,10 +1,11 @@
 //! Font width parsing, encoding, and text decoding.
 
 use crate::glyph_names::glyph_to_char;
-use crate::tounicode::FontCMaps;
+use crate::tounicode::{CMapEntry, FontCMaps};
 use crate::types::{FontEncodingMap, FontWidthInfo, PageFontEncodings, PageFontWidths};
 use log::debug;
 use lopdf::{Document, Encoding, Object, ObjectId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1139,45 +1140,92 @@ fn font_file_ref(descriptor: &lopdf::Dictionary) -> Option<ObjectId> {
 }
 
 /// Decompressed embedded font program bytes.
-fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
+fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Cow<'_, [u8]>> {
     let stream = doc
         .get_object(ff_ref)
         .and_then(lopdf::Object::as_stream)
         .ok()?;
     Some(
         stream
-            .decompressed_content()
-            .unwrap_or_else(|_| stream.content.clone()),
+            .decompressed_content_cow()
+            .unwrap_or_else(|_| Cow::Borrowed(&stream.content)),
     )
 }
 
+/// A page's font lookup tables, keyed by font resource name.
+pub(crate) struct FontDecodeTables<'a> {
+    pub(crate) font_cmaps: &'a FontCMaps,
+    pub(crate) font_tounicode_refs: &'a HashMap<String, u32>,
+    pub(crate) inline_cmaps: &'a HashMap<String, CMapEntry>,
+    pub(crate) font_encodings: &'a PageFontEncodings,
+    pub(crate) encoding_cache: &'a HashMap<String, Encoding<'a>>,
+    pub(crate) font_widths: &'a PageFontWidths,
+}
+
+/// Everything string decoding needs that depends only on the selected font.
+/// Resolved when a font is selected, not for every shown string; the page's
+/// font tables do not change while its content stream runs.
+#[derive(Clone, Copy)]
+pub(crate) struct FontDecodeSettings<'a> {
+    base_font_name: Option<&'a str>,
+    is_type0_cid_font: bool,
+    use_cp1252_fallback: bool,
+    inline_cmap: Option<&'a CMapEntry>,
+    tounicode_ref: Option<u32>,
+    tounicode_cmap: Option<&'a CMapEntry>,
+    encoding_map: Option<&'a FontEncodingMap>,
+    encoding: Option<&'a Encoding<'a>>,
+}
+
+impl<'a> FontDecodeSettings<'a> {
+    pub(crate) fn resolve(
+        font: &str,
+        base_font_name: Option<&'a str>,
+        tables: &FontDecodeTables<'a>,
+    ) -> Self {
+        let is_type0_cid_font = tables.font_widths.get(font).is_some_and(|info| info.is_cid);
+        let tounicode_ref = tables.font_tounicode_refs.get(font).copied();
+        Self {
+            base_font_name,
+            is_type0_cid_font,
+            use_cp1252_fallback: should_use_cp1252_single_byte_fallback(
+                base_font_name,
+                is_type0_cid_font,
+            ),
+            inline_cmap: tables.inline_cmaps.get(font),
+            tounicode_ref,
+            tounicode_cmap: tounicode_ref.and_then(|obj_num| tables.font_cmaps.get_by_obj(obj_num)),
+            encoding_map: tables.font_encodings.get(font),
+            encoding: tables.encoding_cache.get(font),
+        }
+    }
+}
+
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
     obj: &Object,
     current_font: &str,
-    base_font_name: Option<&str>,
-    font_cmaps: &FontCMaps,
-    font_tounicode_refs: &std::collections::HashMap<String, u32>,
-    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
-    font_encodings: &PageFontEncodings,
-    encoding_cache: &HashMap<String, Encoding<'_>>,
+    font: &FontDecodeSettings<'_>,
     cmap_decisions: &mut CMapDecisionCache,
-    font_widths: &PageFontWidths,
 ) -> Option<String> {
-    let is_type0_cid_font = font_widths
-        .get(current_font)
-        .is_some_and(|info| info.is_cid);
-    let use_cp1252_fallback =
-        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
+    let FontDecodeSettings {
+        base_font_name,
+        is_type0_cid_font,
+        use_cp1252_fallback,
+        inline_cmap,
+        tounicode_ref,
+        tounicode_cmap,
+        encoding_map: font_encoding_map,
+        encoding: font_encoding,
+    } = *font;
     let result = (|| -> Option<String> {
         if let Object::String(bytes, _) = obj {
-            let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
+            let mut decode_with_entry = |entry: &CMapEntry| -> Option<String> {
                 // For single-byte CMaps, merge CMap + Differences at the byte level:
                 // try CMap first, then Differences, then Latin-1 fallback per byte.
                 // This prevents partial CMap results from blocking the Differences path.
                 if entry.primary.code_byte_length == 1 {
-                    let encoding_map = font_encodings.get(current_font);
+                    let encoding_map = font_encoding_map;
                     let decoded: String = bytes
                         .iter()
                         .filter_map(|&b| {
@@ -1233,9 +1281,7 @@ pub(crate) fn extract_text_from_operand(
                     let decoded_remap = remapped.decode_cids(bytes);
                     let decoded_fallback = entry.fallback.as_ref().map(|c| c.decode_cids(bytes));
 
-                    if let Some(choice) = cmap_decisions
-                        .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
-                    {
+                    if let Some(choice) = cmap_decisions.get_choice(tounicode_ref.unwrap_or(0)) {
                         let decoded = match choice {
                             CMapChoice::Primary => decoded_primary.clone(),
                             CMapChoice::Remapped => decoded_remap.clone(),
@@ -1246,7 +1292,7 @@ pub(crate) fn extract_text_from_operand(
                     }
 
                     let choice = cmap_decisions.consider(
-                        font_tounicode_refs.get(current_font).copied().unwrap_or(0),
+                        tounicode_ref.unwrap_or(0),
                         &decoded_primary,
                         &decoded_remap,
                         bytes.len(),
@@ -1285,7 +1331,7 @@ pub(crate) fn extract_text_from_operand(
             };
 
             let mut has_cmap = false;
-            if let Some(entry) = inline_cmaps.get(current_font) {
+            if let Some(entry) = inline_cmap {
                 has_cmap = true;
                 if let Some(decoded) = decode_with_entry(entry) {
                     return Some(decoded);
@@ -1293,12 +1339,10 @@ pub(crate) fn extract_text_from_operand(
             }
 
             // Look up CMap by ToUnicode object reference
-            if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
-                if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
-                    has_cmap = true;
-                    if let Some(decoded) = decode_with_entry(entry) {
-                        return Some(decoded);
-                    }
+            if let Some(entry) = tounicode_cmap {
+                has_cmap = true;
+                if let Some(decoded) = decode_with_entry(entry) {
+                    return Some(decoded);
                 }
             }
 
@@ -1318,7 +1362,7 @@ pub(crate) fn extract_text_from_operand(
             // The Differences array overrides specific codes in a base encoding (typically
             // WinAnsiEncoding). We must combine Differences entries with the base encoding
             // rather than using filter_map which silently drops unmapped bytes.
-            if let Some(encoding_map) = font_encodings.get(current_font) {
+            if let Some(encoding_map) = font_encoding_map {
                 let has_diff_match = bytes.iter().any(|b| encoding_map.contains_key(b));
                 if has_diff_match {
                     let decoded: String = bytes
@@ -1388,7 +1432,7 @@ pub(crate) fn extract_text_from_operand(
             }
 
             // Try to decode using cached font encoding from lopdf
-            if let Some(encoding) = encoding_cache.get(current_font) {
+            if let Some(encoding) = font_encoding {
                 if let Ok(text) = Document::decode_text(encoding, bytes) {
                     let text = normalize_cp1252_controls(text, use_cp1252_fallback);
                     if text.contains('\u{FFFD}') {
@@ -1413,7 +1457,7 @@ pub(crate) fn extract_text_from_operand(
                         // For CID fonts (have ToUnicode CMap), the CID is
                         // genuinely unmapped — return None to avoid Latin-1
                         // fallback misinterpreting CID bytes as characters.
-                        if has_cmap || font_tounicode_refs.contains_key(current_font) {
+                        if has_cmap || tounicode_ref.is_some() {
                             return None;
                         }
                         // Non-CID fonts: fall through to other methods
@@ -1546,10 +1590,13 @@ fn should_use_cp1252_single_byte_fallback(
     let Some(base_font_name) = base_font_name else {
         return true;
     };
+    // Runs once per shown string, so the name is compared byte-wise with
+    // ASCII case folding instead of lowercased into a new string; the
+    // needles are lowercase ASCII, which makes the two equivalent.
     let font_name = base_font_name
         .rsplit_once('+')
         .map_or(base_font_name, |(_, stripped)| stripped)
-        .to_ascii_lowercase();
+        .as_bytes();
 
     // TeX/Computer Modern and math/symbol fonts often place ligatures or
     // symbols in the C1 byte range. Treating those bytes as Windows-1252 makes
@@ -1558,15 +1605,20 @@ fn should_use_cp1252_single_byte_fallback(
         "cmr", "cmb", "cmmi", "cmsy", "cmex", "cmtt", "cmss", "cmti", "ecrm", "ecbx", "ecti",
         "tcrm", "tctt", "msam", "msbm", "ttdc",
     ];
-    if non_cp1252_prefixes
-        .iter()
-        .any(|prefix| font_name.starts_with(prefix))
-    {
+    if non_cp1252_prefixes.iter().any(|prefix| {
+        font_name
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    }) {
         return false;
     }
 
     let non_cp1252_names = ["math", "symbol", "dingbat", "emoji"];
-    !non_cp1252_names.iter().any(|name| font_name.contains(name))
+    !non_cp1252_names.iter().any(|name| {
+        font_name
+            .windows(name.len())
+            .any(|window| window.eq_ignore_ascii_case(name.as_bytes()))
+    })
 }
 
 /// Replace PUA characters in the F000-F0FF range with standard Unicode equivalents.
@@ -1967,7 +2019,7 @@ mod tests {
         // Replace the font program with garbage: a repeat call must serve
         // the memo instead of re-reading the stream — repeated per-page
         // decompression is exactly what the cache exists to avoid.
-        doc.objects.insert(
+        doc.set_object(
             ff_id,
             Object::Stream(Stream::new(dictionary! {}, vec![0u8; 4])),
         );
@@ -2162,18 +2214,16 @@ mod tests {
         let mut font_widths: PageFontWidths = HashMap::new();
         font_widths.insert("F0".to_string(), make_font_info(&[], 1000, true));
 
-        let result = extract_text_from_operand(
-            &obj,
-            "F0",
-            None,
-            &font_cmaps,
-            &font_tounicode_refs,
-            &inline_cmaps,
-            &font_encodings,
-            &encoding_cache,
-            &mut decisions,
-            &font_widths,
-        );
+        let tables = FontDecodeTables {
+            font_cmaps: &font_cmaps,
+            font_tounicode_refs: &font_tounicode_refs,
+            inline_cmaps: &inline_cmaps,
+            font_encodings: &font_encodings,
+            encoding_cache: &encoding_cache,
+            font_widths: &font_widths,
+        };
+        let font = FontDecodeSettings::resolve("F0", None, &tables);
+        let result = extract_text_from_operand(&obj, "F0", &font, &mut decisions);
 
         let text = result.expect("CID font fallback should still emit a marker");
         assert!(
@@ -2209,19 +2259,17 @@ mod tests {
         let mut font_widths: PageFontWidths = HashMap::new();
         font_widths.insert("F1".to_string(), make_font_info(&[], 1000, false));
 
-        let text = extract_text_from_operand(
-            &obj,
-            "F1",
-            None,
-            &font_cmaps,
-            &font_tounicode_refs,
-            &inline_cmaps,
-            &font_encodings,
-            &encoding_cache,
-            &mut decisions,
-            &font_widths,
-        )
-        .expect("simple font should round-trip Latin-1 bytes");
+        let tables = FontDecodeTables {
+            font_cmaps: &font_cmaps,
+            font_tounicode_refs: &font_tounicode_refs,
+            inline_cmaps: &inline_cmaps,
+            font_encodings: &font_encodings,
+            encoding_cache: &encoding_cache,
+            font_widths: &font_widths,
+        };
+        let font = FontDecodeSettings::resolve("F1", None, &tables);
+        let text = extract_text_from_operand(&obj, "F1", &font, &mut decisions)
+            .expect("simple font should round-trip Latin-1 bytes");
         assert_eq!(text, "$G\u{00B6}V");
         assert!(
             !text.contains('\u{FFFD}'),
@@ -2242,19 +2290,17 @@ mod tests {
         let mut decisions = CMapDecisionCache::new();
         let font_widths: PageFontWidths = HashMap::new();
 
-        let text = extract_text_from_operand(
-            &obj,
-            "F1",
-            None,
-            &font_cmaps,
-            &font_tounicode_refs,
-            &inline_cmaps,
-            &font_encodings,
-            &encoding_cache,
-            &mut decisions,
-            &font_widths,
-        )
-        .expect("simple font should decode CP1252 punctuation");
+        let tables = FontDecodeTables {
+            font_cmaps: &font_cmaps,
+            font_tounicode_refs: &font_tounicode_refs,
+            inline_cmaps: &inline_cmaps,
+            font_encodings: &font_encodings,
+            encoding_cache: &encoding_cache,
+            font_widths: &font_widths,
+        };
+        let font = FontDecodeSettings::resolve("F1", None, &tables);
+        let text = extract_text_from_operand(&obj, "F1", &font, &mut decisions)
+            .expect("simple font should decode CP1252 punctuation");
 
         assert_eq!(text, "l’acad");
     }

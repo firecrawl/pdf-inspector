@@ -45,8 +45,10 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
         text = text.replace("\n\n\n", "\n\n");
     }
 
-    // Trim leading and trailing whitespace, ensure ends with single newline
-    text = text.trim().to_string();
+    // Trim leading and trailing whitespace in place, ensure ends with single newline
+    text.truncate(text.trim_end().len());
+    let leading = text.len() - text.trim_start().len();
+    text.drain(..leading);
     text.push('\n');
 
     text
@@ -103,11 +105,11 @@ fn remove_spaces_before_closing_brackets(text: &mut String) {
 /// untouched — no such input exists, but the guard is cheap) and dot leaders
 /// (" ... ") are unaffected.
 fn remove_spaces_before_sentence_punctuation(text: &mut String) {
-    let chars: Vec<char> = text.chars().collect();
     let mut result = String::with_capacity(text.len());
-    for (i, &ch) in chars.iter().enumerate() {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         if matches!(ch, '.' | ',' | ';') && result.ends_with(' ') {
-            let next = chars.get(i + 1);
+            let next = chars.peek();
             // `|` counts as a token end so table cells get the same fix.
             let token_ends = next.is_none_or(|c| c.is_whitespace() || *c == '|');
             // Never touch runs of dots (ellipsis / dot leaders).
@@ -154,7 +156,7 @@ fn fix_hyphenation(text: &str) -> String {
 /// decision is rendered (plain text vs. inside split emphasis markers) is the
 /// caller's business.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Join {
+pub(crate) enum Join {
     /// The fragments are one word: "de- fendant" -> "defendant".
     Plain,
     /// The fragments are a hyphenated compound: "six- month" -> "six-month".
@@ -167,7 +169,7 @@ enum Join {
 /// vocabulary evidence. The whole dehyphenation policy lives here so it can
 /// be reasoned about (and tested) apart from the Markdown scanning around it;
 /// see [`dehyphenate_line_breaks`] for the rule rationale.
-fn join_decision(
+pub(crate) fn join_decision(
     a: &str,
     b: &str,
     words: &std::collections::HashSet<String>,

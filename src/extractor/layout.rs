@@ -1,6 +1,6 @@
 //! Column detection, line grouping, and reading-order layout.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::text_utils::{effective_width, sort_line_items};
 use crate::types::{TextItem, TextLine};
@@ -1811,21 +1811,27 @@ pub(crate) fn filter_markdown_page_numbers_with_removed_pages(
     items: Vec<TextItem>,
     document_page_count: u32,
 ) -> (Vec<TextItem>, HashSet<u32>, Vec<bool>) {
-    let remove = page_number_removal_mask(&items, document_page_count as usize);
-    let mut removed_pages = HashSet::new();
-    let items = items
-        .into_iter()
-        .zip(remove.iter().copied())
-        .filter_map(|(item, remove)| {
-            if remove {
-                removed_pages.insert(item.page);
-                None
-            } else {
-                Some(item)
-            }
-        })
-        .collect();
+    let (removed_pages, remove) = markdown_page_number_removals(&items, document_page_count);
+    let mut keep = remove.iter().map(|remove| !remove);
+    let mut items = items;
+    items.retain(|_| keep.next().unwrap_or(false));
     (items, removed_pages, remove)
+}
+
+/// The folio removal decision for each item, and the pages where at least
+/// one item is removed, without building the cleaned collection.
+pub(crate) fn markdown_page_number_removals(
+    items: &[TextItem],
+    document_page_count: u32,
+) -> (HashSet<u32>, Vec<bool>) {
+    let remove = page_number_removal_mask(items, document_page_count as usize);
+    let removed_pages = items
+        .iter()
+        .zip(&remove)
+        .filter(|&(_, &remove)| remove)
+        .map(|(item, _)| item.page)
+        .collect();
+    (removed_pages, remove)
 }
 
 /// Group text items into lines, with multi-column support
@@ -2193,15 +2199,15 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         items
     };
 
-    // Get unique pages
-    let mut pages: Vec<u32> = items.iter().map(|i| i.page).collect();
-    pages.sort();
-    pages.dedup();
+    // Move items into their pages, keeping each page's item order.
+    let mut items_by_page: BTreeMap<u32, Vec<TextItem>> = BTreeMap::new();
+    for item in items {
+        items_by_page.entry(item.page).or_default().push(item);
+    }
 
     let mut all_lines = Vec::new();
 
-    for page in pages {
-        let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
+    for (page, page_items) in items_by_page {
         // Page-edge numeric runs are weak evidence for column geometry. Keep
         // contextual values for line assembly, but prevent their preservation
         // from changing the page's inferred layout.

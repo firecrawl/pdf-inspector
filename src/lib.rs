@@ -32,6 +32,7 @@
 pub mod python;
 
 pub mod adobe_korea1;
+pub mod blocks;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
@@ -63,6 +64,7 @@ pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use text_quality::{
     analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
     region_items_have_decoding_issue,
@@ -305,18 +307,49 @@ pub fn detect_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
     process_pdf_mem_with_options(buffer, PdfOptions::detect_only())
 }
 
-/// Process a PDF from a memory buffer with custom options.
-///
-/// The buffer is parsed **once** and shared between detection and extraction.
-pub fn process_pdf_mem_with_options(
+/// Parse a PDF from memory into typed content blocks. The block
+/// pipeline runs page-at-a-time in two passes (document-wide
+/// calibration, then per-page emission), so peak memory follows the
+/// largest page rather than the document. The markdown surface is
+/// unchanged; this is a separate output over the same detection and
+/// extraction machinery.
+pub fn process_pdf_blocks_mem_with_options(
     buffer: &[u8],
     options: PdfOptions,
-) -> Result<PdfProcessResult, PdfError> {
+) -> Result<blocks::PdfBlocksResult, PdfError> {
     let start = ProcessingTimer::start();
     validate_pdf_bytes(buffer)?;
 
     let (doc, page_count) =
         load_document_from_mem_with_password(buffer, options.password.as_deref())?;
+
+    blocks::process_document_blocks(doc, page_count, options, start)
+}
+
+/// Process a PDF from a memory buffer with custom options.
+///
+/// The buffer is parsed **once** and shared between detection and extraction.
+/// The slice is copied once; callers that own the bytes use
+/// [`process_pdf_vec_with_options`] and pay no copy at all.
+pub fn process_pdf_mem_with_options(
+    buffer: &[u8],
+    options: PdfOptions,
+) -> Result<PdfProcessResult, PdfError> {
+    process_pdf_vec_with_options(buffer.to_vec(), options)
+}
+
+/// Owned-buffer form of [`process_pdf_mem_with_options`]: the
+/// document holds the caller's allocation instead of a copy, which
+/// halves peak memory on large files.
+pub fn process_pdf_vec_with_options(
+    buffer: Vec<u8>,
+    options: PdfOptions,
+) -> Result<PdfProcessResult, PdfError> {
+    let start = ProcessingTimer::start();
+    validate_pdf_bytes(&buffer)?;
+
+    let (doc, page_count) =
+        load_document_from_vec_with_password(buffer, options.password.as_deref())?;
 
     process_document(doc, page_count, options, start)
 }
@@ -539,7 +572,7 @@ fn extract_pages_markdown_mem_impl(
     let chart_regions = markdown::chart_regions_by_page(&all_items, &all_rects, &all_lines);
     let complexity = compute_layout_complexity_with_chart_regions(
         &all_items,
-        &filtered_items,
+        &page_number_removal_mask,
         &all_rects,
         &all_lines,
         &chart_regions,
@@ -569,6 +602,9 @@ fn extract_pages_markdown_mem_impl(
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
+    let item_runs = single_page_runs(&all_items, |item| item.page);
+    let rect_runs = single_page_runs(&all_rects, |rect| rect.page);
+    let line_runs = single_page_runs(&all_lines, |line| line.page);
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -586,27 +622,51 @@ fn extract_pages_markdown_mem_impl(
         let page_1idx = page_0idx + 1;
 
         // Partition items, removal decisions, and rects for this page only.
+        // The removal mask is aligned with `all_items`, so a page's run
+        // indexes both.
+        let item_range = match item_runs.get(&page_1idx) {
+            Some(Some(run)) => run.clone(),
+            Some(None) => 0..all_items.len(),
+            None => 0..0,
+        };
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
-            .iter()
-            .zip(&page_number_removal_mask)
-            .filter(|(item, _)| {
-                item.page == page_1idx
-                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
-            })
-            .map(|(item, remove)| (item.clone(), *remove))
-            .unzip();
+            [item_range.clone()]
+        .iter()
+        .zip(&page_number_removal_mask[item_range])
+        .filter(|(item, _)| {
+            item.page == page_1idx
+                && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+        })
+        .map(|(item, remove)| (item.clone(), *remove))
+        .unzip();
 
-        let page_rects: Vec<PdfRect> = all_rects
-            .iter()
-            .filter(|r| r.page == page_1idx)
-            .cloned()
-            .collect();
+        let collected_rects: Vec<PdfRect>;
+        let page_rects: &[PdfRect] = match rect_runs.get(&page_1idx) {
+            Some(Some(run)) => &all_rects[run.clone()],
+            None => &[],
+            Some(None) => {
+                collected_rects = all_rects
+                    .iter()
+                    .filter(|r| r.page == page_1idx)
+                    .cloned()
+                    .collect();
+                &collected_rects
+            }
+        };
 
-        let page_lines: Vec<types::PdfLine> = all_lines
-            .iter()
-            .filter(|l| l.page == page_1idx)
-            .cloned()
-            .collect();
+        let collected_lines: Vec<types::PdfLine>;
+        let page_lines: &[types::PdfLine] = match line_runs.get(&page_1idx) {
+            Some(Some(run)) => &all_lines[run.clone()],
+            None => &[],
+            Some(None) => {
+                collected_lines = all_lines
+                    .iter()
+                    .filter(|l| l.page == page_1idx)
+                    .cloned()
+                    .collect();
+                &collected_lines
+            }
+        };
 
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         {
@@ -655,8 +715,8 @@ fn extract_pages_markdown_mem_impl(
             markdown::to_markdown_from_items_with_rects_and_lines(
                 page_items,
                 options,
-                &page_rects,
-                &page_lines,
+                page_rects,
+                page_lines,
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
@@ -990,15 +1050,16 @@ pub struct PageRegionResult {
 }
 
 /// Minimum alphanumeric mass an invisible (Tr 3) text layer must carry for
-/// the OCR-layer fallback in [`extract_text_in_regions_mem`] to adopt it. A
+/// the OCR-layer fallbacks in [`extract_text_in_regions_mem`] and
+/// `extractor::extract_page_unit` to adopt it. A
 /// real OCR layer carries far more; a stray watermark or artifact does not.
-const OCR_LAYER_MIN_ALNUM: usize = 40;
+pub(crate) const OCR_LAYER_MIN_ALNUM: usize = 40;
 
 /// Alphanumeric mass of extracted items, ignoring raster placeholders.
 /// `[Image: ...]` items (ItemType::Image) are synthesized for image
 /// XObjects — they mark that pixels exist, not that text was read, so they
 /// must not count as coverage.
-fn non_placeholder_alnum(items: &[TextItem]) -> usize {
+pub(crate) fn non_placeholder_alnum(items: &[TextItem]) -> usize {
     items
         .iter()
         .filter(|it| !matches!(it.item_type, types::ItemType::Image))
@@ -1071,6 +1132,7 @@ pub fn extract_text_in_regions_mem(
                 false,
                 &mut style_cache,
                 &mut form_budget,
+                &mut extractor::content_stream::PageVecSizes::default(),
             )?;
         // OCR-layer fallback: scanned pages often carry their text as an
         // invisible (Tr 3) layer behind the page raster. The visible-only
@@ -1100,6 +1162,7 @@ pub fn extract_text_in_regions_mem(
                     true,
                     &mut style_cache,
                     &mut form_budget,
+                    &mut extractor::content_stream::PageVecSizes::default(),
                 )
             {
                 let inv_alnum = non_placeholder_alnum(&inv_items);
@@ -1283,6 +1346,7 @@ pub fn extract_tables_in_regions_mem(
                 false,
                 &mut style_cache,
                 &mut extractor::FormWalkBudget::new(),
+                &mut extractor::content_stream::PageVecSizes::default(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1595,6 +1659,7 @@ pub fn detect_vector_grid_in_region_mem(
             false,
             &mut extractor::FontStyleCache::new(),
             &mut extractor::FormWalkBudget::new(),
+            &mut extractor::content_stream::PageVecSizes::default(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1790,6 +1855,7 @@ mod vector_grid_tests {
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
                 &mut crate::extractor::FormWalkBudget::new(),
+                &mut crate::extractor::content_stream::PageVecSizes::default(),
             )
             .unwrap();
 
@@ -1834,6 +1900,7 @@ mod vector_grid_tests {
                 false,
                 &mut crate::extractor::FontStyleCache::new(),
                 &mut crate::extractor::FormWalkBudget::new(),
+                &mut crate::extractor::content_stream::PageVecSizes::default(),
             )
             .unwrap();
 
@@ -2572,6 +2639,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 false,
                 &mut style_cache,
                 &mut extractor::FormWalkBudget::new(),
+                &mut extractor::content_stream::PageVecSizes::default(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -3375,6 +3443,7 @@ fn detect_tsr_quality_issue(
             false,
             &mut extractor::FontStyleCache::new(),
             &mut extractor::FormWalkBudget::new(),
+            &mut extractor::content_stream::PageVecSizes::default(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -3859,7 +3928,7 @@ pub(crate) fn load_document_from_path_with_password<P: AsRef<Path>>(
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
     let buffer = std::fs::read(&path)?;
-    load_document_from_mem_with_password(&buffer, password)
+    load_document_from_vec_with_password(buffer, password)
 }
 
 /// Load a PDF from a memory buffer.
@@ -3868,20 +3937,35 @@ pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), P
 }
 
 /// Load a PDF from a memory buffer, decrypting with `password` if encrypted.
+/// The slice is copied once; callers that own the bytes use
+/// [`load_document_from_vec_with_password`] and share the allocation
+/// with the document's lazy store instead.
 pub(crate) fn load_document_from_mem_with_password(
     buffer: &[u8],
+    password: Option<&str>,
+) -> Result<(Document, u32), PdfError> {
+    load_document_from_vec_with_password(buffer.to_vec(), password)
+}
+
+/// Owned-buffer load: the document's lazy store shares this exact
+/// allocation, so a large file is held once, not once per layer.
+pub(crate) fn load_document_from_vec_with_password(
+    buffer: Vec<u8>,
     password: Option<&str>,
 ) -> Result<(Document, u32), PdfError> {
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
-    let fixed = structure_tree::fix_bare_struct_names(buffer);
-    let buf = fixed.as_ref();
+    let buffer = match structure_tree::fix_bare_struct_names(&buffer) {
+        std::borrow::Cow::Borrowed(_) => buffer,
+        std::borrow::Cow::Owned(fixed) => fixed,
+    };
+    let shared = Arc::new(buffer);
 
-    let doc = match load_document_bytes(buf, password) {
+    let doc = match load_document_shared(&shared, password) {
         Ok(doc) => doc,
         Err(first_err) => {
-            for repaired in repair_pdf_container_candidates(buf) {
+            for repaired in repair_pdf_container_candidates(&shared) {
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
@@ -3900,6 +3984,19 @@ pub(crate) fn load_document_from_mem_with_password(
     };
     let page_count = doc.get_pages().len() as u32;
     Ok((doc, page_count))
+}
+
+fn load_document_shared(
+    shared: &Arc<Vec<u8>>,
+    password: Option<&str>,
+) -> Result<Document, lopdf::Error> {
+    match Document::load_mem_shared_with_options(Arc::clone(shared), lopdf::LoadOptions::default())
+    {
+        Ok(doc) if doc.is_encrypted() => decrypt_document_bytes(shared, password),
+        Ok(doc) => Ok(doc),
+        Err(ref e) if is_encrypted_lopdf_error(e) => decrypt_document_bytes(shared, password),
+        Err(e) => Err(e),
+    }
 }
 
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
@@ -4232,6 +4329,9 @@ fn process_document(
             (roles, tables)
         })
         .unwrap_or((None, Vec::new()));
+    // Everything below works from the extracted items; release the parsed
+    // document before layout analysis and Markdown conversion.
+    drop(doc);
 
     let (
         markdown,
@@ -4259,6 +4359,7 @@ fn process_document(
                     // Collect text per OCR-flagged page and check quality
                     let mut garbage_pages: std::collections::HashSet<u32> =
                         std::collections::HashSet::new();
+                    let item_runs = single_page_runs(&items, |item| item.page);
                     for &pg in &ocr_set {
                         if options
                             .page_filter
@@ -4267,11 +4368,17 @@ fn process_document(
                         {
                             continue;
                         }
-                        let page_text: String = items
-                            .iter()
-                            .filter(|i| i.page == pg)
-                            .map(|i| i.text.as_str())
-                            .collect();
+                        let page_text: String = match item_runs.get(&pg) {
+                            Some(Some(run)) => {
+                                items[run.clone()].iter().map(|i| i.text.as_str()).collect()
+                            }
+                            Some(None) => items
+                                .iter()
+                                .filter(|i| i.page == pg)
+                                .map(|i| i.text.as_str())
+                                .collect(),
+                            None => String::new(),
+                        };
                         if is_cid_garbage(&page_text) {
                             garbage_pages.insert(pg);
                         }
@@ -4326,7 +4433,6 @@ fn process_document(
                 .collect();
             let FolioFilteredItems {
                 items,
-                layout_items,
                 removal_mask,
                 removed_pages,
             } = select_items_with_document_folio_context(
@@ -4340,7 +4446,7 @@ fn process_document(
             let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
             let layout = compute_layout_complexity_with_chart_regions(
                 &items,
-                &layout_items,
+                &removal_mask,
                 &rects,
                 &lines,
                 &chart_regions,
@@ -4528,7 +4634,9 @@ fn page_ocr_reason(reasons_by_page: &BTreeMap<u32, Vec<String>>, page: u32) -> O
         .cloned()
 }
 
-fn page_ocr_reasons_vec(reasons_by_page: BTreeMap<u32, Vec<String>>) -> Vec<PageOcrReasons> {
+pub(crate) fn page_ocr_reasons_vec(
+    reasons_by_page: BTreeMap<u32, Vec<String>>,
+) -> Vec<PageOcrReasons> {
     reasons_by_page
         .into_iter()
         .map(|(page, reasons)| PageOcrReasons { page, reasons })
@@ -6125,7 +6233,6 @@ mod looks_like_partial_table_tests {
 
 struct FolioFilteredItems {
     items: Vec<types::TextItem>,
-    layout_items: Vec<types::TextItem>,
     removal_mask: Vec<bool>,
     removed_pages: HashSet<u32>,
 }
@@ -6137,19 +6244,15 @@ fn select_items_with_document_folio_context(
     page_count: u32,
     page_filter: Option<&HashSet<u32>>,
 ) -> FolioFilteredItems {
-    let (all_layout_items, all_removed_pages, all_removal_mask) =
-        extractor::filter_markdown_page_numbers_with_removed_pages(all_items.clone(), page_count);
+    let (all_removed_pages, all_removal_mask) =
+        extractor::markdown_page_number_removals(&all_items, page_count);
     let selected_page = |page: u32| page_filter.is_none_or(|filter| filter.contains(&page));
 
-    let (items, removal_mask) = all_items
-        .into_iter()
-        .zip(all_removal_mask)
-        .filter(|(item, _)| selected_page(item.page))
-        .unzip();
-    let layout_items = all_layout_items
-        .into_iter()
-        .filter(|item| selected_page(item.page))
-        .collect();
+    // Filtered in place, in lockstep, so no second item buffer is built.
+    let (mut items, mut removal_mask) = (all_items, all_removal_mask);
+    let mut item_pages = items.iter().map(|item| item.page);
+    removal_mask.retain(|_| item_pages.next().is_some_and(selected_page));
+    items.retain(|item| selected_page(item.page));
     let removed_pages = all_removed_pages
         .into_iter()
         .filter(|page| selected_page(*page))
@@ -6157,7 +6260,6 @@ fn select_items_with_document_folio_context(
 
     FolioFilteredItems {
         items,
-        layout_items,
         removal_mask,
         removed_pages,
     }
@@ -6167,23 +6269,47 @@ fn select_items_with_document_folio_context(
 #[cfg(test)]
 fn compute_layout_complexity(
     items: &[types::TextItem],
-    column_items: &[types::TextItem],
+    page_number_removal_mask: &[bool],
     rects: &[types::PdfRect],
     lines: &[types::PdfLine],
 ) -> LayoutComplexity {
     let page_chart_regions = markdown::chart_regions_by_page(items, rects, lines);
     compute_layout_complexity_with_chart_regions(
         items,
-        column_items,
+        page_number_removal_mask,
         rects,
         lines,
         &page_chart_regions,
     )
 }
 
+/// Contiguous per-page runs of page-tagged values, for zero-copy page
+/// slices. Extraction accumulates values page by page, so a page is
+/// normally exactly one run; a page split across several runs maps to
+/// `None` and callers take their collecting path instead. A page with no
+/// values is absent from the map.
+pub(crate) fn single_page_runs<T>(
+    values: &[T],
+    page_of: impl Fn(&T) -> u32,
+) -> HashMap<u32, Option<std::ops::Range<usize>>> {
+    let mut runs: HashMap<u32, Option<std::ops::Range<usize>>> = HashMap::new();
+    let mut index = 0;
+    while index < values.len() {
+        let page = page_of(&values[index]);
+        let start = index;
+        while index < values.len() && page_of(&values[index]) == page {
+            index += 1;
+        }
+        runs.entry(page)
+            .and_modify(|run| *run = None)
+            .or_insert(Some(start..index));
+    }
+    runs
+}
+
 fn compute_layout_complexity_with_chart_regions(
     items: &[types::TextItem],
-    column_items: &[types::TextItem],
+    page_number_removal_mask: &[bool],
     rects: &[types::PdfRect],
     lines: &[types::PdfLine],
     page_chart_regions: &markdown::PageChartRegions,
@@ -6195,6 +6321,10 @@ fn compute_layout_complexity_with_chart_regions(
     seen_pages.sort();
     seen_pages.dedup();
 
+    let item_runs = single_page_runs(items, |item| item.page);
+    let rect_runs = single_page_runs(rects, |rect| rect.page);
+    let line_runs = single_page_runs(lines, |line| line.page);
+
     let font_stats = calculate_font_stats_from_items(items);
     let base_size = font_stats.most_common_size;
 
@@ -6202,12 +6332,19 @@ fn compute_layout_complexity_with_chart_regions(
     //     with side-by-side band splitting ---
     let mut pages_with_tables: Vec<u32> = Vec::new();
     for &page in &seen_pages {
-        let page_items: Vec<&types::TextItem> = items.iter().filter(|i| i.page == page).collect();
+        let collected_items: Vec<types::TextItem>;
+        let page_items: &[types::TextItem] = match item_runs.get(&page) {
+            Some(Some(run)) => &items[run.clone()],
+            None => &[],
+            Some(None) => {
+                collected_items = items.iter().filter(|i| i.page == page).cloned().collect();
+                &collected_items
+            }
+        };
 
         // Check for side-by-side layout
-        let owned_items: Vec<types::TextItem> = page_items.iter().map(|i| (*i).clone()).collect();
-        let page_content_width = tables::content_width(&owned_items);
-        let bands = markdown::split_side_by_side(&owned_items);
+        let page_content_width = tables::content_width(page_items);
+        let bands = markdown::split_side_by_side(page_items);
         let chart_regions = page_chart_regions
             .get(&page)
             .map(Vec::as_slice)
@@ -6223,25 +6360,52 @@ fn compute_layout_complexity_with_chart_regions(
         let mut found_table = false;
         for &(x_lo, x_hi) in &band_ranges {
             let margin = 2.0;
-            let band_items: Vec<types::TextItem> = owned_items
-                .iter()
-                .filter(|item| {
-                    (x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin))
-                        && !markdown::item_is_in_chart_region(item, chart_regions)
-                })
-                .cloned()
-                .collect();
-
-            let band_rects: Vec<types::PdfRect> = if x_lo == f32::MIN {
-                rects.iter().filter(|r| r.page == page).cloned().collect()
+            let banded_items: Vec<types::TextItem>;
+            let band_items: &[types::TextItem] = if x_lo == f32::MIN && chart_regions.is_empty() {
+                // The sentinel band with no chart regions admits every item.
+                page_items
             } else {
-                markdown::filter_rects_to_band(rects, page, x_lo, x_hi)
+                banded_items = page_items
+                    .iter()
+                    .filter(|item| {
+                        (x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin))
+                            && !markdown::item_is_in_chart_region(item, chart_regions)
+                    })
+                    .cloned()
+                    .collect();
+                &banded_items
             };
 
-            let band_lines: Vec<types::PdfLine> = if x_lo == f32::MIN {
-                lines.iter().filter(|l| l.page == page).cloned().collect()
+            let collected_rects: Vec<types::PdfRect>;
+            let band_rects: &[types::PdfRect] = if x_lo == f32::MIN {
+                match rect_runs.get(&page) {
+                    Some(Some(run)) => &rects[run.clone()],
+                    None => &[],
+                    Some(None) => {
+                        collected_rects =
+                            rects.iter().filter(|r| r.page == page).cloned().collect();
+                        &collected_rects
+                    }
+                }
             } else {
-                markdown::filter_lines_to_band(lines, page, x_lo, x_hi)
+                collected_rects = markdown::filter_rects_to_band(rects, page, x_lo, x_hi);
+                &collected_rects
+            };
+
+            let collected_lines: Vec<types::PdfLine>;
+            let band_lines: &[types::PdfLine] = if x_lo == f32::MIN {
+                match line_runs.get(&page) {
+                    Some(Some(run)) => &lines[run.clone()],
+                    None => &[],
+                    Some(None) => {
+                        collected_lines =
+                            lines.iter().filter(|l| l.page == page).cloned().collect();
+                        &collected_lines
+                    }
+                }
+            } else {
+                collected_lines = markdown::filter_lines_to_band(lines, page, x_lo, x_hi);
+                &collected_lines
             };
 
             // TOC pages route through the table detector but render as flat
@@ -6251,19 +6415,19 @@ fn compute_layout_complexity_with_chart_regions(
             let has_data_table =
                 |tables: &[tables::Table]| tables.iter().any(|t| t.kind == tables::TableKind::Data);
 
-            let (rect_tables, _) = tables::detect_tables_from_rects(&band_items, &band_rects, page);
+            let (rect_tables, _) = tables::detect_tables_from_rects(band_items, band_rects, page);
             if has_data_table(&rect_tables) {
                 found_table = true;
                 break;
             }
-            let line_tables = tables::detect_tables_from_lines(&band_items, &band_lines, page);
+            let line_tables = tables::detect_tables_from_lines(band_items, band_lines, page);
             if has_data_table(&line_tables) {
                 found_table = true;
                 break;
             }
             // Heuristic fallback for borderless tables
             let heuristic_tables = tables::detect_tables_with_page_width(
-                &band_items,
+                band_items,
                 base_size,
                 false,
                 page_content_width,
@@ -6284,15 +6448,47 @@ fn compute_layout_complexity_with_chart_regions(
             .get(&page)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let page_column_items: Vec<types::TextItem> = column_items
-            .iter()
-            .filter(|item| {
-                item.page == page && !markdown::item_is_in_chart_region(item, chart_regions)
-            })
-            .cloned()
-            .collect();
-        let cols =
-            extractor::detect_columns(&page_column_items, page, pages_with_tables.contains(&page));
+        let collected_items: Vec<types::TextItem>;
+        let collected_removed: Vec<bool>;
+        let (page_items, page_removed): (&[types::TextItem], &[bool]) = match item_runs.get(&page) {
+            Some(Some(run)) => (&items[run.clone()], &page_number_removal_mask[run.clone()]),
+            None => (&[], &[]),
+            Some(None) => {
+                (collected_items, collected_removed) = items
+                    .iter()
+                    .zip(page_number_removal_mask)
+                    .filter(|(item, _)| item.page == page)
+                    .map(|(item, removed)| (item.clone(), *removed))
+                    .unzip();
+                (&collected_items, &collected_removed)
+            }
+        };
+        // Column evidence is the page's items minus removed folios and chart
+        // text, built per page so no folio-cleaned copy of the document is
+        // ever held.
+        let collected_columns: Vec<types::TextItem>;
+        let page_column_items: &[types::TextItem] =
+            if chart_regions.is_empty() && !page_removed.contains(&true) {
+                page_items
+            } else {
+                collected_columns = page_items
+                    .iter()
+                    .zip(page_removed)
+                    .filter(|&(item, &removed)| {
+                        !removed
+                            && (chart_regions.is_empty()
+                                || !markdown::item_is_in_chart_region(item, chart_regions))
+                    })
+                    .map(|(item, _)| item.clone())
+                    .collect();
+                &collected_columns
+            };
+        // Pages are visited in ascending order, so the table pages are sorted.
+        let cols = extractor::detect_columns(
+            page_column_items,
+            page,
+            pages_with_tables.binary_search(&page).is_ok(),
+        );
         if cols.len() >= 2 {
             pages_with_columns.push(page);
         }
@@ -6541,11 +6737,11 @@ mod tests {
             test_item("1", 25.0, 20.0, 12.0, 10.0),
             test_item("2", 520.0, 60.0, 12.0, 10.0),
         ];
-        let (filtered, _, _) =
+        let (filtered, _, removal_mask) =
             extractor::filter_markdown_page_numbers_with_removed_pages(items.clone(), 1);
         assert!(filtered.is_empty());
 
-        let filtered = compute_layout_complexity(&items, &filtered, &[], &[]);
+        let filtered = compute_layout_complexity(&items, &removal_mask, &[], &[]);
 
         assert!(!filtered.is_complex);
         assert!(filtered.pages_with_tables.is_empty());
@@ -6607,7 +6803,8 @@ mod tests {
             page: 1,
         }];
 
-        let complexity = compute_layout_complexity(&items, &items, &rects, &lines);
+        let complexity =
+            compute_layout_complexity(&items, &vec![false; items.len()], &rects, &lines);
 
         assert!(complexity.pages_with_tables.is_empty());
     }
@@ -6634,9 +6831,9 @@ mod tests {
             .filter(|item| item.page == 1)
             .cloned()
             .collect();
-        let (page_local_layout, _, _) =
+        let (_, _, page_local_mask) =
             extractor::filter_markdown_page_numbers_with_removed_pages(page_one_items.clone(), 4);
-        let page_local = compute_layout_complexity(&page_one_items, &page_local_layout, &[], &[]);
+        let page_local = compute_layout_complexity(&page_one_items, &page_local_mask, &[], &[]);
         assert!(
             page_local.pages_with_columns.contains(&1),
             "fixture must reproduce page-local folio column evidence"
@@ -6653,7 +6850,7 @@ mod tests {
             8
         );
         let document_wide =
-            compute_layout_complexity(&selected.items, &selected.layout_items, &[], &[]);
+            compute_layout_complexity(&selected.items, &selected.removal_mask, &[], &[]);
         assert!(!document_wide.pages_with_columns.contains(&1));
     }
 

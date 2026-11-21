@@ -36,7 +36,7 @@ use crate::types::TextLine;
 /// - Rows of three-plus item clusters stay: figure label rows and table rows
 ///   share a baseline but are not one text run.
 /// - The block's total text must be short (<= 90 chars) and non-structural.
-fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
+pub(crate) fn strip_edge_furniture(lines: Vec<TextLine>) -> Vec<TextLine> {
     const MIN_PAGE_LINES: usize = 8;
     const MAX_EDGE_BLOCK_LINES: usize = 2;
     const ISOLATION_FACTOR: f32 = 1.8;
@@ -460,6 +460,10 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         band_y_positions.entry(normalized).or_default().push(band_y);
     }
 
+    // How far, as a share of the average page span, a line may sit from a
+    // running line's usual Y and still be in its slot.
+    const RUNNING_Y_TOLERANCE: f32 = 0.05;
+
     // Compute threshold
     let threshold = 3u32.max(page_count * 30 / 100);
 
@@ -475,7 +479,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         let mean = pos.iter().sum::<f32>() / n;
         let variance = pos.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / n;
         let stddev = variance.sqrt();
-        stddev / avg_span < 0.05
+        stddev / avg_span < RUNNING_Y_TOLERANCE
     };
 
     // Identify candidates from individual frequency map
@@ -510,12 +514,30 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
     //   (b) its Y-band's coalesced text matches a band candidate, OR
     //   (c) any sibling in its Y-band was removed (propagation).
     //
-    // The first occurrence (lowest page number) of each repeated header/footer
-    // is kept so that document titles, column headers, etc. appear once.
+    // Every copy after the first page is removed. The first page's copy is
+    // removed only when it sits in the slot the later copies share: a line
+    // elsewhere on that page with the same text is the document's own (a
+    // title set in the body, a table's column header) and is kept once.
     let mut removal_set: HashSet<usize> = HashSet::new();
+    let running_copies = |occurrences: &[(Vec<usize>, u32, f32)], first: u32| -> Vec<usize> {
+        let later_ys: Vec<f32> = occurrences
+            .iter()
+            .filter(|(_, page, _)| *page > first)
+            .map(|(_, _, y)| *y)
+            .collect();
+        let slot_y =
+            (!later_ys.is_empty()).then(|| later_ys.iter().sum::<f32>() / later_ys.len() as f32);
+        occurrences
+            .iter()
+            .filter(|(_, page, y)| {
+                *page > first
+                    || slot_y.is_some_and(|slot| (y - slot).abs() / avg_span < RUNNING_Y_TOLERANCE)
+            })
+            .flat_map(|(indices, _, _)| indices.iter().copied())
+            .collect()
+    };
 
-    // Track which page first shows each candidate (to preserve first occurrence)
-    let mut first_page_individual: HashMap<String, u32> = HashMap::new();
+    let mut occurrences_individual: HashMap<String, Vec<(Vec<usize>, u32, f32)>> = HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
         if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
             continue;
@@ -531,13 +553,20 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         }
         let normalized = normalize_for_comparison(&text);
         if candidates.contains(&normalized) {
-            let first = first_page_individual.entry(normalized).or_insert(line.page);
-            if line.page > *first {
-                removal_set.insert(idx);
-            } else if line.page == *first {
-                // Keep this occurrence (first page)
-            }
+            occurrences_individual.entry(normalized).or_default().push((
+                vec![idx],
+                line.page,
+                line.y,
+            ));
         }
+    }
+    for occurrences in occurrences_individual.values() {
+        let first = occurrences
+            .iter()
+            .map(|(_, page, _)| *page)
+            .min()
+            .unwrap_or(0);
+        removal_set.extend(running_copies(occurrences, first));
     }
 
     // Track first page for band candidates
@@ -559,7 +588,8 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             }
         }
     }
-    // Second pass: mark for removal (skip first page)
+    // Second pass: mark for removal
+    let mut occurrences_band: HashMap<String, Vec<(Vec<usize>, u32, f32)>> = HashMap::new();
     for (&(page, y_bucket), indices) in &y_bands {
         if indices.len() < 2 || protected_bands.contains(&(page, y_bucket)) {
             continue;
@@ -573,13 +603,15 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
             continue;
         }
         if band_candidates.contains(&normalized) {
-            let first = first_page_band.get(&normalized).copied().unwrap_or(0);
-            if page > first {
-                for &idx in &sorted_indices {
-                    removal_set.insert(idx);
-                }
-            }
+            occurrences_band
+                .entry(normalized)
+                .or_default()
+                .push((sorted_indices, page, band_y));
         }
+    }
+    for (normalized, occurrences) in &occurrences_band {
+        let first = first_page_band.get(normalized).copied().unwrap_or(0);
+        removal_set.extend(running_copies(occurrences, first));
     }
 
     // (c) Y-band sibling propagation: if any member is removed, remove all
@@ -1074,8 +1106,8 @@ mod tests {
                 .iter()
                 .filter(|l| l.text().contains("Annual Review Overview"))
                 .count(),
-            1,
-            "Unicode-numbered running header must strip to its first occurrence"
+            0,
+            "Unicode-numbered running header must strip from every page, its first included"
         );
     }
 
@@ -1296,13 +1328,18 @@ mod tests {
             .iter()
             .filter(|l| l.text().contains("VOICE OF SOUTH MARION"))
             .count();
-        assert_eq!(header_count, 1, "repeated header should be kept once");
+        assert_eq!(
+            header_count, 0,
+            "a header in the same slot on every page is not kept"
+        );
 
-        // First occurrence should be on page 1
+        // No copy survives, page 1's included
         let first_header = result
             .iter()
-            .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
-            .unwrap();
-        assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
+            .find(|l| l.text().contains("VOICE OF SOUTH MARION"));
+        assert!(
+            first_header.is_none(),
+            "page 1's copy sits in the running slot too"
+        );
     }
 }

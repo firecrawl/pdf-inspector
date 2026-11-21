@@ -1,31 +1,32 @@
-//! Bounded content-stream decoding.
+//! Bounded content-stream reading.
 //!
-//! `lopdf::content::Content::decode` materializes every operator before any
-//! caller can apply a limit. A compact page of `q Q` pairs can therefore
-//! allocate hundreds of megabytes and abort. Count operators first (without
-//! allocating `Operation` objects) and skip decode when the cap is exceeded.
+//! A compact page of `q Q` pairs can carry millions of operators; walking
+//! it unbounded costs time even when it allocates nothing. Count operators
+//! first (without allocating `Operation` / `Object` values) and skip the
+//! stream when the cap is exceeded, so skip decisions stay independent of
+//! how far a reader would get.
 
-use crate::PdfError;
-use lopdf::content::Content;
+use lopdf::content::ContentOperations;
 
-/// Maximum content-stream operators decoded for a page or a single Form
+/// Maximum content-stream operators read for a page or a single Form
 /// XObject. Matches the previous post-decode skip threshold.
 pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
 
-/// Decode `data` unless it contains more than `max_operations` operators.
+/// Stream `data`'s operations unless it contains more than
+/// `max_operations` operators.
 ///
-/// Returns `Ok(None)` when the stream exceeds the cap, so callers can skip
-/// extraction without first allocating the operation vector.
-pub(crate) fn decode_content_bounded(
+/// Returns `None` when the stream exceeds the cap, so callers can skip
+/// extraction. Construction cannot fail: a stream that whole-stream
+/// decoding would refuse surfaces as a poisoned reader after its last
+/// parseable operation, and callers must then discard what it yielded.
+pub(crate) fn stream_content_bounded(
     data: &[u8],
     max_operations: usize,
-) -> Result<Option<Content>, PdfError> {
+) -> Option<ContentOperations<'_>> {
     if content_exceeds_operation_limit(data, max_operations) {
-        return Ok(None);
+        return None;
     }
-    Content::decode(data)
-        .map(Some)
-        .map_err(|e| PdfError::Parse(e.to_string()))
+    Some(ContentOperations::new(data))
 }
 
 fn content_exceeds_operation_limit(data: &[u8], max_operations: usize) -> bool {
@@ -191,6 +192,7 @@ fn skip_inline_image_after_bi(data: &[u8], mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::content::Content;
 
     fn lopdf_op_count(data: &[u8]) -> usize {
         Content::decode(data)
@@ -277,9 +279,14 @@ mod tests {
         for _ in 0..20 {
             data.extend_from_slice(b"q Q\n");
         }
-        assert!(decode_content_bounded(&data, 10).unwrap().is_none());
-        let decoded = decode_content_bounded(&data, 50).unwrap().unwrap();
-        assert_eq!(decoded.operations.len(), 40);
+        assert!(stream_content_bounded(&data, 10).is_none());
+        let mut ops = stream_content_bounded(&data, 50).unwrap();
+        let mut yielded = 0;
+        while ops.advance() {
+            yielded += 1;
+        }
+        assert!(!ops.poisoned());
+        assert_eq!(yielded, 40);
     }
 
     #[test]
@@ -321,8 +328,6 @@ mod tests {
             data.extend_from_slice(b"q\n");
         }
         assert!(content_exceeds_operation_limit(&data, MAX_PAGE_OPERATIONS));
-        assert!(decode_content_bounded(&data, MAX_PAGE_OPERATIONS)
-            .unwrap()
-            .is_none());
+        assert!(stream_content_bounded(&data, MAX_PAGE_OPERATIONS).is_none());
     }
 }

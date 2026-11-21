@@ -10,7 +10,9 @@
 //! Repeated same-span rules are treated as table/form rulings rather than
 //! underlines, which avoids marking every cell in ruled tables.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashSet};
+use std::ops::Range;
 
 use crate::types::{ItemType, PdfRect, TextItem};
 
@@ -136,9 +138,46 @@ fn discard_repeated_ruling_rules(
         return rules;
     }
 
+    // Sorted views turn each predicate's whole-slice peer rescan into a
+    // binary-searched window; pages dense with drawn rulings (surveys,
+    // form grids) otherwise pay rules x rules and rules x items.
+    let mut by_y: Vec<usize> = (0..rules.len()).collect();
+    by_y.sort_by(|&a, &b| rules[a].y.total_cmp(&rules[b].y));
+    let ys: Vec<f32> = by_y.iter().map(|&i| rules[i].y).collect();
+
+    let mut by_x1: Vec<usize> = (0..rules.len()).collect();
+    by_x1.sort_by(|&a, &b| rules[a].x1.total_cmp(&rules[b].x1));
+    let x1s: Vec<f32> = by_x1.iter().map(|&i| rules[i].x1).collect();
+
+    let mut candidates: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_underline_candidate(item))
+        .map(|(index, _)| index)
+        .collect();
+    candidates.sort_by(|&a, &b| items[a].y.total_cmp(&items[b].y));
+    let candidate_ys: Vec<f32> = candidates.iter().map(|&i| items[i].y).collect();
+    // rule_matches_item looks down by (0.72 x font size).max(3pt); the page
+    // maximum bounds every per-item window.
+    let max_below = candidates
+        .iter()
+        .map(|&i| (items[i].font_size * 0.72).max(3.0))
+        .fold(3.0_f32, f32::max);
+
+    let page_rects = flanking_page_rects(rects, page);
+
+    // Reused across the per-rule predicate calls: drawing-heavy pages run
+    // them tens of thousands of times, and a fresh working vector per call
+    // was this file's dominant allocation churn.
+    let mut peer_scratch: Vec<usize> = Vec::new();
+    let mut level_scratch: Vec<f32> = Vec::new();
+
+    let segmented = segmented_row_rules(&rules, &by_y, &ys);
+
     rules
         .iter()
-        .filter(|rule| {
+        .enumerate()
+        .filter(|&(index, rule)| {
             // A rule snugly owned by one text line is an underline even when
             // span-similar rules repeat down the page — documents that
             // underline many full-width lines (dense CJK business docs) look
@@ -150,13 +189,33 @@ fn discard_repeated_ruling_rules(
             // Same-row segmented rules (column-header separators) are
             // always rulings — each segment snugly owns its column label,
             // so snugness must not override that check.
-            !is_segmented_row_ruling_rule(rule, &rules)
-                && ((has_snug_text_owner(rule, items)
-                    && !has_flanking_verticals(rule, rects, lines, page))
-                    || !is_repeated_ruling_rule(rule, &rules))
+            !segmented[index]
+                && ((has_snug_text_owner(
+                    rule,
+                    items,
+                    &candidates,
+                    &candidate_ys,
+                    max_below,
+                    &mut peer_scratch,
+                ) && !has_flanking_verticals(rule, &page_rects, lines, page))
+                    || !is_repeated_ruling_rule(rule, &rules, &by_x1, &x1s, &mut level_scratch))
         })
-        .cloned()
+        .map(|(_, rule)| rule.clone())
         .collect()
+}
+
+/// Widening added to every window bound; see `key_window`.
+const WINDOW_MARGIN: f32 = 0.5;
+
+/// Half-open index range of `keys` (sorted ascending) whose values lie in
+/// `[lo, hi]`. Callers widen the bounds by [`WINDOW_MARGIN`] and re-apply
+/// their exact predicate to every element: the window only has to be a
+/// superset, so float rounding in the bound arithmetic cannot change which
+/// peers a predicate accepts (page coordinates round at well under 0.5pt).
+fn key_window(keys: &[f32], lo: f32, hi: f32) -> Range<usize> {
+    let start = keys.partition_point(|&key| key < lo);
+    let end = keys.partition_point(|&key| key <= hi);
+    start..end
 }
 
 /// True when a single text item both matches the rule vertically (baseline
@@ -169,17 +228,9 @@ fn discard_repeated_ruling_rules(
 /// rules rising from their ends. Checked against raw stroked lines: a
 /// near-vertical segment whose x sits at either end of the rule and whose
 /// y-range covers the rule's row.
-fn has_flanking_verticals(
-    rule: &Rule,
-    rects: &[PdfRect],
-    lines: &[UnderlineLine],
-    page: u32,
-) -> bool {
-    // A drawn rect that CONTAINS the rule vetoes rescue only with GRID
-    // EVIDENCE: another drawn rect abutting it vertically (cell rows tile).
-    // Height alone can't separate a table cell from a decorative callout
-    // panel — genuine underlines live inside isolated filled panels, and
-    // multiline table cells can be arbitrarily tall.
+/// The drawn boxes `has_flanking_verticals` tests against, normalized and
+/// built once per page instead of once per rule.
+fn flanking_page_rects(rects: &[PdfRect], page: u32) -> Vec<(f32, f32, f32, f32)> {
     let norm = |r: &PdfRect| {
         let (x_lo, x_hi) = if r.width >= 0.0 {
             (r.x, r.x + r.width)
@@ -193,11 +244,24 @@ fn has_flanking_verticals(
         };
         (x_lo, x_hi, y_lo, y_hi)
     };
-    let page_rects: Vec<(f32, f32, f32, f32)> = rects
+    rects
         .iter()
         .filter(|r| r.page == page && r.height.abs() > 6.0)
         .map(norm)
-        .collect();
+        .collect()
+}
+
+fn has_flanking_verticals(
+    rule: &Rule,
+    page_rects: &[(f32, f32, f32, f32)],
+    lines: &[UnderlineLine],
+    page: u32,
+) -> bool {
+    // A drawn rect that CONTAINS the rule vetoes rescue only with GRID
+    // EVIDENCE: another drawn rect abutting it vertically (cell rows tile).
+    // Height alone can't separate a table cell from a decorative callout
+    // panel — genuine underlines live inside isolated filled panels, and
+    // multiline table cells can be arbitrarily tall.
     let rect_flank = page_rects.iter().any(|&(x_lo, x_hi, y_lo, y_hi)| {
         let contains = x_lo <= rule.x1 + 2.0
             && x_hi >= rule.x2 - 2.0
@@ -236,74 +300,200 @@ fn has_flanking_verticals(
     })
 }
 
-fn has_snug_text_owner(rule: &Rule, items: &[TextItem]) -> bool {
+fn has_snug_text_owner(
+    rule: &Rule,
+    items: &[TextItem],
+    candidates: &[usize],
+    candidate_ys: &[f32],
+    max_below: f32,
+    scratch: &mut Vec<usize>,
+) -> bool {
     // Underlines are drawn to the width of the text they decorate, but the
     // text may be split into several runs (CJK lines mix scripts and font
     // switches) — so ownership is judged against the UNION of the runs on
     // the rule's baseline row. Table/form rulings overshoot their row's
     // text (row separators span cell padding and empty columns), so they
     // fail either containment or coverage.
-    let matched: Vec<&TextItem> = items
-        .iter()
-        .filter(|item| is_underline_candidate(item) && rule_matches_item(rule, item))
-        .collect();
-    if matched.is_empty() {
+    // rule_matches_item accepts item.y in [rule.y - 1, rule.y + below(item)]
+    // and below(item) <= max_below, so the window is a superset.
+    let span = key_window(
+        candidate_ys,
+        rule.y - 1.0 - WINDOW_MARGIN,
+        rule.y + max_below + WINDOW_MARGIN,
+    );
+    scratch.clear();
+    scratch.extend(
+        candidates[span]
+            .iter()
+            .copied()
+            .filter(|&index| rule_matches_item(rule, &items[index])),
+    );
+    if scratch.is_empty() {
         return false;
     }
-    let x1 = matched.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
-    let x2 = matched
+    // Original item order: the f32 coverage sum depends on it.
+    scratch.sort_unstable();
+    let matched = |index: &usize| &items[*index];
+    let x1 = scratch
         .iter()
+        .map(matched)
+        .map(|i| i.x)
+        .fold(f32::INFINITY, f32::min);
+    let x2 = scratch
+        .iter()
+        .map(matched)
         .map(|i| i.x + i.width)
         .fold(f32::NEG_INFINITY, f32::max);
-    let max_fs = matched.iter().map(|i| i.font_size).fold(0.0, f32::max);
+    let max_fs = scratch
+        .iter()
+        .map(matched)
+        .map(|i| i.font_size)
+        .fold(0.0, f32::max);
     let pad = (max_fs * 0.75).max(4.0);
     if rule.x1 < x1 - pad || rule.x2 > x2 + pad {
         return false;
     }
-    let covered: f32 = matched.iter().map(|i| i.width).sum();
+    let covered: f32 = scratch.iter().map(matched).map(|i| i.width).sum();
     if covered < rule.width() * 0.6 {
         return false;
     }
     // A table row also unions to the rule's span — but its cells sit apart.
     // An underlined text line is contiguous runs with word-sized gaps; any
     // column-sized hole between matched runs means this is a row ruling.
-    let mut sorted = matched;
-    sorted.sort_by(|a, b| a.x.total_cmp(&b.x));
-    sorted.windows(2).all(|pair| {
-        let gap = pair[1].x - (pair[0].x + pair[0].width);
+    // Sorting by (x, index) equals the previous stable x sort over the
+    // index-ordered set.
+    scratch.sort_unstable_by(|&a, &b| items[a].x.total_cmp(&items[b].x).then(a.cmp(&b)));
+    scratch.windows(2).all(|pair| {
+        let (left, right) = (&items[pair[0]], &items[pair[1]]);
+        let gap = right.x - (left.x + left.width);
         gap <= (max_fs * 2.0).max(12.0)
     })
 }
 
-fn is_repeated_ruling_rule(rule: &Rule, rules: &[Rule]) -> bool {
-    let mut y_levels: Vec<f32> = rules
-        .iter()
-        .filter(|other| has_similar_span(rule, other))
-        .map(|other| other.y)
-        .collect();
+fn is_repeated_ruling_rule(
+    rule: &Rule,
+    rules: &[Rule],
+    by_x1: &[usize],
+    x1s: &[f32],
+    levels: &mut Vec<f32>,
+) -> bool {
+    // A similar-span peer overlaps the rule and is at most
+    // RULE_SPAN_WIDTH_RATIO wider, so its left edge lies in this window.
+    // y_levels' order does not matter: it is sorted before dedup.
+    let span = key_window(
+        x1s,
+        rule.x1 - rule.width() * RULE_SPAN_WIDTH_RATIO - WINDOW_MARGIN,
+        rule.x2 + WINDOW_MARGIN,
+    );
+    levels.clear();
+    levels.extend(
+        by_x1[span]
+            .iter()
+            .filter(|&&index| has_similar_span(rule, &rules[index]))
+            .map(|&index| rules[index].y),
+    );
 
-    y_levels.sort_by(|a, b| a.total_cmp(b));
-    y_levels.dedup_by(|a, b| (*a - *b).abs() <= RULE_Y_DEDUP_EPS);
-    y_levels.len() >= MIN_REPEATED_RULE_LEVELS
+    levels.sort_by(|a, b| a.total_cmp(b));
+    levels.dedup_by(|a, b| (*a - *b).abs() <= RULE_Y_DEDUP_EPS);
+    levels.len() >= MIN_REPEATED_RULE_LEVELS
 }
 
-fn is_segmented_row_ruling_rule(rule: &Rule, rules: &[Rule]) -> bool {
-    let mut row_rules: Vec<&Rule> = rules
-        .iter()
-        .filter(|other| (other.y - rule.y).abs() <= RULE_Y_DEDUP_EPS)
-        .collect();
+/// A rule in a row set, ordered by left edge then index so equal edges
+/// order the same way on every run.
+#[derive(Clone, Copy)]
+struct RowMember {
+    x1: f32,
+    index: usize,
+}
 
-    if row_rules.len() < MIN_SEGMENTED_ROW_RULES {
-        return false;
+impl PartialEq for RowMember {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
     }
+}
 
-    row_rules.sort_by(|a, b| a.x1.total_cmp(&b.x1));
-    let large_gaps = row_rules
-        .windows(2)
-        .filter(|pair| pair[1].x1 - pair[0].x2 > SEGMENTED_ROW_GAP_MIN)
-        .count();
+impl Eq for RowMember {}
 
-    large_gaps >= MIN_SEGMENTED_ROW_GAPS
+impl PartialOrd for RowMember {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowMember {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.x1
+            .total_cmp(&other.x1)
+            .then(self.index.cmp(&other.index))
+    }
+}
+
+/// Per rule index: whether the rule's row reads as segmented column-header
+/// separators. A rule's row is every rule within `RULE_Y_DEDUP_EPS` of its
+/// y; the row is segmented when it holds at least
+/// `MIN_SEGMENTED_ROW_RULES` rules and, ordered by left edge, at least
+/// `MIN_SEGMENTED_ROW_GAPS` neighbours leave a gap wider than
+/// `SEGMENTED_ROW_GAP_MIN`. One sweep in y order slides the row window,
+/// keeping its members in left-edge order and the wide-gap count current as
+/// rules enter and leave, so a row of k rules costs O(k log k) rather than
+/// a sort per rule. A rule with a non-finite y belongs to no row.
+fn segmented_row_rules(rules: &[Rule], by_y: &[usize], ys: &[f32]) -> Vec<bool> {
+    let mut segmented = vec![false; rules.len()];
+    let first = ys.iter().position(|y| y.is_finite()).unwrap_or(ys.len());
+    let end = ys
+        .iter()
+        .rposition(|y| y.is_finite())
+        .map_or(first, |last| last + 1);
+
+    let wide_gap = |left: RowMember, right: RowMember| {
+        usize::from(rules[right.index].x1 - rules[left.index].x2 > SEGMENTED_ROW_GAP_MIN)
+    };
+    let member = |position: usize| RowMember {
+        x1: rules[by_y[position]].x1,
+        index: by_y[position],
+    };
+
+    let mut row: BTreeSet<RowMember> = BTreeSet::new();
+    let mut wide_gaps = 0usize;
+    let (mut lo, mut hi) = (first, first);
+    for position in first..end {
+        let y = ys[position];
+        while hi < end && ys[hi] - y <= RULE_Y_DEDUP_EPS {
+            let entering = member(hi);
+            let before = row.range(..entering).next_back().copied();
+            let after = row.range(entering..).next().copied();
+            if let (Some(before), Some(after)) = (before, after) {
+                wide_gaps -= wide_gap(before, after);
+            }
+            if let Some(before) = before {
+                wide_gaps += wide_gap(before, entering);
+            }
+            if let Some(after) = after {
+                wide_gaps += wide_gap(entering, after);
+            }
+            row.insert(entering);
+            hi += 1;
+        }
+        while ys[lo] - y < -RULE_Y_DEDUP_EPS {
+            let leaving = member(lo);
+            row.remove(&leaving);
+            let before = row.range(..leaving).next_back().copied();
+            let after = row.range(leaving..).next().copied();
+            if let Some(before) = before {
+                wide_gaps -= wide_gap(before, leaving);
+            }
+            if let Some(after) = after {
+                wide_gaps -= wide_gap(leaving, after);
+            }
+            if let (Some(before), Some(after)) = (before, after) {
+                wide_gaps += wide_gap(before, after);
+            }
+            lo += 1;
+        }
+        segmented[by_y[position]] =
+            row.len() >= MIN_SEGMENTED_ROW_RULES && wide_gaps >= MIN_SEGMENTED_ROW_GAPS;
+    }
+    segmented
 }
 
 fn has_similar_span(a: &Rule, b: &Rule) -> bool {
@@ -324,23 +514,29 @@ fn has_similar_span(a: &Rule, b: &Rule) -> bool {
 
 fn tabular_row_separator_rule_indices(rules: &[Rule], items: &[TextItem]) -> HashSet<usize> {
     let mut tabular_rules = HashSet::new();
+    let mut matched: Vec<usize> = Vec::new();
 
     for (rule_idx, rule) in rules.iter().enumerate() {
-        let mut matched_items: Vec<&TextItem> = items
-            .iter()
-            .filter(|item| is_underline_candidate(item) && rule_matches_item(rule, item))
-            .collect();
+        matched.clear();
+        matched.extend(
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| is_underline_candidate(item) && rule_matches_item(rule, item))
+                .map(|(index, _)| index),
+        );
 
-        if matched_items.len() < MIN_TABULAR_RULE_ITEMS {
+        if matched.len() < MIN_TABULAR_RULE_ITEMS {
             continue;
         }
 
-        matched_items.sort_by(|a, b| a.x.total_cmp(&b.x));
-        let large_gaps = matched_items
+        // (x, index) ordering equals the previous stable x sort over the
+        // item-ordered set.
+        matched.sort_unstable_by(|&a, &b| items[a].x.total_cmp(&items[b].x).then(a.cmp(&b)));
+        let large_gaps = matched
             .windows(2)
             .filter(|pair| {
-                let left = pair[0];
-                let right = pair[1];
+                let (left, right) = (&items[pair[0]], &items[pair[1]]);
                 let gap = right.x - (left.x + left.width);
                 let font_size = left.font_size.max(right.font_size).max(1.0);
                 gap > font_size * TABULAR_RULE_GAP_EM

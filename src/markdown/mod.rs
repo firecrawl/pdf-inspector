@@ -14,14 +14,21 @@ mod heading;
 mod postprocess;
 mod preprocess;
 
+pub(crate) use classify::{is_caption_line, is_list_item, line_is_monospace};
 pub use convert::to_markdown_from_lines;
+pub(crate) use convert::{resolve_line_struct_role, struct_role_heading_level};
+pub(crate) use furniture::strip_edge_furniture;
+pub(crate) use heading::dominant_font_size;
+pub(crate) use postprocess::{join_decision, Join};
+pub(crate) use preprocess::{effective_heading_level, merge_heading_lines};
 
 use std::collections::{HashMap, HashSet};
 
+use crate::structure_tree::{StructTable, StructTableRow};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
-use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
+use classify::{format_list_item, is_code_like};
 use convert::{
     merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
     PositionedMarkdown,
@@ -136,19 +143,44 @@ pub(crate) fn chart_regions_by_page(
     rects: &[PdfRect],
     lines: &[PdfLine],
 ) -> PageChartRegions {
-    let mut page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
-    for item in items.iter().filter(|item| {
+    let is_text = |item: &&TextItem| {
         matches!(
             &item.item_type,
             crate::types::ItemType::Text | crate::types::ItemType::FormField
         )
-    }) {
-        page_items.entry(item.page).or_default().push(item.clone());
-    }
-
-    page_items
+    };
+    let item_runs = crate::single_page_runs(items, |item| item.page);
+    let rect_runs = crate::single_page_runs(rects, |rect| rect.page);
+    let line_runs = crate::single_page_runs(lines, |line| line.page);
+    item_runs
         .into_iter()
-        .filter_map(|(page, items)| {
+        .filter_map(|(page, run)| {
+            // One page's text items are held at a time, never a copy of the
+            // whole document's.
+            let items: Vec<TextItem> = match run {
+                Some(run) => items[run].iter().filter(is_text).cloned().collect(),
+                None => items
+                    .iter()
+                    .filter(|item| item.page == page)
+                    .filter(is_text)
+                    .cloned()
+                    .collect(),
+            };
+            if items.is_empty() {
+                return None;
+            }
+            // Both detectors keep only this page's geometry, so the page's
+            // run is the same input as the whole document's.
+            let rects = match rect_runs.get(&page) {
+                Some(Some(run)) => &rects[run.clone()],
+                Some(None) => rects,
+                None => &[],
+            };
+            let lines = match line_runs.get(&page) {
+                Some(Some(run)) => &lines[run.clone()],
+                Some(None) => lines,
+                None => &[],
+            };
             let rect_regions = crate::tables::detect_chart_regions(&items, rects, page);
             let line_regions = crate::tables::detect_dense_line_chart_regions(lines, rects, page)
                 .into_iter()
@@ -1547,14 +1579,29 @@ fn convert_items_with_rects_lines_and_table_output(
     let has_precomputed_page_number_mask = prefiltered_page_number_mask.is_some();
     let removed_page_number_pages = prefiltered_page_number_pages.cloned().unwrap_or_default();
 
-    // Separate images and links from text items
+    // Separate images and links from text items. Text items stay in the
+    // input allocation, in order; images and links are moved out of it.
     let mut images: Vec<TextItem> = Vec::new();
     let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut links: Vec<TextItem> = Vec::new();
-    let mut text_items: Vec<TextItem> = Vec::new();
+    let mut text_items: Vec<TextItem> = items;
     let mut text_item_page_number_mask: Vec<bool> = Vec::new();
 
-    for (input_index, item) in items.into_iter().enumerate() {
+    let mut input_index = 0;
+    let non_text = text_items.extract_if(.., |item| {
+        let is_text = matches!(item.item_type, ItemType::Text | ItemType::FormField);
+        if is_text {
+            text_item_page_number_mask.push(
+                prefiltered_page_number_mask
+                    .and_then(|mask| mask.get(input_index))
+                    .copied()
+                    .unwrap_or(false),
+            );
+        }
+        input_index += 1;
+        !is_text
+    });
+    for item in non_text {
         match &item.item_type {
             ItemType::Image => {
                 page_image_regions.entry(item.page).or_default().push((
@@ -1572,15 +1619,7 @@ fn convert_items_with_rects_lines_and_table_output(
                     links.push(item);
                 }
             }
-            ItemType::Text | ItemType::FormField => {
-                text_item_page_number_mask.push(
-                    prefiltered_page_number_mask
-                        .and_then(|mask| mask.get(input_index))
-                        .copied()
-                        .unwrap_or(false),
-                );
-                text_items.push(item);
-            }
+            ItemType::Text | ItemType::FormField => {}
         }
     }
 
@@ -1617,6 +1656,35 @@ fn convert_items_with_rects_lines_and_table_output(
 
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
+    let rect_runs = crate::single_page_runs(rects, |rect| rect.page);
+    let line_runs = crate::single_page_runs(pdf_lines, |line| line.page);
+
+    // Struct-table rows grouped by every page their cells reference, keeping
+    // table and row order, so each page's detection scans only its own rows.
+    let mut page_struct_tables: HashMap<u32, Vec<StructTable>> = HashMap::new();
+    let mut row_pages: Vec<u32> = Vec::new();
+    for st in struct_tables {
+        let mut rows_by_page: HashMap<u32, Vec<StructTableRow>> = HashMap::new();
+        for row in &st.rows {
+            row_pages.clear();
+            row_pages.extend(
+                row.cells
+                    .iter()
+                    .flat_map(|cell| cell.mcids.iter().map(|&(_, p)| p)),
+            );
+            row_pages.sort_unstable();
+            row_pages.dedup();
+            for &p in &row_pages {
+                rows_by_page.entry(p).or_default().push(row.clone());
+            }
+        }
+        for (p, rows) in rows_by_page {
+            page_struct_tables
+                .entry(p)
+                .or_default()
+                .push(StructTable { rows });
+        }
+    }
 
     // Track band splits per page so we can split non-table items later
     let mut page_band_splits: HashMap<u32, Vec<(f32, f32)>> = HashMap::new();
@@ -1629,6 +1697,18 @@ fn convert_items_with_rects_lines_and_table_output(
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
         let page_content_width = content_width(&page_items);
+        // Every use of rects and lines below keeps only this page's, so the
+        // page's run is the same input as the whole document's.
+        let rects = match rect_runs.get(&page) {
+            Some(Some(run)) => &rects[run.clone()],
+            Some(None) => rects,
+            None => &[],
+        };
+        let pdf_lines = match line_runs.get(&page) {
+            Some(Some(run)) => &pdf_lines[run.clone()],
+            Some(None) => pdf_lines,
+            None => &[],
+        };
 
         // Chart-bar regions: bar charts drawn as filled rects read as cell
         // rects or aligned text and get gridded into phantom tables. Their
@@ -1792,8 +1872,9 @@ fn convert_items_with_rects_lines_and_table_output(
             //    Only use struct-tree tables when they capture a majority (≥50%) of
             //    band items.  Incomplete struct trees (partial tagging) should fall
             //    through to geometry detection which sees all items.
-            if !struct_tables.is_empty() {
-                let st_tables = detect_tables_from_struct_tree(band_items, struct_tables, page);
+            if let Some(page_struct_tables) = page_struct_tables.get(&page) {
+                let st_tables =
+                    detect_tables_from_struct_tree(band_items, page_struct_tables, page);
                 for table in &st_tables {
                     let coverage = table.item_indices.len() as f32 / band_items.len().max(1) as f32;
                     if coverage < 0.5 {
@@ -2193,17 +2274,27 @@ fn convert_items_with_rects_lines_and_table_output(
         None
     };
 
-    // Filter out table items and process the rest
-    let non_table_items: Vec<(usize, TextItem)> = text_items
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, _)| !table_items.contains(idx))
-        .collect();
+    // Filter out table items and process the rest. Items and their folio
+    // mask are filtered in place, in step, so both stay aligned.
+    let mut non_table_items = text_items;
+    let mut non_table_page_number_mask = text_item_page_number_mask;
+    let mut index = 0;
+    non_table_page_number_mask.retain(|_| {
+        let keep = !table_items.contains(&index);
+        index += 1;
+        keep
+    });
+    let mut index = 0;
+    non_table_items.retain(|_| {
+        let keep = !table_items.contains(&index);
+        index += 1;
+        keep
+    });
 
     // Find pages that are table-only (no remaining non-table text)
     let table_only_pages: HashSet<u32> = {
         let mut pages_with_text: HashSet<u32> =
-            non_table_items.iter().map(|(_, item)| item.page).collect();
+            non_table_items.iter().map(|item| item.page).collect();
         // Preserve the pre-filter continuation classification: a page that
         // originally also contained a folio does not become table-only merely
         // because an upstream document-level pass removed it.
@@ -2223,14 +2314,12 @@ fn convert_items_with_rects_lines_and_table_output(
     let table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
 
     let non_table_items = if has_precomputed_page_number_mask {
+        let mut removed = non_table_page_number_mask.iter();
+        non_table_items.retain(|_| !removed.next().copied().unwrap_or(false));
         non_table_items
-            .into_iter()
-            .filter(|(index, _)| !text_item_page_number_mask[*index])
-            .map(|(_, item)| item)
-            .collect()
     } else {
         crate::extractor::filter_markdown_page_numbers_with_removed_pages(
-            non_table_items.into_iter().map(|(_, item)| item).collect(),
+            non_table_items,
             document_page_count,
         )
         .0
