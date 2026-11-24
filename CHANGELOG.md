@@ -7,7 +7,9 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
-## Unreleased
+## [1.27.1] - 2026-11-24
+
+Changes since 1.27.0.
 
 ### Fixed
 
@@ -16,10 +18,12 @@ version and date. Earlier releases are described in their
   subset whose glyphs decode to their ASCII codes no longer writes `2`
   for `\in`, `j` for `|` or `!` for `\rightarrow`. The rest of the
   symbol table is covered (`\{`, `\langle`, `\mathcal` capitals,
-  `\cup`, `\nabla`, ...), and `\mapsto` is read as one symbol.
+  `\cup`, `\nabla`, ...), and `\mapsto` is read as one symbol
+  ([#682](https://github.com/firecrawl/pdf-inspector/pull/682)).
 - `\phi` and `\varphi`, and `\epsilon` and `\varepsilon`, follow the
   glyph's Unicode value (ϕ is `\phi`, ϵ is `\epsilon`) in every font,
-  where Computer Modern fonts had them swapped.
+  where Computer Modern fonts had them swapped
+  ([#682](https://github.com/firecrawl/pdf-inspector/pull/682)).
 
 ## [1.27.0] - 2026-11-20
 
