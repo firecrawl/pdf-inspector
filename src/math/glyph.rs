@@ -60,13 +60,6 @@ pub(crate) fn is_extension(key: &str) -> bool {
     .any(|n| key.contains(n))
 }
 
-fn is_computer_modern(key: &str) -> bool {
-    ["cm", "lm", "ec", "msam", "msbm", "eufm", "rsfs"]
-        .iter()
-        .any(|p| key.starts_with(p))
-        || key.contains("latinmodern")
-}
-
 /// Fonts that set mathematics: the TeX families and the math faces of the
 /// common OpenType and Type 1 math sets. A text layer that an OCR engine
 /// wrote, or a page set in one text face, has few of these.
@@ -183,13 +176,23 @@ fn cmex_extent(code: u32) -> (f32, f32) {
     (0.04, depth - 0.04)
 }
 
+/// The stem TeX draws in front of an arrow to make `\mapsto` (OMS 0x37),
+/// carried as a private character until [`crate::math::latex`] joins it
+/// with the arrow that follows.
+pub(crate) const MAPSTO_STEM: char = '\u{F0000}';
+
 /// The character a code of TeX's math italic (OML), math symbol (OMS) or
 /// AMS symbol encoding draws, for fonts whose subset leaves the glyph
 /// unnamed.
 fn tex_encoding(key: &str, code: u32) -> Option<char> {
-    const OML: &str = "ΓΔΘΛΞΠΣΥΦΨΩαβγδεζηθικλμνξπρστυφχψωϵϑϖϱςϕ↼↽⇀⇁";
-    const OMS: &str =
-        "−·×∗÷⋄±∓⊕⊖⊗⊘⊙◯∘•≍≡⊆⊇≤≥⪯⪰∼≈⊂⊃≪≫≺≻←→↑↓↔↗↘≃⇐⇒⇑⇓⇔↖↙∝′∞∈∋△▽\u{338}\u{338}∀∃¬∅ℜℑ⊤⊥";
+    const OML: &str = concat!(
+        "ΓΔΘΛΞΠΣΥΦΨΩαβγδϵζηθικλμνξπρστυϕχψωεϑϖϱςφ↼↽⇀⇁↪↩▷◁0123456789.,</>⋆",
+        "∂ABCDEFGHIJKLMNOPQRSTUVWXYZ♭♮♯⌣⌢ℓabcdefghijklmnopqrstuvwxyzıȷ℘\u{20D7}⁀"
+    );
+    const OMS: &str = concat!(
+        "−·×∗÷⋄±∓⊕⊖⊗⊘⊙◯∘•≍≡⊆⊇≤≥⪯⪰∼≈⊂⊃≪≫≺≻←→↑↓↔↗↘≃⇐⇒⇑⇓⇔↖↙∝′∞∈∋△▽\u{338}\u{F0000}∀∃¬∅ℜℑ⊤⊥",
+        "ℵABCDEFGHIJKLMNOPQRSTUVWXYZ∪∩⊎∧∨⊢⊣⌊⌋⌈⌉{}⟨⟩|‖↕⇕\\≀√⨿∇∫⊔⊓⊑⊒§†‡¶♣♢♡♠"
+    );
     const MSAM: &str = "⊡⊞⊠□■⋅◊";
     let has = |names: &[&str]| names.iter().any(|n| key.contains(n));
     let table = if has(&["cmmi", "lmmi", "txmi", "pxmi", "rmtmi", "mathitalic"]) {
@@ -215,7 +218,8 @@ pub(crate) fn from_math_glyph(m: &MathGlyph) -> (Option<G>, bool) {
     let class = font_class(&key);
     let ex = class == FontClass::Extension;
     let mut text = m.text.clone();
-    if text.is_empty() || text.chars().any(is_unmapped) {
+    let passed_through = !m.to_unicode && m.code < 0x80 && text.chars().eq(char::from_u32(m.code));
+    if text.is_empty() || text.chars().any(is_unmapped) || passed_through {
         if let Some(c) = tex_encoding(&key, m.code) {
             text = c.to_string();
         }
@@ -224,17 +228,6 @@ pub(crate) fn from_math_glyph(m: &MathGlyph) -> (Option<G>, bool) {
         if let Some(c) = cmex(m.code) {
             text = c.to_string();
         }
-    } else if !is_computer_modern(&key) {
-        text = text
-            .chars()
-            .map(|c| match c {
-                'φ' => 'ϕ',
-                'ϕ' => 'φ',
-                'ε' => 'ϵ',
-                'ϵ' => 'ε',
-                c => c,
-            })
-            .collect();
     }
     if text.trim().is_empty() {
         return (None, text.is_empty());
@@ -261,4 +254,46 @@ pub(crate) fn from_math_glyph(m: &MathGlyph) -> (Option<G>, bool) {
         }),
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn glyph(font: &str, text: &str, code: u32) -> String {
+        glyph_with(font, text, code, false)
+    }
+
+    fn glyph_with(font: &str, text: &str, code: u32, to_unicode: bool) -> String {
+        let m = MathGlyph {
+            text: text.to_string(),
+            code,
+            font: font.to_string(),
+            x0: 0.0,
+            x1: 5.0,
+            base: 10.0,
+            size: 10.0,
+            invisible: false,
+            to_unicode,
+        };
+        from_math_glyph(&m).0.map(|g| g.c).unwrap_or_default()
+    }
+
+    #[test]
+    fn tex_symbol_codes_decoded_as_ascii_take_their_tex_symbol() {
+        assert_eq!(glyph("LOSMWZ+CMSY10", "2", 0x32), "∈");
+        assert_eq!(glyph("LOSMWZ+CMSY10", "j", 0x6A), "|");
+        assert_eq!(glyph("LOSMWZ+CMSY10", "f", 0x66), "{");
+        assert_eq!(glyph("LOSMWZ+CMSY10", "7", 0x37), MAPSTO_STEM.to_string());
+        assert_eq!(glyph("KYAZXS+CMMI10", ",", 0x2C), "↪");
+        assert_eq!(glyph("LOSMWZ+CMSY10", "N", 0x4E), "N");
+        assert_eq!(glyph("LOSMWZ+CMSY10", "∈", 0x32), "∈");
+        assert_eq!(glyph("KYAZXS+CMMI10", "@", 0x40), "∂");
+        assert_eq!(glyph("KYAZXS+CMMI10", "x", 0x78), "x");
+        assert_eq!(glyph("KYAZXS+CMMI10", "!", 0x21), "ω");
+        assert_eq!(glyph("KYAZXS+CMMI10", "", 0x1E), "ϕ");
+        assert_eq!(glyph("KYAZXS+CMMI10", "", 0x27), "φ");
+        assert_eq!(glyph("UBJNKM+CMR10", "2", 0x32), "2");
+        assert_eq!(glyph_with("OPTGWZ+txsys", "=", 0x3D, true), "=");
+    }
 }

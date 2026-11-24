@@ -19,7 +19,7 @@ use crate::tounicode::{CMapEntry, FontCMaps};
 use crate::types::{FontWidthInfo, PageFontEncodings, PageFontKinds, PageFontWidths};
 use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Encoding, Object, ObjectId, StringFormat};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 const MAX_FORM_DEPTH: u8 = 5;
@@ -39,6 +39,8 @@ pub(crate) struct MathGlyph {
     pub(crate) base: f32,
     pub(crate) size: f32,
     pub(crate) invisible: bool,
+    /// The font carries a ToUnicode map, so `text` is what it declares.
+    pub(crate) to_unicode: bool,
 }
 
 /// The frame a page's glyphs are reported in: user space turned by
@@ -96,6 +98,7 @@ struct PaintedGlyph {
     quarter_turns: u8,
     size: f32,
     invisible: bool,
+    to_unicode: bool,
 }
 
 #[derive(Clone)]
@@ -121,6 +124,7 @@ struct FontContext<'a> {
     tounicode_refs: HashMap<String, u32>,
     inline_cmaps: HashMap<String, CMapEntry>,
     encoding_cache: HashMap<String, Encoding<'a>>,
+    with_tounicode: HashSet<String>,
 }
 
 impl<'a> FontContext<'a> {
@@ -136,6 +140,7 @@ impl<'a> FontContext<'a> {
         let mut tounicode_refs = HashMap::new();
         let mut inline_cmaps = HashMap::new();
         let mut encoding_cache = HashMap::new();
+        let mut with_tounicode = HashSet::new();
         for (font_name, font_dict) in &fonts {
             let resource_name = String::from_utf8_lossy(font_name).to_string();
             if let Ok(name) = font_dict.get(b"BaseFont").and_then(Object::as_name) {
@@ -146,6 +151,9 @@ impl<'a> FontContext<'a> {
             }
             match font_dict.get(b"ToUnicode") {
                 Ok(Object::Reference(obj_ref)) => {
+                    if font_cmaps.get_by_obj(obj_ref.0).is_some() {
+                        with_tounicode.insert(resource_name.clone());
+                    }
                     tounicode_refs.insert(resource_name.clone(), obj_ref.0);
                 }
                 Ok(Object::Stream(s)) => {
@@ -155,6 +163,7 @@ impl<'a> FontContext<'a> {
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
+                        with_tounicode.insert(resource_name.clone());
                         inline_cmaps.insert(resource_name.clone(), entry);
                     }
                 }
@@ -179,6 +188,7 @@ impl<'a> FontContext<'a> {
             tounicode_refs,
             inline_cmaps,
             encoding_cache,
+            with_tounicode,
         }
     }
 }
@@ -326,6 +336,7 @@ pub(crate) fn page_math_glyphs(
                 base,
                 size: g.size,
                 invisible: g.invisible,
+                to_unicode: g.to_unicode,
             }
         })
         .collect();
@@ -577,6 +588,7 @@ impl<'a> Walker<'a, '_> {
             .to_string();
         let size_scale = ctx.type3_scales.get(font).copied().unwrap_or(1.0);
         let invisible = matches!(state.render_mode, 3 | 7);
+        let to_unicode = ctx.with_tounicode.contains(font);
         for code_bytes in bytes.chunks(code_len) {
             let text = extract_text_from_operand(
                 &Object::String(code_bytes.to_vec(), StringFormat::Literal),
@@ -620,6 +632,7 @@ impl<'a> Walker<'a, '_> {
                     quarter_turns,
                     size: effective_font_size(state.font_size, &text_to_user) * size_scale,
                     invisible,
+                    to_unicode,
                 });
             }
             *tm = multiply_matrices(&[1.0, 0.0, 0.0, 1.0, advance, 0.0], tm);
