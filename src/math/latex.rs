@@ -2,7 +2,7 @@
 //! limits of large operators, accents and stacked delimiter pieces, then
 //! LaTeX for one line of mathematics.
 
-use super::glyph::{FontClass, G};
+use super::glyph::{FontClass, G, MAPSTO_STEM};
 
 const ATOM: &str = "\u{1}";
 
@@ -12,8 +12,8 @@ fn greek(c: char) -> Option<&'static str> {
         'β' => "beta",
         'γ' => "gamma",
         'δ' => "delta",
-        'ε' => "epsilon",
-        'ϵ' => "varepsilon",
+        'ϵ' => "epsilon",
+        'ε' => "varepsilon",
         'ζ' => "zeta",
         'η' => "eta",
         'θ' => "theta",
@@ -32,8 +32,8 @@ fn greek(c: char) -> Option<&'static str> {
         'ς' => "varsigma",
         'τ' => "tau",
         'υ' => "upsilon",
-        'φ' => "phi",
-        'ϕ' => "varphi",
+        'ϕ' => "phi",
+        'φ' => "varphi",
         'ψ' => "psi",
         'χ' => "chi",
         'ω' => "omega",
@@ -372,6 +372,8 @@ fn postfix(s: &str) -> String {
         i += 1;
     }
     out.replace("\\cdot\\cdot\\cdot", "\\cdots ")
+        .replace(&format!("{MAPSTO_STEM}\\rightarrow"), "\\mapsto ")
+        .replace(MAPSTO_STEM, "\\mapsto ")
         .replace("\u{338}=", "\\neq ")
         .replace("\u{338}\\in", "\\notin")
         .replace('\u{338}', "\\not ")
@@ -812,6 +814,11 @@ mod tests {
         assert_eq!(postfix("\\cdot\\cdot\\cdot"), "\\cdots ");
         assert_eq!(postfix("a\u{338}=b"), "a\\neq b");
         assert_eq!(postfix("a\u{338}\\in B"), "a\\notin B");
+        assert_eq!(postfix("x\u{F0000}\\rightarrow y"), "x\\mapsto  y");
+        assert_eq!(
+            postfix("x\\mapsto\\rightarrow y"),
+            "x\\mapsto\\rightarrow y"
+        );
     }
 
     #[test]
