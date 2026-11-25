@@ -426,14 +426,17 @@ fn is_rtl_led(text: &str) -> bool {
 
 /// Small Arabic/Hebrew letters or brackets beside a larger RTL-led item are a
 /// piece of that word set at another size (the "ال" of an Arabic heading,
-/// the "())" after it), not a footnote marker.
+/// the "())" after it), not a footnote marker. Digits count too once the run
+/// has a bracket ("(1)", the heading's own number); a bare raised digit is
+/// still a footnote reference.
 fn is_plain_text_piece(items: &[TextItem], glyphs: &[usize], anchor: &TextItem) -> bool {
+    let mut chars = glyphs.iter().flat_map(|&g| items[g].text.chars());
+    let has_bracket = chars.clone().any(is_bracket);
     is_rtl_led(&anchor.text)
-        && glyphs.iter().all(|&g| {
-            items[g]
-                .text
-                .chars()
-                .all(|c| is_bracket(c) || (c.is_alphabetic() && crate::text_utils::is_rtl_char(c)))
+        && chars.all(|c| {
+            is_bracket(c)
+                || (c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
+                || (has_bracket && c.is_ascii_digit())
         })
 }
 
@@ -484,7 +487,12 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let mut glyphs = run.glyphs.clone();
     // Arabic/Hebrew glyphs read right to left whichever side of the word the
     // piece sits on.
-    if run.plain {
+    // Digits and brackets ("(1)") keep their x order.
+    if run.plain
+        && !glyphs
+            .iter()
+            .any(|&g| items[g].text.contains(|c: char| c.is_ascii_digit()))
+    {
         glyphs.reverse();
     }
     let mapped: String = glyphs
@@ -509,12 +517,12 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let left = anchor.x.min(run_left);
     anchor.width = anchor_right.max(run_right) - left;
     anchor.x = left;
-    let brackets_only = run.plain && mapped.chars().all(is_bracket);
+    let brackets_only = run.plain && mapped.chars().all(|c| is_bracket(c) || c.is_ascii_digit());
     if run.anchor_on_left && !run.plain {
         anchor.text.push_str(&mapped);
     } else if brackets_only && !run.anchor_on_left {
-        // Brackets left of an RTL word close it ("المادة:())"): they are its
-        // logical suffix, ahead of any trailing space.
+        // Brackets (and a number in them) left of an RTL word close it
+        // ("المادة:())", "المادة:(1)"): they are its logical suffix, ahead of any trailing space.
         let at = anchor.text.trim_end().len();
         anchor.text.insert_str(at, &mapped);
     } else {
@@ -1300,6 +1308,56 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[1].text, "*");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn numbered_bracket_run_beside_arabic_heading_fuses_as_suffix() {
+        let items = vec![
+            make_item_fs("(1)", 159.8416, 208.9678, 8.9199, 6.996),
+            make_item_fs("المادة الأولى:", 168.7574, 204.9718, 72.198, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "المادة الأولى:(1)");
+        assert_eq!(merged[0].font_size, 14.0);
+        assert_eq!(merged[0].baseline_shift, 0.0);
+    }
+
+    #[test]
+    fn numbered_bracket_glyphs_beside_arabic_heading_keep_x_order() {
+        let items = vec![
+            make_item_fs("(", 159.0, 208.9678, 3.0, 6.996),
+            make_item_fs("1", 162.0, 208.9678, 3.0, 6.996),
+            make_item_fs(")", 165.0, 208.9678, 3.0, 6.996),
+            make_item_fs("المادة الأولى:", 168.7574, 204.9718, 72.198, 14.0),
+        ];
+        assert_eq!(
+            texts(&merge_subscript_items(items)),
+            vec!["المادة الأولى:(1)"]
+        );
+    }
+
+    #[test]
+    fn raised_digit_beside_arabic_heading_is_still_a_footnote() {
+        let items = vec![
+            make_item_fs("1", 164.7574, 208.9678, 4.0, 6.996),
+            make_item_fs("المادة الأولى:", 168.7574, 204.9718, 72.198, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "¹المادة الأولى:");
+    }
+
+    #[test]
+    fn numbered_bracket_run_beside_latin_text_is_still_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("(1)", 124.0, 504.0, 7.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "(1)");
         assert!(merged[1].baseline_shift > 0.0);
     }
 }
