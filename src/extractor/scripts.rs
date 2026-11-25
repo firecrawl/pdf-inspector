@@ -9,7 +9,7 @@
 //! rendering (`TextItem::line_y`, `TextLine::text`) consume those results.
 
 use crate::types::{ItemType, TextItem};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Merge subscript/superscript glyph runs into their parent items, or flag
 /// them with a baseline offset when they cannot be fused.
@@ -111,6 +111,10 @@ struct ScriptRun {
     /// The anchor precedes the run ("word²") rather than following it
     /// ("¹Hong Kong").
     anchor_on_left: bool,
+    /// Not a script after all: small Arabic/Hebrew letters or brackets beside
+    /// a larger RTL-led word. They join the anchor's text, or stay untouched
+    /// where that is not possible; they are never flagged as a script.
+    plain: bool,
 }
 
 /// Items that can take part in script detection, as glyph or anchor.
@@ -237,6 +241,7 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
     pages.sort_by_key(|(page, _)| *page);
 
     let mut runs = Vec::new();
+    let mut skipped_brackets: HashSet<usize> = HashSet::new();
     for (_, mut by_y) in pages {
         by_y.sort_by(|&a, &b| items[a].y.total_cmp(&items[b].y));
         let max_fs = by_y
@@ -335,14 +340,26 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 }
             }
             if let Some((_, anchor, anchor_on_left)) = best {
+                let plain = is_plain_text_piece(items, &chain, &items[anchor]);
+                // Brackets alone ("())") are punctuation of the neighbouring
+                // text, not a marker, even where they cannot rejoin it.
+                let only_brackets = chain.iter().all(|&i| items[i].text.chars().all(is_bracket));
+                if only_brackets && !plain {
+                    skipped_brackets.extend(chain);
+                    continue;
+                }
                 runs.push(ScriptRun {
                     glyphs: chain,
                     anchor,
                     anchor_on_left,
+                    plain,
                 });
             }
         }
     }
+    // A skipped bracket is punctuation, so a digit beside it belongs to the
+    // word the bracket belongs to, not to the bracket.
+    runs.retain(|run| !skipped_brackets.contains(&run.anchor));
     runs
 }
 
@@ -368,7 +385,138 @@ fn fusable_anchor_edge(anchor: &TextItem, anchor_on_left: bool) -> bool {
     }
 }
 
-/// Fuse digit-only runs into their anchors; flag every other run.
+fn is_bracket(c: char) -> bool {
+    matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+/// Whether the first letter of `text` is Arabic/Hebrew.
+fn is_rtl_led(text: &str) -> bool {
+    text.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(crate::text_utils::is_rtl_char)
+}
+
+/// Small Arabic/Hebrew letters or brackets beside a larger RTL-led item are a
+/// piece of that word set at another size (the "ال" of an Arabic heading,
+/// the "())" after it), not a footnote marker.
+fn is_plain_text_piece(items: &[TextItem], glyphs: &[usize], anchor: &TextItem) -> bool {
+    is_rtl_led(&anchor.text)
+        && glyphs.iter().all(|&g| {
+            items[g]
+                .text
+                .chars()
+                .all(|c| is_bracket(c) || (c.is_alphabetic() && crate::text_utils::is_rtl_char(c)))
+        })
+}
+
+/// Whether `run` is absorbed into its anchor's text: a plain-text piece, or
+/// a short digit-only run, beside a fusable anchor edge that is body text.
+fn can_fuse(items: &[TextItem], run: &ScriptRun, glyph_runs: &HashMap<usize, usize>) -> bool {
+    let anchor = &items[run.anchor];
+    let digits: usize = run
+        .glyphs
+        .iter()
+        .map(|&g| items[g].text.chars().count())
+        .sum();
+    let digit_only = run
+        .glyphs
+        .iter()
+        .all(|&g| items[g].text.chars().all(|c| c.is_ascii_digit()));
+    // Strikeout boundaries block fusion (a struck word must not extend its
+    // strike over a live footnote digit, and a struck digit must not lose its
+    // own mark). An underlined anchor with an unmarked digit DOES fuse: the
+    // drawn rule easily misses the tiny digit's overlap window, and refusing
+    // costs the whole token. Visually the rule spans both. A plain piece also
+    // needs the anchor's bold and italic, so fusing never drops emphasis.
+    let marks_ok = run.glyphs.iter().all(|&g| {
+        let glyph = &items[g];
+        anchor.is_strikeout == glyph.is_strikeout
+            && (anchor.is_underline == glyph.is_underline
+                || (anchor.is_underline && !glyph.is_underline))
+            && (!run.plain
+                || (anchor.is_bold == glyph.is_bold && anchor.is_italic == glyph.is_italic))
+    });
+    (run.plain || (digit_only && digits <= SCRIPT_MAX_FUSED_DIGITS))
+        && marks_ok
+        && fusable_anchor_edge(anchor, run.anchor_on_left)
+        && !glyph_runs.contains_key(&run.anchor)
+}
+
+/// Absorb a run into its anchor's text. Digits become super/subscript
+/// characters; plain pieces keep their letters. A plain piece on the right
+/// of its word reads right to left, so it goes at the start of the text
+/// (after any opening punctuation) with its glyphs in reverse x order; one on
+/// the left is already ahead of the word in the stream order of the source
+/// PDFs and goes at the start.
+fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
+    let first = &items[run.glyphs[0]];
+    // Direction from the baseline offset (y-up): raised → superscript digits
+    // (footnote refs), lowered → subscript (chemistry). NFKC folds both back
+    // to plain digits, so downstream text matching is unaffected.
+    let raised = first.y > items[run.anchor].y + items[run.anchor].font_size * 0.1;
+    let mut glyphs = run.glyphs.clone();
+    if run.plain && run.anchor_on_left {
+        glyphs.reverse();
+    }
+    let mapped: String = glyphs
+        .iter()
+        .map(|&g| {
+            if run.plain {
+                items[g].text.clone()
+            } else {
+                map_script_digits(&items[g].text, raised)
+            }
+        })
+        .collect();
+    let run_left = first.x;
+    let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
+    let rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
+
+    let anchor = &mut items[run.anchor];
+    anchor.legacy_symbol_rewrite |= rewrite;
+    // The fused item spans the union of word and marker: a kerned marker may
+    // end inside the word's advance or start before it.
+    let anchor_right = item_right(anchor);
+    let left = anchor.x.min(run_left);
+    anchor.width = anchor_right.max(run_right) - left;
+    anchor.x = left;
+    if run.anchor_on_left && !run.plain {
+        anchor.text.push_str(&mapped);
+    } else {
+        let at = if run.plain {
+            anchor.text.find(char::is_alphabetic).unwrap_or(0)
+        } else {
+            0
+        };
+        anchor.text.insert_str(at, &mapped);
+    }
+    for &g in &run.glyphs {
+        remove[g] = true;
+    }
+}
+
+/// Materialize a script run as ONE item, so line assembly,
+/// `TextLine::text` and the bindings consume the detector's decision instead
+/// of re-deriving run membership from geometry: the glyph texts concatenate
+/// in x order (a run's glyphs touch, there is no space inside "1,2,3"), the
+/// item spans the run, and `baseline_shift` records the offset from the
+/// anchor baseline. The head glyph keeps its font, style flags and mcid.
+fn flag_run(items: &mut [TextItem], run: &ScriptRun, anchor_y: f32, remove: &mut [bool]) {
+    let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
+    let text: String = run.glyphs.iter().map(|&g| items[g].text.as_str()).collect();
+    let rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
+    let head = &mut items[run.glyphs[0]];
+    head.text = text;
+    head.legacy_symbol_rewrite = rewrite;
+    head.width = run_right - head.x;
+    head.baseline_shift = head.y - anchor_y;
+    for &g in &run.glyphs[1..] {
+        remove[g] = true;
+    }
+}
+
+/// Fuse digit-only and plain-text runs into their anchors; flag every other
+/// run.
 fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextItem> {
     // A glyph can itself anchor a smaller run (nested scripts: "x", "2",
     // "n"). Shifts are measured from the BODY baseline, so anchor chains are
@@ -397,84 +545,10 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
 
     let mut remove = vec![false; items.len()];
     for (ri, run) in runs.iter().enumerate() {
-        let anchor = &items[run.anchor];
-        let digits: usize = run
-            .glyphs
-            .iter()
-            .map(|&g| items[g].text.chars().count())
-            .sum();
-        let digit_only = run
-            .glyphs
-            .iter()
-            .all(|&g| items[g].text.chars().all(|c| c.is_ascii_digit()));
-        // Strikeout boundaries block fusion (a struck word must not extend
-        // its strike over a live footnote digit, and a struck digit must not
-        // lose its own mark). An underlined anchor with an unmarked digit
-        // DOES fuse: the drawn rule easily misses the tiny digit's overlap
-        // window, and refusing costs the whole token. Visually the rule
-        // spans both.
-        let marks_ok = run.glyphs.iter().all(|&g| {
-            let glyph = &items[g];
-            anchor.is_strikeout == glyph.is_strikeout
-                && (anchor.is_underline == glyph.is_underline
-                    || (anchor.is_underline && !glyph.is_underline))
-        });
-        let fuse = digit_only
-            && digits <= SCRIPT_MAX_FUSED_DIGITS
-            && marks_ok
-            && fusable_anchor_edge(anchor, run.anchor_on_left)
-            && !run_of_glyph.contains_key(&run.anchor);
-
-        let legacy_symbol_rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
-        if fuse {
-            // Direction from the baseline offset (y-up): raised → superscript
-            // digits (footnote refs), lowered → subscript (chemistry). NFKC
-            // folds both back to plain digits, so downstream text matching
-            // is unaffected.
-            let raised = items[run.glyphs[0]].y > anchor.y + anchor.font_size * 0.1;
-            let mapped: String = run
-                .glyphs
-                .iter()
-                .map(|&g| map_script_digits(&items[g].text, raised))
-                .collect();
-            let run_left = items[run.glyphs[0]].x;
-            let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
-            let anchor = &mut items[run.anchor];
-            anchor.legacy_symbol_rewrite |= legacy_symbol_rewrite;
-            // The fused item spans the union of word and marker: a kerned
-            // marker may end inside the word's advance or start before it.
-            let anchor_right = item_right(anchor);
-            if run.anchor_on_left {
-                anchor.text.push_str(&mapped);
-                anchor.width = anchor_right.max(run_right) - anchor.x;
-            } else {
-                anchor.text = mapped + &anchor.text;
-                let left = anchor.x.min(run_left);
-                anchor.width = anchor_right.max(run_right) - left;
-                anchor.x = left;
-            }
-            for &g in &run.glyphs {
-                remove[g] = true;
-            }
-        } else {
-            // Materialize the run as ONE item, so line assembly,
-            // `TextLine::text` and the bindings consume the detector's
-            // decision instead of re-deriving run membership from geometry:
-            // the glyph texts concatenate in x order (a run's glyphs touch,
-            // there is no space inside "1,2,3"), the item spans the run, and
-            // `baseline_shift` records the offset from the anchor baseline.
-            // The head glyph keeps its font, style flags and mcid.
-            let anchor_y = body_anchor_y[ri];
-            let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
-            let text: String = run.glyphs.iter().map(|&g| items[g].text.as_str()).collect();
-            let head = &mut items[run.glyphs[0]];
-            head.text = text;
-            head.legacy_symbol_rewrite = legacy_symbol_rewrite;
-            head.width = run_right - head.x;
-            head.baseline_shift = head.y - anchor_y;
-            for &g in &run.glyphs[1..] {
-                remove[g] = true;
-            }
+        if can_fuse(&items, run, &run_of_glyph) {
+            fuse_run(&mut items, run, &mut remove);
+        } else if !run.plain {
+            flag_run(&mut items, run, body_anchor_y[ri], &mut remove);
         }
     }
 
@@ -941,5 +1015,228 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(texts(&merged), vec!["a", "b", "second"]);
+    }
+    // ---- Review follow-ups ----
+
+    #[test]
+    fn small_hebrew_piece_on_the_right_precedes_its_word() {
+        let items = vec![
+            make_item_fs("ספר", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("ה", 124.0, 504.0, 4.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["הספר"]);
+        assert!((merged[0].x - 100.0).abs() < 1e-3);
+        assert!((merged[0].width - 28.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn right_hand_rtl_run_reads_right_to_left() {
+        let items = vec![
+            make_item_fs("ספר", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("ב", 124.0, 504.0, 3.0, 6.0),
+            make_item_fs("א", 127.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["אבספר"]);
+    }
+
+    #[test]
+    fn bold_or_italic_rtl_piece_is_not_fused_into_plain_anchor() {
+        for (bold, italic) in [(true, false), (false, true)] {
+            let mut piece = make_item_fs("ال", 173.6707, 295.9942, 8.9199, 6.996);
+            piece.is_bold = bold;
+            piece.is_italic = italic;
+            let items = vec![piece, make_item_fs("مادة", 182.5865, 291.9982, 30.0, 14.0)];
+            let merged = merge_subscript_items(items);
+            assert_eq!(merged.len(), 2, "bold={bold} italic={italic}");
+            assert!(merged.iter().any(|i| i.text == "مادة"));
+        }
+    }
+
+    #[test]
+    fn matching_bold_rtl_piece_still_fuses() {
+        let mut piece = make_item_fs("ال", 173.6707, 295.9942, 8.9199, 6.996);
+        let mut anchor = make_item_fs("مادة", 182.5865, 291.9982, 30.0, 14.0);
+        piece.is_bold = true;
+        anchor.is_bold = true;
+        let merged = merge_subscript_items(vec![piece, anchor]);
+        assert_eq!(texts(&merged), vec!["المادة"]);
+    }
+
+    #[test]
+    fn rtl_piece_goes_after_opening_punctuation_of_the_anchor() {
+        let items = vec![
+            make_item_fs("(ספר חדש", 100.0, 500.0, 60.0, 12.0),
+            make_item_fs("ה", 160.0, 504.0, 4.0, 6.0),
+        ];
+        assert_eq!(texts(&merge_subscript_items(items)), vec!["(הספר חדש"]);
+    }
+
+    // ---- Arabic heading regression (firecrawl/firecrawl#5931) ----
+    // The PDF sets pieces of a 14 pt heading as 7 pt items raised 4 pt and
+    // touching the heading item. They are heading text, not footnote markers.
+
+    #[test]
+    fn arabic_letters_beside_heading_rejoin_the_word() {
+        let items = vec![
+            make_item_fs("ال", 173.6707, 295.9942, 8.9199, 6.996),
+            make_item_fs("مادة الأولى:", 182.5865, 291.9982, 58.366, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "المادة الأولى:");
+        assert_eq!(merged[0].baseline_shift, 0.0);
+        assert_eq!(merged[0].font_size, 14.0);
+    }
+
+    #[test]
+    fn arabic_heading_with_small_piece_stays_a_markdown_heading() {
+        use crate::markdown::{to_markdown_from_items, MarkdownOptions};
+        let mut items = Vec::new();
+        for y in [600.0_f32, 500.0] {
+            items.push(make_item_fs("ال", 173.6707, y + 4.0, 8.9199, 6.996));
+            items.push(make_item_fs("مادة الأولى:", 182.5865, y, 58.366, 14.0));
+        }
+        for y in [450.0_f32, 435.0, 420.0, 405.0] {
+            let mut body = make_item_fs("نص الفقرة العادية هنا", 100.0, y, 140.0, 10.0);
+            body.page = 1;
+            items.push(body);
+        }
+        let md = to_markdown_from_items(merge_subscript_items(items), MarkdownOptions::default());
+        assert!(md.contains("# المادة الأولى:"), "{md}");
+        assert!(!md.contains("<sup>"), "{md}");
+        assert!(!md.contains("**ال**"), "{md}");
+    }
+
+    #[test]
+    fn hebrew_letters_beside_larger_hebrew_item_rejoin_the_word() {
+        let items = vec![
+            make_item_fs("ה", 100.0, 504.0, 4.0, 6.0),
+            make_item_fs("ספר", 104.0, 500.0, 24.0, 12.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "הספר");
+    }
+
+    #[test]
+    fn raised_arabic_letter_beside_latin_text_is_still_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("أ", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn latin_raised_lone_bracket_is_not_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|i| i.baseline_shift == 0.0));
+    }
+
+    #[test]
+    fn footnote_digit_beside_skipped_bracket_stays_with_its_word() {
+        // The "1" is too small to attach to the 12 pt word, but it does touch
+        // the raised ")" . The skipped bracket must not take the digit.
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs(")", 124.0, 504.0, 2.0, 6.0),
+            make_item_fs("1", 126.0, 505.0, 2.0, 3.0),
+        ];
+        let merged = merge_subscript_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["word", ")", "1"]);
+    }
+
+    #[test]
+    fn bracket_only_item_beside_arabic_heading_rejoins_it() {
+        let items = vec![
+            make_item_fs("())", 159.8416, 208.9678, 8.9199, 6.996),
+            make_item_fs("المادة الثلاثون: ", 168.7574, 204.9718, 72.198, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].font_size, 14.0);
+        assert_eq!(merged[0].baseline_shift, 0.0);
+    }
+
+    #[test]
+    fn arabic_word_with_raised_digit_footnote_still_fuses() {
+        let items = vec![
+            make_item_fs("كلمة", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("1", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "كلمة¹");
+    }
+
+    #[test]
+    fn latin_raised_marker_symbol_is_flagged_superscript() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("*", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "*");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn latin_raised_ordinal_suffix_is_flagged_superscript() {
+        let items = vec![
+            make_item_fs("4", 100.0, 500.0, 6.0, 12.0),
+            make_item_fs("th", 106.0, 504.0, 6.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "th");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn latin_bracketed_raised_marker_is_still_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
+            make_item_fs("1", 126.0, 504.0, 3.0, 6.0),
+            make_item_fs(")", 129.0, 504.0, 2.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "(1)");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn cjk_raised_digit_footnote_fuses() {
+        let items = vec![
+            make_item_fs("脚注", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("1", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "脚注¹");
+    }
+
+    #[test]
+    fn cjk_raised_marker_symbol_is_flagged_superscript() {
+        let items = vec![
+            make_item_fs("脚注", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("*", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "*");
+        assert!(merged[1].baseline_shift > 0.0);
     }
 }

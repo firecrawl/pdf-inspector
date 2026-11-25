@@ -7,6 +7,22 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Arabic and Hebrew headings no longer come out with `<sup>` markers such as
+  `## مادة الأولى:())<sup>ال</sup>`. Small Arabic or Hebrew letters and
+  bracket-only pieces that touch a larger Arabic or Hebrew item are now part
+  of that word, so the heading keeps its text, its size, and its `##`. A
+  piece on the right of its word is placed in right-to-left order, after any
+  opening punctuation. Latin and CJK footnote markers are unchanged
+  (firecrawl/firecrawl#5931).
+- Known limitations: a small piece is rejoined only when its bold and italic
+  match the larger item and the larger item starts with an Arabic or Hebrew
+  letter. Layouts with a mixed-direction anchor, a style change inside a
+  marker, or brackets that cannot join may still render as before.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
