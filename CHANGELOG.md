@@ -7,6 +7,31 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Parentheses in Arabic and Hebrew text from PDFs made with InDesign's
+  Middle Eastern edition are no longer swapped. These files showed
+  `الفقرة )1( و)2(` where the document reads `الفقرة (1) و(2)`; the
+  brackets now come out the right way round. PDFs that already draw their
+  brackets mirrored are unchanged, apart from the wrapped-bracket case
+  under Known limitations. The choice is made per page: a page is
+  read as storing brackets by their role only when more of its bracket
+  pairs read `)…(` on screen than `(…)`
+  ([firecrawl/firecrawl#5931](https://github.com/firecrawl/firecrawl/issues/5931)).
+
+### Known limitations
+
+On pages whose brackets are stored by role:
+
+- A pair split across a line break leaves a stray bracket.
+- A mirrored page whose only brackets wrap across lines may be read as
+  storing brackets by role.
+- Pairs around punctuation or separators alone, such as `(+)` or `(، )`,
+  Latin pairs next to inverted pairs, and brackets supplied by ActualText
+  beside inverted pairs can still be misread.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
