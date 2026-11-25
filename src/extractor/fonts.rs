@@ -53,7 +53,8 @@ impl CMapDecisionCache {
     /// Whether the CMap of a simple font reads Arabic letters
     /// ([`crate::tounicode::ToUnicodeCMap::reads_arabic_bytes`]), found once for the CMap
     /// `key` names (the ToUnicode object) and not again for each string.
-    /// A CMap without a key (an inline one) is measured each time; the
+    /// A CMap without a key (an inline one) is measured each time this is
+    /// called; the caller asks at most once for each string, and the
     /// measure is bounded by the 256 codes of a byte.
     pub(crate) fn reads_arabic_bytes(
         &mut self,
@@ -2672,13 +2673,18 @@ pub(crate) fn extract_text_from_operand(
                     // code the font gives as a space (a Differences name
                     // or a blank glyph), which keeps its reading.
                     let suppressed = std::cell::Cell::new(false);
+                    // The Arabic verdict of the CMap, found at most once for
+                    // this string, on the first U+FFFD code.
+                    let mut reads_arabic: Option<bool> = None;
                     let mut decode_byte = |b: u8| -> Option<String> {
                         let code = b as u16;
                         let mapping = entry.primary.lookup_code(code);
                         if is_simple_font
                             && matches!(&mapping, CodeMapping::Text(s) if s == "\u{FFFD}")
                             && !shows_space(encoding_map, b)
-                            && cmap_decisions.reads_arabic_bytes(cache_key, &entry.primary)
+                            && *reads_arabic.get_or_insert_with(|| {
+                                cmap_decisions.reads_arabic_bytes(cache_key, &entry.primary)
+                            })
                         {
                             suppressed.set(true);
                             return None;

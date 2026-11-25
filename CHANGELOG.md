@@ -47,8 +47,8 @@ version and date. Earlier releases are described in their
   Known limitations: only the primary ToUnicode map is consulted, the first
   piece's glyph is not measured, so a U+FFFD entry of an Arabic simple font
   that shows a real letter is dropped as well, and a font whose ToUnicode
-  stream is inline (no object) is measured for each string that shows such
-  a code (at most 256 lookups).
+  stream is inline (no object) is measured once for each string that shows
+  such a code (at most 256 lookups), not for each code.
 
 ## [1.27.1] - 2026-11-24
 

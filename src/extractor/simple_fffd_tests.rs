@@ -133,6 +133,46 @@ fn the_arabic_reading_of_a_cmap_is_measured_once_for_all_the_strings_of_a_font()
 }
 
 #[test]
+fn the_arabic_reading_of_an_inline_cmap_is_measured_once_for_each_string() {
+    // The ToUnicode stream sits in the font dictionary: no object number
+    // names it. Each of three strings shows 2,000 replacement codes.
+    let (mut doc, tounicode, page) =
+        simple_font_doc(&bfchar(ARABIC), None, None, encoding(), false);
+    let stream = doc.objects.remove(&(tounicode, 0)).unwrap();
+    for object in doc.objects.values_mut() {
+        if let Object::Dictionary(dict) = object {
+            if dict.get(b"ToUnicode").is_ok() {
+                dict.set("ToUnicode", stream.clone());
+            }
+        }
+    }
+    let mut content = b"BT /F1 12 Tf 100 700 Td ".to_vec();
+    for _ in 0..3 {
+        content.push(b'<');
+        content.extend(std::iter::repeat_n(*b"29", 2000).flatten());
+        content.extend_from_slice(b"> Tj ");
+    }
+    content.extend_from_slice(b"ET");
+    let contents = doc.add_object(Stream::new(dictionary! {}, content));
+    let page_dict = doc.get_object_mut(page).unwrap().as_dict_mut().unwrap();
+    page_dict.set("Contents", contents);
+    let cmaps = FontCMaps::from_doc(&doc);
+    ARABIC_BYTE_SCANS.with(|scans| scans.set(0));
+    let ((items, _, _), _, _, _) = extract_page_text_items(
+        &doc,
+        page,
+        1,
+        &cmaps,
+        false,
+        &mut FontStyleCache::new(),
+        &mut FormWalkBudget::new(),
+    )
+    .unwrap();
+    assert!(items.is_empty(), "{items:?}");
+    assert_eq!(ARABIC_BYTE_SCANS.with(std::cell::Cell::get), 3);
+}
+
+#[test]
 fn a_run_of_nothing_but_dropped_codes_is_no_item_and_no_space() {
     let (mut doc, _, page) = simple_font_doc(&bfchar(ARABIC), None, None, encoding(), false);
     let content = b"BT /F1 12 Tf 100 700 Td <2C> Tj <292A> Tj <2C> Tj ET".to_vec();
