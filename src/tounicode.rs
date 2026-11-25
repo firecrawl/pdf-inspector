@@ -1350,22 +1350,33 @@ impl ToUnicodeCMap {
 
     /// Whether the CMap reads at least [`ARABIC_CMAP_MIN_ENTRIES`] codes as
     /// Arabic letters, counted over its entries: a direct entry by its first
-    /// character, a range whose base is an Arabic letter by its length. A
-    /// direct entry that overrides a range is not told apart: the count only
-    /// gates a measurement of glyphs.
+    /// character, a range whose base is an Arabic letter by its length less
+    /// the codes a direct entry overrides (those count by the entry).
     pub(crate) fn reads_arabic_letters(&self) -> bool {
+        let is_arabic = |text: &String| text.chars().next().is_some_and(is_arabic_char);
+        let arabic_range =
+            |&&(_, _, base): &&(u16, u16, u32)| char::from_u32(base).is_some_and(is_arabic_char);
         let direct = self
             .char_map
             .values()
-            .filter(|text| text.chars().next().is_some_and(is_arabic_char))
+            .filter(|text| is_arabic(text))
             .count();
         let ranged = self
             .ranges
             .iter()
-            .filter(|&&(_, _, base)| char::from_u32(base).is_some_and(is_arabic_char))
+            .filter(arabic_range)
             .map(|&(start, end, _)| usize::from(end.saturating_sub(start)) + 1)
             .fold(0usize, usize::saturating_add);
-        direct.saturating_add(ranged) >= ARABIC_CMAP_MIN_ENTRIES
+        // The range a code falls in, found as `destination` finds it.
+        let overridden = self
+            .char_map
+            .keys()
+            .filter(|&&code| {
+                let at = self.ranges.partition_point(|&(start, _, _)| start <= code);
+                at > 0 && self.ranges[at - 1].1 >= code && arabic_range(&&self.ranges[at - 1])
+            })
+            .count();
+        direct.saturating_add(ranged.saturating_sub(overridden)) >= ARABIC_CMAP_MIN_ENTRIES
     }
 
     /// Give `codes` — control destinations of this CMap — the text `source`

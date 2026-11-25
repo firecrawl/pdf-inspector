@@ -229,12 +229,15 @@ pub(crate) fn add_kashida_codes(
     }
 }
 
-/// `bytes`, a string of two-byte codes, without the codes in `kashidas`.
+/// `bytes`, a string of two-byte codes, without the codes in `kashidas`
+/// (sorted, as [`crate::tounicode::kashida_codes`] returns them).
 fn without_kashidas(bytes: &[u8], kashidas: &[u16]) -> Vec<u8> {
     bytes
         .chunks(2)
         .filter(|code| match code {
-            [high, low] => !kashidas.contains(&u16::from_be_bytes([*high, *low])),
+            [high, low] => kashidas
+                .binary_search(&u16::from_be_bytes([*high, *low]))
+                .is_err(),
             _ => true,
         })
         .flatten()
@@ -2609,7 +2612,8 @@ pub(crate) fn extract_text_from_operand(
                 .get(current_font)
                 .map_or(&[][..], |info| info.kashida_codes.as_slice());
             let unjustified;
-            let bytes = if kashidas.is_empty() {
+            // An odd-length string is read a byte at a time, not in pairs.
+            let bytes = if kashidas.is_empty() || bytes.len() % 2 == 1 {
                 bytes.as_slice()
             } else {
                 unjustified = without_kashidas(bytes, kashidas);
@@ -5669,12 +5673,13 @@ mod tests {
     ) -> (Document, u32, lopdf::ObjectId) {
         use lopdf::Stream;
         let mut doc = Document::with_version("1.5");
+        let count = bfchar.lines().filter(|line| line.starts_with('<')).count();
         let cmap = format!(
             "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
              /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
              /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
              1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
-             4 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+             {count} beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
              CMapName currentdict /CMap defineresource pop\nend\nend"
         );
         let tounicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
