@@ -15,12 +15,15 @@ version and date. Earlier releases are described in their
   Middle Eastern edition are no longer swapped. These files showed
   `الفقرة )1( و)2(` where the document reads `الفقرة (1) و(2)`; the
   brackets now come out the right way round. PDFs that already draw their
-  brackets mirrored are unchanged. The choice is made per page: a page is
+  brackets mirrored are unchanged, apart from the wrapped-bracket case
+  under Known limitations. The choice is made per page: a page is
   read as storing brackets by their role only when more of its bracket
   pairs read `)…(` on screen than `(…)`
   ([firecrawl/firecrawl#5931](https://github.com/firecrawl/firecrawl/issues/5931)).
 
-Known limitations, on pages whose brackets are stored by role:
+### Known limitations
+
+On pages whose brackets are stored by role:
 
 - A pair split across a line break leaves a stray bracket.
 - A mirrored page whose only brackets wrap across lines may be read as
