@@ -6,8 +6,10 @@ use log::{debug, warn};
 use lopdf::{Document, Object, ObjectId};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::iter::Peekable;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+use std::str::Chars;
 
 use crate::glyph_names::glyph_name_to_string;
 
@@ -1065,25 +1067,12 @@ impl ToUnicodeCMap {
         let mut chars = section.chars().peekable();
 
         loop {
-            // Skip whitespace
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            skip_whitespace(&mut chars);
 
             // Look for opening <
-            if chars.peek() != Some(&'<') {
+            let Some(start_hex) = read_angle_hex(&mut chars) else {
                 break;
-            }
-            chars.next(); // consume <
-
-            // Read start hex
-            let mut start_hex = String::new();
-            while chars.peek().is_some_and(|&c| c != '>') {
-                if let Some(c) = chars.next() {
-                    start_hex.push(c);
-                }
-            }
-            chars.next(); // consume >
+            };
 
             // Track source hex length
             let trimmed_start = start_hex.trim();
@@ -1091,40 +1080,17 @@ impl ToUnicodeCMap {
                 src_hex_lengths.push(trimmed_start.len());
             }
 
-            // Skip whitespace
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            skip_whitespace(&mut chars);
 
             // Read end hex
-            if chars.peek() != Some(&'<') {
+            let Some(end_hex) = read_angle_hex(&mut chars) else {
                 continue;
-            }
-            chars.next();
-            let mut end_hex = String::new();
-            while chars.peek().is_some_and(|&c| c != '>') {
-                if let Some(c) = chars.next() {
-                    end_hex.push(c);
-                }
-            }
-            chars.next();
+            };
 
-            // Skip whitespace
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            skip_whitespace(&mut chars);
 
             // Read base - could be <hex> or [array]
-            if chars.peek() == Some(&'<') {
-                chars.next();
-                let mut base_hex = String::new();
-                while chars.peek().is_some_and(|&c| c != '>') {
-                    if let Some(c) = chars.next() {
-                        base_hex.push(c);
-                    }
-                }
-                chars.next();
-
+            if let Some(base_hex) = read_angle_hex(&mut chars) {
                 // Store range mapping
                 if let (Some(start), Some(end), Some(base)) = (
                     parse_hex_u16(&start_hex),
@@ -1134,59 +1100,47 @@ impl ToUnicodeCMap {
                     self.ranges.push((start, end, base));
                 }
             } else if chars.peek() == Some(&'[') {
-                // Array format: [<unicode1> <unicode2> ...]
-                // Each entry maps to start_cid + index
                 chars.next(); // consume [
-                if let (Some(start), Some(end)) =
-                    (parse_hex_u16(&start_hex), parse_hex_u16(&end_hex))
-                {
-                    let mut cid = start;
-                    loop {
-                        // Skip whitespace
-                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                            chars.next();
-                        }
-                        if chars.peek() == Some(&']') {
-                            chars.next();
-                            break;
-                        }
-                        if chars.peek() != Some(&'<') {
-                            break;
-                        }
-                        chars.next(); // consume <
-                        let mut hex = String::new();
-                        while chars.peek().is_some_and(|&c| c != '>') {
-                            if let Some(c) = chars.next() {
-                                hex.push(c);
-                            }
-                        }
-                        chars.next(); // consume >
-                        if let Some(unicode_str) = hex_to_unicode_string(&hex) {
-                            self.char_map.insert(cid, unicode_str);
-                            bfchar_codes.remove(&cid);
-                        }
-                        if cid >= end {
-                            // Skip remaining entries and closing bracket
-                            while chars.peek().is_some_and(|&c| c != ']') {
-                                chars.next();
-                            }
-                            if chars.peek() == Some(&']') {
-                                chars.next();
-                            }
-                            break;
-                        }
-                        cid = cid.saturating_add(1);
+                match (parse_hex_u16(&start_hex), parse_hex_u16(&end_hex)) {
+                    (Some(start), Some(end)) => {
+                        self.parse_bfrange_array(&mut chars, start, end, bfchar_codes);
                     }
-                } else {
                     // Couldn't parse start/end, skip the array
-                    while chars.peek().is_some_and(|&c| c != ']') {
-                        chars.next();
-                    }
-                    if chars.peek() == Some(&']') {
-                        chars.next();
-                    }
+                    _ => skip_past_closing_bracket(&mut chars),
                 }
             }
+        }
+    }
+
+    /// Parse the entries of a bfrange array `[<u1> <u2> ...]` after its opening
+    /// bracket. Each entry maps to `start + index`.
+    fn parse_bfrange_array(
+        &mut self,
+        chars: &mut Peekable<Chars<'_>>,
+        start: u16,
+        end: u16,
+        bfchar_codes: &mut HashSet<u16>,
+    ) {
+        let mut cid = start;
+        loop {
+            skip_whitespace(chars);
+            if chars.peek() == Some(&']') {
+                chars.next();
+                break;
+            }
+            let Some(hex) = read_angle_hex(chars) else {
+                break;
+            };
+            if let Some(unicode_str) = hex_to_unicode_string(&hex) {
+                self.char_map.insert(cid, unicode_str);
+                bfchar_codes.remove(&cid);
+            }
+            if cid >= end {
+                // Skip remaining entries and closing bracket
+                skip_past_closing_bracket(chars);
+                break;
+            }
+            cid = cid.saturating_add(1);
         }
     }
 
@@ -3847,6 +3801,34 @@ fn build_fallback_cmap_for_simple(
     }
     let program = embedded_font_program(font_dict, doc)?;
     program_fallback_cmap(font_dict, doc, Some(&program))
+}
+
+/// Advance past any whitespace.
+fn skip_whitespace(chars: &mut Peekable<Chars<'_>>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
+}
+
+/// If the next character is `<`, consume `<hex>` and return the hex text.
+/// The closing `>` is consumed when present.
+fn read_angle_hex(chars: &mut Peekable<Chars<'_>>) -> Option<String> {
+    if chars.peek() != Some(&'<') {
+        return None;
+    }
+    chars.next(); // consume <
+    let mut hex = String::new();
+    while let Some(c) = chars.next_if(|&c| c != '>') {
+        hex.push(c);
+    }
+    chars.next(); // consume >
+    Some(hex)
+}
+
+/// Skip up to and including the next `]`.
+fn skip_past_closing_bracket(chars: &mut Peekable<Chars<'_>>) {
+    while chars.next_if(|&c| c != ']').is_some() {}
+    chars.next_if_eq(&']');
 }
 
 #[cfg(test)]
