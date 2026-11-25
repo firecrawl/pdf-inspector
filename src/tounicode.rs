@@ -249,6 +249,60 @@ fn repair_control_destinations<'p>(
     }
 }
 
+/// The fewest Arabic letters a CMap reads for it to be an Arabic font's.
+const ARABIC_CMAP_MIN_ENTRIES: usize = 8;
+/// How far below the baseline a kashida glyph may reach, in em.
+const KASHIDA_MAX_BELOW_BASELINE: f32 = 0.03;
+/// How high a kashida glyph may rise above the baseline, in em.
+const KASHIDA_MAX_HEIGHT: f32 = 0.2;
+/// The least width of a kashida glyph, in em.
+const KASHIDA_MIN_WIDTH: f32 = 0.1;
+
+/// Drop the U+FFFD entries of `target` that read a kashida.
+///
+/// A justified Arabic line is stretched with kashida (tatweel) glyphs, and
+/// some producers (InDesign) give that glyph the destination U+FFFD, so
+/// every stretch shows up as a replacement character in the middle of a
+/// word. A kashida is no part of the text, so such an entry is emptied: the
+/// code reads as nothing. An entry is emptied only when the CMap is that of
+/// an Arabic-script font ([`ToUnicodeCMap::is_arabic_script`]) and the
+/// glyph itself, in `program`, is a kashida ([`ProgramGlyphs::is_kashida`]);
+/// any other U+FFFD entry keeps reading as a decode failure.
+fn repair_kashida_destinations<'p>(
+    target: &mut ToUnicodeCMap,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    program: impl FnOnce() -> Option<&'p [u8]>,
+) {
+    let codes = target.replacement_codes();
+    if codes.is_empty() || !target.is_arabic_script() {
+        return;
+    }
+    let Some(cid_font_dict) = get_descendant_cid_font(font_dict, doc) else {
+        return;
+    };
+    let Some(program) = program() else {
+        return;
+    };
+    let Some(glyphs) = ProgramGlyphs::parse(program) else {
+        return;
+    };
+    let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
+    let mut changed = false;
+    for code in codes {
+        let is_kashida = glyphs
+            .glyph_of(cid_to_gid.as_deref(), code)
+            .is_some_and(|gid| glyphs.is_kashida(gid));
+        if is_kashida {
+            target.char_map.insert(code, String::new());
+            changed = true;
+        }
+    }
+    if changed {
+        target.refresh_gap_fills();
+    }
+}
+
 /// Give a font's CMaps their roles in a [`CMapEntry`]. `primary` is the
 /// parsed ToUnicode CMap, `remapped` its subset remap when
 /// [`try_remap_subset_cmap`] made one, `fallback` the font's own reading
@@ -359,17 +413,7 @@ fn blank_cid_glyph_spaces(
         return Vec::new();
     };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
-    // The glyph a CID selects: through the charset of a CID-keyed CFF
-    // program; else through the CIDToGIDMap, when the map has one for it —
-    // a CID past the map's end, or sent to glyph 0, has no glyph of its
-    // own, and its code stays what the CMap says of it; else the CID itself.
-    let glyph_of = |cid: u16| -> Option<u16> {
-        match (&glyphs.charset, cid_to_gid.as_ref()) {
-            (Some(by_cid), _) => by_cid.get(&cid).copied(),
-            (None, None) => Some(cid),
-            (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
-        }
-    };
+    let glyph_of = |cid: u16| glyphs.glyph_of(cid_to_gid.as_deref(), cid);
     let mut with_glyph = 0usize;
     let blanks: Vec<(u16, String)> = codes
         .iter()
@@ -428,6 +472,47 @@ impl<'a> ProgramGlyphs<'a> {
             .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
             .map(|cff| cff_cid_to_gid(&cff));
         Some(Self { outlines, charset })
+    }
+
+    /// The glyph a CID selects: through the charset of a CID-keyed CFF
+    /// program; else through the CIDToGIDMap, when the map has one for it —
+    /// a CID past the map's end, or sent to glyph 0, has no glyph of its
+    /// own, and its code stays what the CMap says of it; else the CID itself.
+    fn glyph_of(&self, cid_to_gid: Option<&[u16]>, cid: u16) -> Option<u16> {
+        match (&self.charset, cid_to_gid) {
+            (Some(by_cid), _) => by_cid.get(&cid).copied(),
+            (None, None) => Some(cid),
+            (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
+        }
+    }
+
+    /// Whether glyph `gid` is a kashida (tatweel): a flat stroke on the
+    /// baseline that reaches both edges of its advance, so that it joins the
+    /// letters on either side. Only an sfnt's glyphs are measured; a bare CFF
+    /// program says nothing here.
+    fn is_kashida(&self, gid: u16) -> bool {
+        let Outlines::Sfnt(face) = &self.outlines else {
+            return false;
+        };
+        let glyph = ttf_parser::GlyphId(gid);
+        let (Some(bbox), Some(advance)) = (
+            face.glyph_bounding_box(glyph),
+            face.glyph_hor_advance(glyph),
+        ) else {
+            return false;
+        };
+        let em = f32::from(face.units_per_em());
+        let (width, height) = (
+            f32::from(bbox.x_max - bbox.x_min),
+            f32::from(bbox.y_max - bbox.y_min),
+        );
+        advance > 0
+            && bbox.x_min <= 0
+            && i32::from(bbox.x_max) >= i32::from(advance)
+            && f32::from(bbox.y_min) >= -KASHIDA_MAX_BELOW_BASELINE * em
+            && f32::from(bbox.y_max) <= KASHIDA_MAX_HEIGHT * em
+            && width >= KASHIDA_MIN_WIDTH * em
+            && width > height
     }
 
     /// Whether the program has a glyph at `gid`: an index below its glyph
@@ -708,6 +793,11 @@ fn font_cmap_entry(
             font_dict,
             doc,
         );
+    }
+    // The kashida entries are read from the ToUnicode CMap's own codes, so
+    // only it is repaired, not its subset remap (whose codes are renumbered).
+    if build.program_repair {
+        repair_kashida_destinations(&mut primary, font_dict, doc, || program.bytes());
     }
     cmap_entry(
         primary,
@@ -1172,6 +1262,62 @@ impl ToUnicodeCMap {
         codes.into_iter().collect()
     }
 
+    /// The codes whose destination is U+FFFD alone: a direct entry, or the
+    /// first code of a range that starts at it.
+    pub(crate) fn replacement_codes(&self) -> Vec<u16> {
+        let mut codes: std::collections::BTreeSet<u16> = self
+            .char_map
+            .iter()
+            .filter(|(_, text)| text.as_str() == "\u{FFFD}")
+            .map(|(&code, _)| code)
+            .collect();
+        codes.extend(
+            self.ranges
+                .iter()
+                .filter(|&&(start, end, base)| start <= end && base == 0xFFFD)
+                .map(|&(start, _, _)| start),
+        );
+        codes.into_iter().collect()
+    }
+
+    /// Whether `bytes` is a string of two-byte codes that this CMap reads
+    /// as nothing at all, each code being an entry emptied by
+    /// [`repair_kashida_destinations`]. Such a string (a lone kashida in a
+    /// justified line) is no failed decode, and decodes to the empty text.
+    pub(crate) fn reads_as_nothing(&self, bytes: &[u8]) -> bool {
+        self.code_byte_length == 2
+            && !bytes.is_empty()
+            && bytes.len().is_multiple_of(2)
+            && bytes.chunks_exact(2).all(|chunk| {
+                self.destination(u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .is_some_and(|text| text.is_empty())
+            })
+    }
+
+    /// Whether the CMap is that of an Arabic-script font: at least
+    /// [`ARABIC_CMAP_MIN_ENTRIES`] of its single-character destinations are
+    /// Arabic letters, and they are at least a third of all the
+    /// destinations that are not U+FFFD.
+    pub(crate) fn is_arabic_script(&self) -> bool {
+        let is_arabic = |ch: char| {
+            matches!(ch, '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}'
+                | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}')
+        };
+        let (mut arabic, mut total) = (0usize, 0usize);
+        for text in self
+            .char_map
+            .values()
+            .filter(|text| text.as_str() != "\u{FFFD}")
+        {
+            total += 1;
+            let mut chars = text.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                arabic += usize::from(is_arabic(ch));
+            }
+        }
+        arabic >= ARABIC_CMAP_MIN_ENTRIES && arabic * 3 >= total
+    }
+
     /// Give `codes` — control destinations of this CMap — the text `source`
     /// has for them: the font's own reading of the same codes. Every other
     /// entry is left alone, and a code `source` cannot read stays a
@@ -1291,7 +1437,7 @@ impl ToUnicodeCMap {
                 match self.lookup_code(code) {
                     CodeMapping::Text(s) if !s.contains('\u{FFFD}') => {
                         append(&mut result, &s);
-                        contributing += 1;
+                        contributing += usize::from(!s.is_empty());
                     }
                     CodeMapping::ControlDestination => {
                         result.push('\u{FFFD}');
@@ -1319,7 +1465,8 @@ impl ToUnicodeCMap {
                     match self.lookup_code(cid) {
                         CodeMapping::Text(s) if !s.contains('\u{FFFD}') => {
                             append(&mut result, &s);
-                            contributing += 1;
+                            // A code read as nothing (a kashida) adds no text.
+                            contributing += usize::from(!s.is_empty());
                         }
                         CodeMapping::ControlDestination => {
                             result.push('\u{FFFD}');
@@ -3780,6 +3927,10 @@ fn build_fallback_cmap_for_simple(
     let program = embedded_font_program(font_dict, doc)?;
     program_fallback_cmap(font_dict, doc, Some(&program))
 }
+
+#[cfg(test)]
+#[path = "tounicode_kashida_tests.rs"]
+mod kashida_tests;
 
 #[cfg(test)]
 mod tests {

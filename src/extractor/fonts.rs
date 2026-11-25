@@ -2866,6 +2866,10 @@ pub(crate) fn extract_text_from_operand(
                 // the codes it could not read as unmapped; a simple font's
                 // string is read by its encoding below, and a CMap keyed by
                 // two-byte codes over its one-byte string says nothing.
+                if entry.primary.reads_as_nothing(bytes) {
+                    // Nothing but kashidas, which are no text.
+                    return Some(String::new());
+                }
                 if is_type0_cid_font {
                     // An odd-length string none of whose bytes any CMap
                     // reads is counted byte by byte, as read above, not

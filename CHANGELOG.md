@@ -7,6 +7,19 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Justified Arabic text from PDFs whose ToUnicode map reads the kashida
+  (tatweel) glyph as U+FFFD, as InDesign writes it, no longer shows a
+  replacement character for every stretch in a word (`الش���خصية` is now
+  `الشخصية`). The entry is dropped only when the CMap is that of an
+  Arabic font and the glyph itself is a flat stroke on the baseline that
+  spans its advance; any other U+FFFD entry still counts as a decode
+  failure. Pages that carried such characters are no longer flagged for
+  OCR because of them.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
