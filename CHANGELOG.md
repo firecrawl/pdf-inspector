@@ -26,7 +26,9 @@ version and date. Earlier releases are described in their
   Known limitations: only the primary ToUnicode map is read, not its
   renumbered subset remap, and a ToUnicode stream written inline in the font
   dictionary is not; a bare CFF program is not measured; the fast
-  page-detection mode does not apply it.
+  page-detection mode does not apply it; a malformed string of an odd
+  number of bytes is read a byte at a time, so its kashidas are dropped only
+  when no byte is read and the string falls back to pairs.
 - Arabic text set in a simple (non-Type0) font whose ToUnicode map reads a
   code as U+FFFD, as InDesign writes the dotted first piece of a letter it
   split over two glyphs, no longer shows a Latin letter for that code

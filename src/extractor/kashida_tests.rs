@@ -396,7 +396,41 @@ fn an_odd_length_string_is_read_by_the_byte_not_by_pairs_of_a_kashida() {
     assert_eq!(font_kashida_codes(&doc), vec![0x100]);
     let text = |bytes: &[u8]| decode_page_font_string_as(&doc.0, "F1", doc.1, doc.2, true, bytes);
     assert_eq!(text(&[1, 0, 1]), "\u{628}\u{628}");
-    assert_eq!(text(&[0, 1, 1, 0, 0, 1]), "\u{628}\u{628}");
+}
+
+#[test]
+fn the_kashidas_of_a_string_of_pairs_are_dropped_pair_by_pair() {
+    // The same font, a string of six bytes: three codes, of which the
+    // middle one (0x0100) is dropped and the letters on both sides stay.
+    let map: Vec<u16> = (0..=u16::MAX)
+        .map(|cid| if cid < 0x100 { 1 } else { 2 })
+        .collect();
+    let doc = document(&bfchar(&[0x100], ARABIC), program(&GLYPHS), Some(&map));
+    assert_eq!(decode(&doc, "F1", &[1, 0x100, 1]), "\u{628}\u{628}");
+}
+
+/// A font whose code 1 is a kashida read as U+FFFD (glyph 2; every other
+/// code is glyph 1).
+fn kashida_at_code_one() -> (Document, u32, ObjectId) {
+    let map: Vec<u16> = (0..=u16::MAX)
+        .map(|cid| if cid == 1 { 2 } else { 1 })
+        .collect();
+    let cmap = format!("<0001> <FFFD>\n{ARABIC}");
+    let doc = document(&cmap, program(&GLYPHS), Some(&map));
+    assert_eq!(font_kashida_codes(&doc), vec![1]);
+    doc
+}
+
+#[test]
+fn an_odd_string_no_byte_of_which_is_read_drops_its_kashida_pairs() {
+    // No byte of 0x00 0x01 0x00 is read as text, so the decoder takes the
+    // string in pairs: the pair 0x0001 is a kashida and is no U+FFFD.
+    let doc = kashida_at_code_one();
+    let text = |bytes: &[u8]| decode_page_font_string_as(&doc.0, "F1", doc.1, doc.2, true, bytes);
+    assert_eq!(text(&[0, 1, 0]), "");
+    assert_eq!(text(&[0, 1, 0, 1, 0]), "");
+    // A byte that is read as text keeps the string read by the byte.
+    assert_eq!(text(&[0, 1, 0x10]), "\u{627}");
 }
 
 #[test]
@@ -420,4 +454,20 @@ fn a_code_a_direct_entry_overrides_is_not_counted_with_its_range() {
 1 beginbfrange\n<0001><0004><0627>\nendbfrange";
     let some = ToUnicodeCMap::parse(some.as_bytes()).unwrap();
     assert!(some.reads_arabic_letters());
+}
+
+#[test]
+fn ranges_that_share_a_start_are_read_alike_by_the_decoder_and_the_arabic_count() {
+    // Eight Arabic letters from code 1, and a second range from code 1 whose
+    // character is no scalar value, so code 1 is read through the first.
+    // Code 1 has an entry of its own: seven letters are left to the range.
+    let mut cmap = ToUnicodeCMap::new();
+    cmap.ranges = vec![(1, 8, 0x627), (1, 1, 0xD800)];
+    assert!(cmap.reads_arabic_letters());
+    cmap.char_map.insert(1, "a".to_string());
+    assert_eq!(cmap.lookup(1).as_deref(), Some("a"));
+    assert!(!cmap.reads_arabic_letters());
+    // Without the entry, the decoder reads code 1 through the first range.
+    cmap.char_map.clear();
+    assert_eq!(cmap.lookup(1).as_deref(), Some("\u{627}"));
 }
