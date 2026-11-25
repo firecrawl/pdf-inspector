@@ -3875,12 +3875,6 @@ mod tests {
         // A neighbour is missing.
         let c = parse("<0010> <0030>\n<0011> <0028>\n");
         assert_eq!(c.lookup(0x11), Some("(".to_string()));
-        // The entry lies in a range.
-        let src = "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
-                   2 beginbfchar\n<0010> <0030>\n<0012> <0032>\nendbfchar\n\
-                   1 beginbfrange\n<0011> <0011> <0028>\nendbfrange\n";
-        let c = ToUnicodeCMap::parse(src.as_bytes()).unwrap();
-        assert_eq!(c.lookup(0x11), Some("(".to_string()));
     }
 
     #[test]
@@ -3898,6 +3892,21 @@ mod tests {
             b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
               9 beginbfchar\n<0010> <0030>\n<0011> <0028>\n<0012> <0032>\n<0013> <0033>\n\
               <0014> <0034>\n<0015> <0035>\n<0016> <0036>\n<0017> <0037>\n<0018> <0038>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_leaves_an_entry_inside_a_range_alone() {
+        // Code 0x11 is a bfchar entry and also lies in a bfrange, with the
+        // other nine codes of the table explicit bfchar digits.
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              10 beginbfchar\n<0010> <0030>\n<0011> <0028>\n<0012> <0032>\n<0013> <0033>\n\
+              <0014> <0034>\n<0015> <0035>\n<0016> <0036>\n<0017> <0037>\n<0018> <0038>\n\
+              <0019> <0039>\nendbfchar\n\
+              1 beginbfrange\n<0011> <0011> <0028>\nendbfrange\n",
         )
         .unwrap();
         assert_eq!(c.lookup(0x11), Some("(".to_string()));
