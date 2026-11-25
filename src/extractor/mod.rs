@@ -113,13 +113,14 @@ impl PositionOptions {
     }
 
     /// The content-stream switches these options ask for.
-    pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions {
+    pub(crate) fn text_extraction(self, include_invisible: bool) -> TextExtractionOptions<'static> {
         TextExtractionOptions {
             include_invisible,
             bold_from_weight: self.bold_from_weight,
             bold_weight_threshold: self.bold_weight_threshold.clamp(100, 900),
             // The position readers report no CMap coverage.
             cmap_coverage: false,
+            tagged_table_cells: None,
         }
     }
 }
@@ -405,7 +406,7 @@ pub(crate) fn extract_page_text_items_in_page_box_with_options(
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-    options: TextExtractionOptions,
+    options: TextExtractionOptions<'_>,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<PageBoxExtraction, PdfError> {
@@ -462,26 +463,9 @@ pub(crate) type DocumentExtraction = (
     CMapCoverageByFont,
 );
 
-/// Extract positioned text, rectangles, and line segments from a pre-loaded document.
-///
-/// Also returns per-page adaptive join thresholds for Canva-style pages.
-pub(crate) fn extract_positioned_text_from_doc(
-    doc: &Document,
-    font_cmaps: &FontCMaps,
-    page_filter: Option<&HashSet<u32>>,
-) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_impl(
-        doc,
-        font_cmaps,
-        page_filter,
-        TextExtractionOptions::default(),
-        None,
-        CoordinateFrame::UserSpace,
-    )
-}
-
-/// [`extract_positioned_text_from_doc`] with every page's geometry shifted
-/// into the visible-page-box frame — what the public position APIs return.
+/// Extract positioned text from a pre-loaded document with every page's
+/// geometry shifted into the visible-page-box frame — what public position
+/// APIs return.
 /// A page whose frame was turned (see `PageRotation`) gets the equivalently
 /// turned shift, so its items, links and form fields agree with region
 /// bounds computed from the visible box.
@@ -520,8 +504,15 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    tagged_table_cells: &crate::structure_tree::TaggedTableCellIndex,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        false,
+        tagged_table_cells,
+    )
 }
 
 /// Invisible-text variant of [`extract_positioned_text_with_folio_context`].
@@ -529,8 +520,15 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
+    tagged_table_cells: &crate::structure_tree::TaggedTableCellIndex,
 ) -> Result<DocumentExtraction, PdfError> {
-    extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
+    extract_positioned_text_with_folio_context_impl(
+        doc,
+        font_cmaps,
+        page_filter,
+        true,
+        tagged_table_cells,
+    )
 }
 
 fn extract_positioned_text_with_folio_context_impl(
@@ -538,12 +536,14 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
+    tagged_table_cells: &crate::structure_tree::TaggedTableCellIndex,
 ) -> Result<DocumentExtraction, PdfError> {
     // The selected pages report their CMap coverage; the context pages
     // gathered below for their folio evidence do not.
     let options = TextExtractionOptions {
         include_invisible,
         cmap_coverage: true,
+        tagged_table_cells: Some(tagged_table_cells),
         ..TextExtractionOptions::default()
     };
     let Some(required_pages) = page_filter else {
@@ -627,14 +627,18 @@ fn extract_positioned_text_with_folio_context_impl(
 pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
-    required_pages: &HashSet<u32>,
+    required_pages: Option<&HashSet<u32>>,
+    tagged_table_cells: &crate::structure_tree::TaggedTableCellIndex,
 ) -> Result<DocumentExtraction, PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
         None,
-        TextExtractionOptions::default(),
-        Some(required_pages),
+        TextExtractionOptions {
+            tagged_table_cells: Some(tagged_table_cells),
+            ..TextExtractionOptions::default()
+        },
+        required_pages,
         CoordinateFrame::UserSpace,
     )
 }
@@ -643,7 +647,7 @@ fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-    options: TextExtractionOptions,
+    options: TextExtractionOptions<'_>,
     required_pages: Option<&HashSet<u32>>,
     frame: CoordinateFrame,
 ) -> Result<DocumentExtraction, PdfError> {
@@ -1944,7 +1948,7 @@ fn compose_detached_spacing_accents<'a>(
 
 #[cfg(test)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    merge_text_items_with_clips(items, &[], false, &[])
+    merge_text_items_with_clips(items, &[], false, &[], None)
 }
 
 /// The separators a number is written with: point, comma, colon, slash
@@ -2042,6 +2046,7 @@ fn merge_text_items_with_clips(
     clips: &[Option<clip_boundaries::ClipRect>],
     visual_rtl: bool,
     replaced_text: &[bool],
+    tagged_cells: Option<&HashMap<i64, usize>>,
 ) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -2221,6 +2226,7 @@ fn merge_text_items_with_clips(
     ordered_line_groups.sort_by(|a, b| a.page.cmp(&b.page).then_with(|| b.y.total_cmp(&a.y)));
 
     let mut merged = Vec::new();
+    let table_cell = |item: &TextItem| item.mcid.and_then(|mcid| tagged_cells?.get(&mcid));
 
     for line in &ordered_line_groups {
         let LineGroup {
@@ -2264,6 +2270,7 @@ fn merge_text_items_with_clips(
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
+            let first_cell = table_cell(first);
             let mut text = texts[i].to_string();
             let mut legacy_symbol_rewrite = first.legacy_symbol_rewrite;
             let mut end_x = first.x + effective_merge_width(first);
@@ -2281,6 +2288,10 @@ fn merge_text_items_with_clips(
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
+                // Separate table-cell tags even when the printed gap is small.
+                if table_cell(next) != first_cell {
+                    break;
+                }
                 let next_text: &str = &texts[j];
                 let gap = if *bidi {
                     junction_gap(j - 1, j)
@@ -2996,7 +3007,7 @@ mod tests {
         let mut more = make_merge_item("text", 163.6, 24.0);
         more.font_weight = Some(300);
         let items = vec![label.clone(), body.clone(), more.clone()];
-        let merged = merge_text_items_with_clips(items, &[], false, &[]);
+        let merged = merge_text_items_with_clips(items, &[], false, &[], None);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "Label: body text");
         assert_eq!(merged[0].font_weight, Some(500));
@@ -3008,7 +3019,7 @@ mod tests {
         // "body".
         let mut items = vec![label, body, more];
         super::content_stream::read_bold_from_weight(&mut items, 500);
-        let apart = merge_text_items_with_clips(items, &[], false, &[]);
+        let apart = merge_text_items_with_clips(items, &[], false, &[], None);
         assert_eq!(apart.len(), 2);
         assert_eq!(apart[0].text, "Label: ");
         assert!(apart[0].is_bold);
@@ -3028,7 +3039,7 @@ mod tests {
         named.bold_source = Some(BoldSource::FontName);
         let mut items = vec![heavy, named];
         super::content_stream::read_bold_from_weight(&mut items, 600);
-        let merged = merge_text_items_with_clips(items, &[], false, &[]);
+        let merged = merge_text_items_with_clips(items, &[], false, &[], None);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "Heavy named");
         assert_eq!(merged[0].font_weight, Some(700));
@@ -3040,7 +3051,7 @@ mod tests {
             make_merge_item("weight", 113.2, 36.0),
         ];
         assert_eq!(
-            merge_text_items_with_clips(unknown, &[], false, &[]).len(),
+            merge_text_items_with_clips(unknown, &[], false, &[], None).len(),
             1
         );
     }
@@ -5399,8 +5410,15 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
         let font_cmaps = FontCMaps::from_doc(&doc);
-        let ((items, _, _), _, _, page_rotations, _) =
-            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        let ((items, _, _), _, _, page_rotations, _) = extract_positioned_text_impl(
+            &doc,
+            &font_cmaps,
+            None,
+            TextExtractionOptions::default(),
+            None,
+            CoordinateFrame::UserSpace,
+        )
+        .unwrap();
         assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
         let field = items
             .iter()
@@ -5730,7 +5748,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
             accent,
             make_merge_item("eal", 107.3, 20.0),
         ];
-        let merged = merge_text_items_with_clips(items, &[], false, &[false, false, true]);
+        let merged = merge_text_items_with_clips(items, &[], false, &[false, false, true], None);
         assert!(
             merged.iter().any(|item| item.text.contains('\u{00B4}')),
             "{merged:?}"
@@ -5895,7 +5913,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         // read into logical order, with no space on either side, whether
         // the page stores its runs in visual or in logical order.
         for visual in [false, true] {
-            let merged = merge_text_items_with_clips(pointed_rtl_word(), &[], visual, &[]);
+            let merged = merge_text_items_with_clips(pointed_rtl_word(), &[], visual, &[], None);
             assert_eq!(merged.len(), 1, "visual={visual}: {merged:?}");
             assert_eq!(
                 merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}",

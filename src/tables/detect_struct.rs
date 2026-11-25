@@ -203,17 +203,18 @@ fn align_struct_rows(
 fn left_align_struct_rows(
     raw_rows: &[Vec<MatchedCell>],
     num_cols: usize,
+    tagged_header_columns: Option<&[f32]>,
 ) -> (Vec<Vec<String>>, Vec<f32>, Vec<usize>) {
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(raw_rows.len());
     let mut row_positions: Vec<f32> = Vec::with_capacity(raw_rows.len());
     let mut all_item_indices: Vec<usize> = Vec::new();
 
     for row in raw_rows {
-        let mut row_cells: Vec<String> = row.iter().map(|cell| cell.text.clone()).collect();
-        row_cells.truncate(num_cols);
-        while row_cells.len() < num_cols {
-            row_cells.push(String::new());
-        }
+        let mut row_cells = tagged_header_columns
+            .filter(|columns| row.len() < columns.len())
+            .and_then(|columns| restore_missing_tagged_cells(row, columns))
+            .unwrap_or_else(|| row.iter().map(|cell| cell.text.clone()).collect());
+        row_cells.resize(num_cols, String::new());
         cells.push(row_cells);
 
         all_item_indices.extend(
@@ -229,6 +230,50 @@ fn left_align_struct_rows(
     }
 
     (cells, row_positions, all_item_indices)
+}
+
+/// Some tagged PDFs omit empty cell elements. Use a complete tagged header to
+/// recover those gaps when every cell fits a distinct column in row order.
+fn restore_missing_tagged_cells(row: &[MatchedCell], columns: &[f32]) -> Option<Vec<String>> {
+    let mut cells = vec![String::new(); columns.len()];
+    let mut next_column = 0;
+
+    for cell in row {
+        // An explicit empty tag claims a slot even when it has no position.
+        // Reserving the earliest free slot leaves room for omitted gaps.
+        if cell.x.is_none() && cell.text.is_empty() && cell.item_indices.is_empty() {
+            if next_column >= columns.len() {
+                return None;
+            }
+            next_column += 1;
+            continue;
+        }
+        let x = cell.x.filter(|x| x.is_finite())?;
+        let right = columns.partition_point(|&anchor| anchor < x);
+        let left = right.saturating_sub(1);
+        let column = if columns
+            .get(right)
+            .is_some_and(|anchor| (x - anchor).abs() < (x - columns[left]).abs())
+        {
+            right
+        } else {
+            left
+        };
+        let anchor = columns[column];
+        let left_gap = column
+            .checked_sub(1)
+            .map_or(f32::INFINITY, |i| anchor - columns[i]);
+        let right_gap = columns
+            .get(column + 1)
+            .map_or(f32::INFINITY, |next| next - anchor);
+        if column < next_column || (x - anchor).abs() * 2.0 >= left_gap.min(right_gap) {
+            return None;
+        }
+        cells[column].clone_from(&cell.text);
+        next_column = column + 1;
+    }
+
+    Some(cells)
 }
 
 fn recover_unclaimed_header_row(table: &mut Table, items: &[TextItem], has_ragged_rows: bool) {
@@ -530,8 +575,17 @@ pub fn detect_tables_from_struct_tree(
         });
         let fallback_col_positions =
             legacy_column_positions(&page_rows, &mcid_to_items, items, page, num_cols);
+        let tagged_header_columns = (page_rows[0].cells.iter().all(|cell| cell.is_header)
+            && raw_rows[0].len() == num_cols
+            && raw_rows[0]
+                .iter()
+                .all(|cell| cell.x.is_some_and(f32::is_finite))
+            && fallback_col_positions
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]))
+        .then_some(fallback_col_positions.as_slice());
         let (legacy_cells, legacy_row_positions, mut legacy_item_indices) =
-            left_align_struct_rows(&raw_rows, num_cols);
+            left_align_struct_rows(&raw_rows, num_cols, tagged_header_columns);
         legacy_item_indices.sort_unstable();
         legacy_item_indices.dedup();
         let legacy_table = Table::new(
@@ -1097,6 +1151,91 @@ mod tests {
         assert_eq!(table.cells[2], vec!["Third value", ""]);
         assert!(!table.item_indices.contains(&0));
         assert!(!table.item_indices.contains(&1));
+    }
+
+    const STATEMENT_ROWS: [[&str; 5]; 4] = [
+        ["Date", "Description", "Withdrawals", "Deposits", "Balance"],
+        ["10/01", "LOAN PMT", "2,675.12", "", "15,777.25"],
+        ["10/06", "MOBILE DEPOSIT", "", "6,146.48", "21,923.73"],
+        ["10/07", "NO MOVEMENT", "", "", "21,923.73"],
+    ];
+
+    fn tagged_statement_cells(omits_tag: impl Fn(usize, usize) -> bool) -> Vec<Vec<String>> {
+        let header_x = [76.8, 167.73, 272.77, 392.92, 502.86];
+        let body_x = [36.0, 144.6, 253.2, 361.79, 470.39];
+        let mut items = Vec::new();
+        let mut tagged_rows = Vec::new();
+        for (row_index, row) in STATEMENT_ROWS.iter().enumerate() {
+            let is_header = row_index == 0;
+            let coords = if is_header { header_x } else { body_x };
+            let mut cells = Vec::new();
+            for (column, text) in row.iter().enumerate() {
+                if text.is_empty() {
+                    if !omits_tag(row_index, column) {
+                        cells.push(StructTableCell {
+                            is_header: false,
+                            mcids: Vec::new(),
+                        });
+                    }
+                    continue;
+                }
+                let mcid = items.len() as i64;
+                items.push(make_item(
+                    text,
+                    coords[column],
+                    120.0 - row_index as f32 * 20.0,
+                    1,
+                    Some(mcid),
+                ));
+                cells.push(StructTableCell {
+                    is_header,
+                    mcids: vec![(mcid, 1)],
+                });
+            }
+            tagged_rows.push(StructTableRow { cells });
+        }
+
+        let mut tables =
+            detect_tables_from_struct_tree(&items, &[StructTable { rows: tagged_rows }], 1);
+        assert_eq!(tables.len(), 1);
+        tables.remove(0).cells
+    }
+
+    #[test]
+    fn tagged_statement_keeps_explicit_empty_cells() {
+        assert_eq!(
+            tagged_statement_cells(|_, _| false),
+            STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
+        );
+    }
+
+    #[test]
+    fn tagged_statement_restores_omitted_empty_cells() {
+        // Chrome omits the structure element for an empty HTML cell.
+        assert_eq!(
+            tagged_statement_cells(|_, _| true),
+            STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
+        );
+    }
+
+    #[test]
+    fn tagged_statement_restores_omitted_cells_next_to_explicit_blanks() {
+        assert_eq!(
+            tagged_statement_cells(|row, column| row != 3 || column == 3),
+            STATEMENT_ROWS.map(|row| row.map(String::from).to_vec())
+        );
+    }
+
+    #[test]
+    fn tagged_row_gap_recovery_declines_ambiguous_positions() {
+        let row = [MatchedCell {
+            text: "100".into(),
+            item_indices: vec![0],
+            x: Some(15.0),
+            y: Some(100.0),
+        }];
+
+        assert!(restore_missing_tagged_cells(&row, &[10.0, 20.0, 30.0]).is_none());
     }
 
     #[test]

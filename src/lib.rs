@@ -637,6 +637,17 @@ fn extract_pages_markdown_mem_impl(
     let _ = (repairs, render_repairs);
     let font_cmaps = FontCMaps::from_doc(&doc);
 
+    // Sparse tables use the tagged header positions to preserve the column of
+    // each cell. Build their index before extraction joins adjacent text runs.
+    let sparse_tagged_tables = structure_tree::StructTree::from_doc(&doc)
+        .map(|tree| {
+            let mut tables = tree.extract_tables(&doc.get_pages());
+            tables.retain(structure_tree::is_sparse_tagged_table);
+            tables
+        })
+        .unwrap_or_default();
+    let tagged_table_cells = structure_tree::index_sparse_tagged_table_cells(&sparse_tagged_tables);
+
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
     // unselected page cannot make a valid requested page fail, but errors on a
     // requested page retain the normal extraction semantics.
@@ -647,15 +658,12 @@ fn extract_pages_markdown_mem_impl(
             .collect()
     });
     let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
-        if let Some(required_pages) = required_pages.as_ref() {
-            extractor::extract_positioned_text_for_document_analysis(
-                &doc,
-                &font_cmaps,
-                required_pages,
-            )?
-        } else {
-            extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
-        };
+        extractor::extract_positioned_text_for_document_analysis(
+            &doc,
+            &font_cmaps,
+            required_pages.as_ref(),
+            &tagged_table_cells,
+        )?;
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -796,7 +804,7 @@ fn extract_pages_markdown_mem_impl(
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
-                    struct_tables: &[],
+                    struct_tables: &sparse_tagged_tables,
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
@@ -4646,6 +4654,27 @@ fn process_document(
         });
     }
 
+    // Parse the structure tree before extraction so text joins know where
+    // one tagged table cell ends and another begins.
+    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
+        .map(|tree| {
+            let page_ids = doc.get_pages();
+            let roles = tree.mcid_to_roles(&page_ids);
+            let tables = tree.extract_tables(&page_ids);
+            if !roles.is_empty() {
+                log::debug!(
+                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
+                    roles.len(),
+                    tree.mcid_count(),
+                    tables.len()
+                );
+            }
+            let roles = if roles.is_empty() { None } else { Some(roles) };
+            (roles, tables)
+        })
+        .unwrap_or((None, Vec::new()));
+    let tagged_table_cells = structure_tree::index_sparse_tagged_table_cells(&struct_tables);
+
     // Step 2 — Extraction (reuses the already-loaded document)
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
@@ -4656,6 +4685,7 @@ fn process_document(
             &doc,
             &font_cmaps,
             options.page_filter.as_ref(),
+            &tagged_table_cells,
         );
 
         // For Mixed/template PDFs: if normal extraction produces garbage text
@@ -4679,6 +4709,7 @@ fn process_document(
                         &doc,
                         &font_cmaps,
                         options.page_filter.as_ref(),
+                        &tagged_table_cells,
                     )
                 } else {
                     result
@@ -4689,6 +4720,7 @@ fn process_document(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
+                    &tagged_table_cells,
                 )
             }
         } else {
@@ -4702,25 +4734,6 @@ fn process_document(
     } else {
         Some(extracted?)
     };
-
-    // Parse structure tree for tagged PDFs (reuses the loaded document)
-    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
-        .map(|tree| {
-            let page_ids = doc.get_pages();
-            let roles = tree.mcid_to_roles(&page_ids);
-            let tables = tree.extract_tables(&page_ids);
-            if !roles.is_empty() {
-                log::debug!(
-                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
-                    roles.len(),
-                    tree.mcid_count(),
-                    tables.len()
-                );
-            }
-            let roles = if roles.is_empty() { None } else { Some(roles) };
-            (roles, tables)
-        })
-        .unwrap_or((None, Vec::new()));
 
     let (
         markdown,
