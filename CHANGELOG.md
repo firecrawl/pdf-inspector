@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A digit that a font's ToUnicode map writes as another character between
+  its neighbouring digits now reads as the digit. The footnote marker `1`
+  in an Arabic heading, written `())` because its glyph mapped to `(`
+  between the glyphs of `0` and `2`, reads `(1)`
+  (firecrawl/firecrawl#5931).
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.

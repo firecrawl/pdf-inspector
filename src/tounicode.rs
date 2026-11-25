@@ -927,9 +927,57 @@ impl ToUnicodeCMap {
                 warn!("usecmap={} could not be loaded", name);
             }
         }
+        cmap.repair_digit_between_digits();
         cmap.refresh_gap_fills();
 
         Some(cmap)
+    }
+
+    /// Rewrite an entry that sits between two digits in code order and
+    /// reads as something else. A subset font whose digit glyphs take
+    /// consecutive codes can carry one wrong ToUnicode entry: the glyph of
+    /// `1` between those of `0` and `2` written as `(`. An entry is
+    /// rewritten to the digit between its neighbours when it is explicit
+    /// (a `bfchar` entry, not inside a range), reads as one character that
+    /// is not a digit, and the entries one code before and after it each
+    /// read as one ASCII digit, the second two above the first.
+    fn repair_digit_between_digits(&mut self) {
+        let digit = |map: &HashMap<u16, String>, code: u16| -> Option<u8> {
+            let mut chars = map.get(&code)?.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_digit() => Some(c as u8 - b'0'),
+                _ => None,
+            }
+        };
+        let mut repairs = Vec::new();
+        for (&code, text) in &self.char_map {
+            let mut chars = text.chars();
+            let single_non_digit = matches!(
+                (chars.next(), chars.next()),
+                (Some(c), None) if !c.is_ascii_digit()
+            );
+            if !single_non_digit || code == 0 || code == u16::MAX {
+                continue;
+            }
+            if self
+                .ranges
+                .iter()
+                .any(|&(start, end, _)| (start..=end).contains(&code))
+            {
+                continue;
+            }
+            if let (Some(before), Some(after)) = (
+                digit(&self.char_map, code - 1),
+                digit(&self.char_map, code + 1),
+            ) {
+                if after == before + 2 {
+                    repairs.push((code, (b'0' + before + 1) as char));
+                }
+            }
+        }
+        for (code, ch) in repairs {
+            self.char_map.insert(code, ch.to_string());
+        }
     }
 
     /// Parse a bfchar section: <src> <dst> pairs
@@ -3784,6 +3832,52 @@ fn build_fallback_cmap_for_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digit_between_two_digits_written_as_another_char_reads_as_the_digit() {
+        let cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              4 beginbfchar\n<009A> <0030>\n<009B> <0028>\n<009C> <0032>\n<009D> <0033>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(cmap.lookup(0x9A), Some("0".to_string()));
+        assert_eq!(cmap.lookup(0x9B), Some("1".to_string()));
+        assert_eq!(cmap.lookup(0x9C), Some("2".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_leaves_other_entries_alone() {
+        let parse = |entries: &str| {
+            let src = format!(
+                "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+                 beginbfchar\n{entries}endbfchar\n"
+            );
+            ToUnicodeCMap::parse(src.as_bytes()).unwrap()
+        };
+        // Neighbours are not digits.
+        let c = parse("<0010> <0041>\n<0011> <0028>\n<0012> <0043>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        // Neighbours are not two apart.
+        let c = parse("<0010> <0030>\n<0011> <0028>\n<0012> <0033>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        let c = parse("<0010> <0032>\n<0011> <0028>\n<0012> <0030>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        // The entry is already a digit.
+        let c = parse("<0010> <0030>\n<0011> <0037>\n<0012> <0032>\n");
+        assert_eq!(c.lookup(0x11), Some("7".to_string()));
+        // The entry is not one character.
+        let c = parse("<0010> <0030>\n<0011> <00280029>\n<0012> <0032>\n");
+        assert_eq!(c.lookup(0x11), Some("()".to_string()));
+        // A neighbour is missing.
+        let c = parse("<0010> <0030>\n<0011> <0028>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        // The entry lies in a range.
+        let src = "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+                   2 beginbfchar\n<0010> <0030>\n<0012> <0032>\nendbfchar\n\
+                   1 beginbfrange\n<0011> <0011> <0028>\nendbfrange\n";
+        let c = ToUnicodeCMap::parse(src.as_bytes()).unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
 
     #[test]
     fn builtin_cmaps_are_embedded_in_the_binary() {
