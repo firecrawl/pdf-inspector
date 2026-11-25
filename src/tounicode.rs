@@ -1367,13 +1367,13 @@ impl ToUnicodeCMap {
             .filter(arabic_range)
             .map(|&(start, end, _)| usize::from(end.saturating_sub(start)) + 1)
             .fold(0usize, usize::saturating_add);
-        // The range a code falls in, found as `destination` finds it.
+        // The range a code reads through, found as `destination` finds it.
         let overridden = self
             .char_map
             .keys()
             .filter(|&&code| {
-                let at = self.ranges.partition_point(|&(start, _, _)| start <= code);
-                at > 0 && self.ranges[at - 1].1 >= code && arabic_range(&&self.ranges[at - 1])
+                self.range_of(code)
+                    .is_some_and(|range| arabic_range(&range))
             })
             .count();
         direct.saturating_add(ranged.saturating_sub(overridden)) >= ARABIC_CMAP_MIN_ENTRIES
@@ -1402,35 +1402,29 @@ impl ToUnicodeCMap {
             return Some(s.clone());
         }
 
-        // Binary search through sorted ranges
+        let &(start, _, base) = self.range_of(cid)?;
+        char::from_u32(base + u32::from(cid - start)).map(|c| c.to_string())
+    }
+
+    /// The range `cid` is read through, the one [`Self::destination`] uses
+    /// when no direct entry holds the code: of the sorted ranges, the one
+    /// at the position a bisection for the code ends at, else the one before
+    /// it (a range that starts before the code), whichever covers the code
+    /// and has a character for it. Every reading of a range goes through
+    /// here, so two ranges that share a start are never read differently.
+    fn range_of(&self, cid: u16) -> Option<&(u16, u16, u32)> {
         let idx = self
             .ranges
             .binary_search_by(|&(start, _, _)| start.cmp(&cid))
             .unwrap_or_else(|i| i);
-
-        // Check the range at idx (where start == cid)
-        if idx < self.ranges.len() {
-            let (start, end, base) = self.ranges[idx];
-            if cid >= start && cid <= end {
-                let unicode = base + (cid - start) as u32;
-                if let Some(c) = char::from_u32(unicode) {
-                    return Some(c.to_string());
-                }
-            }
-        }
-
-        // Check the range before idx (cid may fall within a range that starts before it)
-        if idx > 0 {
-            let (start, end, base) = self.ranges[idx - 1];
-            if cid >= start && cid <= end {
-                let unicode = base + (cid - start) as u32;
-                if let Some(c) = char::from_u32(unicode) {
-                    return Some(c.to_string());
-                }
-            }
-        }
-
-        None
+        let at = |slot: usize| {
+            self.ranges.get(slot).filter(|&&(start, end, base)| {
+                cid >= start
+                    && cid <= end
+                    && char::from_u32(base + u32::from(cid - start)).is_some()
+            })
+        };
+        at(idx).or_else(|| idx.checked_sub(1).and_then(at))
     }
 
     /// Per-byte CMap lookup without Latin-1 fallback.

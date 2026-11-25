@@ -230,7 +230,8 @@ pub(crate) fn add_kashida_codes(
 }
 
 /// `bytes`, a string of two-byte codes, without the codes in `kashidas`
-/// (sorted, as [`crate::tounicode::kashida_codes`] returns them).
+/// (sorted, as [`crate::tounicode::kashida_codes`] returns them). A last
+/// byte that is no pair is kept.
 fn without_kashidas(bytes: &[u8], kashidas: &[u16]) -> Vec<u8> {
     bytes
         .chunks(2)
@@ -2612,7 +2613,8 @@ pub(crate) fn extract_text_from_operand(
                 .get(current_font)
                 .map_or(&[][..], |info| info.kashida_codes.as_slice());
             let unjustified;
-            // An odd-length string is read a byte at a time, not in pairs.
+            // An odd-length string is read a byte at a time first, so its
+            // kashidas are dropped only where it is read in pairs (below).
             let bytes = if kashidas.is_empty() || bytes.len() % 2 == 1 {
                 bytes.as_slice()
             } else {
@@ -2863,6 +2865,20 @@ pub(crate) fn extract_text_from_operand(
                         unread_byte_stats = Some(byte_stats);
                     }
                 }
+                // An odd-length string no byte of which a CMap read is read
+                // in pairs here, its last byte left over: the pairs are
+                // those of the string from its start, and the kashidas
+                // among them are dropped as in an even string.
+                let paired;
+                let bytes = if bytes.len() % 2 == 1 && !kashidas.is_empty() {
+                    paired = without_kashidas(bytes, kashidas);
+                    if paired.len() == 1 && bytes.len() > 1 {
+                        return Some(String::new());
+                    }
+                    paired.as_slice()
+                } else {
+                    bytes
+                };
                 // Each reading keeps the CMap it came through, so the one
                 // taken joins the characters of its codes by that CMap's own
                 // code boundaries (see `CidDecode::joined`), and carries its

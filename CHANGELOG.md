@@ -27,7 +27,9 @@ version and date. Earlier releases are described in their
   renumbered subset remap, and a ToUnicode stream written inline in the font
   dictionary is not; a bare CFF program is not measured; a simple font whose
   kashida glyph is named by a `/Differences` entry is not covered; the fast
-  page-detection mode does not apply it.
+  page-detection mode does not apply it; a malformed string of an odd
+  number of bytes is read a byte at a time, so its kashidas are dropped only
+  when no byte is read and the string falls back to pairs.
 
 ## [1.27.1] - 2026-11-24
 
