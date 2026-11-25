@@ -210,7 +210,8 @@ pub(crate) fn scaled_run_geometry(
     )
 }
 
-/// `em` is the rendered font size, negative when the `Tf` size was.
+/// `em` is the rendered font size (`effective_font_size`, the em height
+/// along the matrix's y axis), negative when the `Tf` size was.
 pub(crate) fn run_geometry(
     combined: &[f32; 6],
     advance_ts: Option<f32>,
@@ -236,14 +237,16 @@ pub(crate) fn run_geometry(
         // Unit perpendicular to the baseline (the advance turned 90° CCW),
         // then the y axis's (c, d) component along it: its sign is the side
         // the glyphs stand on, its size the em's true perpendicular extent.
-        // `em` carries the matrix's larger scale (that is what `font_size`
-        // reports), so a stretched `[2 0 0 1]` matrix must be scaled back
-        // down or the box would be twice as tall as the glyphs.
+        // `em` is the em height along the y axis (`effective_font_size`:
+        // the `Tf` size times the y vector's length), so horizontal stretch
+        // such as `[2 0 0 1]` is already out of it. Only a sheared y axis,
+        // whose component across the baseline is shorter than the vector
+        // itself, is scaled down further.
         let (px, py) = (-combined[1] / axis_len, combined[0] / axis_len);
         let y_axis_perp = combined[2] * px + combined[3] * py;
-        let max_scale = axis_len.max(combined[2].hypot(combined[3]));
-        let em_perp = if y_axis_perp.abs() > f32::EPSILON && max_scale > f32::EPSILON {
-            em * y_axis_perp.abs() / max_scale
+        let y_len = combined[2].hypot(combined[3]);
+        let em_perp = if y_axis_perp.abs() > f32::EPSILON && y_len > f32::EPSILON {
+            em * y_axis_perp.abs() / y_len
         } else {
             em
         };
@@ -351,6 +354,7 @@ pub(crate) fn normalize_degrees(degrees: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_utils::effective_font_size;
 
     #[test]
     fn unrotate_box_undoes_rotate_box() {
@@ -494,25 +498,35 @@ mod tests {
 
     #[test]
     fn run_geometry_takes_the_em_height_from_the_y_axis() {
-        // [2 0 0 1]: horizontally stretched 12pt text. `font_size` reports
-        // the larger scale (24), but the glyphs are only 12pt tall.
+        // `em` is `effective_font_size`: the length of the matrix's y vector
+        // times the `Tf` size, so horizontal stretch never changes it.
+        // [2 0 0 1] at 12pt: stretched text, glyphs 12pt tall.
         let stretched = run_geometry(
             &[2.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             Some(10.0),
             0.0,
-            24.0,
+            effective_font_size(12.0, &[2.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
             false,
         );
         assert_eq!(
             (stretched.width, stretched.height, stretched.rotation),
             (20.0, 12.0, 0.0)
         );
-        // [1 0 0 2]: vertically stretched — the y axis carries the scale.
+        // [28 0 0 14] at 1pt: the size lives in the matrix, still 14pt tall.
+        let unit_tf = run_geometry(
+            &[28.0, 0.0, 0.0, 14.0, 0.0, 0.0],
+            Some(10.0),
+            0.0,
+            effective_font_size(1.0, &[28.0, 0.0, 0.0, 14.0, 0.0, 0.0]),
+            false,
+        );
+        assert_eq!((unit_tf.width, unit_tf.height), (280.0, 14.0));
+        // [1 0 0 2]: vertically stretched, the y axis carries the scale.
         let tall = run_geometry(
             &[1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
             Some(10.0),
             0.0,
-            24.0,
+            effective_font_size(12.0, &[1.0, 0.0, 0.0, 2.0, 0.0, 0.0]),
             false,
         );
         assert_eq!((tall.width, tall.height), (10.0, 24.0));
@@ -521,10 +535,33 @@ mod tests {
             &[0.0, 2.0, -2.0, 0.0, 0.0, 0.0],
             Some(10.0),
             0.0,
-            24.0,
+            effective_font_size(12.0, &[0.0, 2.0, -2.0, 0.0, 0.0, 0.0]),
             false,
         );
         assert_eq!((turned.width, turned.height), (24.0, 20.0));
+        // Rotated 90 degrees and stretched along the baseline: 12pt tall
+        // glyphs, 20 units of run along y.
+        let turned_stretched = run_geometry(
+            &[0.0, 2.0, -1.0, 0.0, 0.0, 0.0],
+            Some(10.0),
+            0.0,
+            effective_font_size(12.0, &[0.0, 2.0, -1.0, 0.0, 0.0, 0.0]),
+            false,
+        );
+        assert_eq!(
+            (turned_stretched.width, turned_stretched.height),
+            (12.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn scaled_run_geometry_keeps_stretched_height_under_horizontal_scale() {
+        let m = [2.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let em = effective_font_size(12.0, &m);
+        let scaled = scaled_run_geometry(&m, Some(10.0), 0.0, em, false, 0.5);
+        assert_eq!((scaled.width, scaled.height), (10.0, 12.0));
+        let mirrored = scaled_run_geometry(&m, Some(10.0), 0.0, em, false, -0.5);
+        assert_eq!((mirrored.width, mirrored.height), (10.0, 12.0));
     }
 
     #[test]

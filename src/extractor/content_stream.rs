@@ -3276,6 +3276,21 @@ mod tests {
         assert!(headings[0].contains("Real Heading"), "{md}");
     }
 
+    /// Stretching a line horizontally must not shrink its box: the height is
+    /// the em height, taken once from the matrix's y axis.
+    #[test]
+    fn horizontally_stretched_text_keeps_its_full_height() {
+        let items = extract_simple_items(
+            b"BT /F1 12 Tf 2 0 0 1 72 700 Tm (Stretched) Tj ET
+              BT /F1 1 Tf 28 0 0 14 72 600 Tm (Unit size) Tj ET
+              BT /F1 12 Tf 72 500 Td (Plain) Tj ET",
+        );
+        let height = |text: &str| items.iter().find(|i| i.text == text).unwrap().height;
+        assert!((height("Stretched") - 12.0).abs() < 1e-3);
+        assert!((height("Unit size") - 14.0).abs() < 1e-3);
+        assert!((height("Plain") - 12.0).abs() < 1e-3);
+    }
+
     #[test]
     fn painted_bold_survives_text_objects_and_graphics_state() {
         let items = extract_simple_items(
