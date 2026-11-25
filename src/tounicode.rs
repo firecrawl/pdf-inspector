@@ -831,6 +831,7 @@ impl ToUnicodeCMap {
         let text = String::from_utf8_lossy(content);
         let mut cmap = ToUnicodeCMap::new();
         let mut src_hex_lengths: Vec<usize> = Vec::new();
+        let mut bfchar_codes: HashSet<u16> = HashSet::new();
         let mut use_cmap_name: Option<String> = None;
 
         // Parse begincodespacerange ... endcodespacerange to determine byte width
@@ -870,7 +871,7 @@ impl ToUnicodeCMap {
             let section_start = pos + start + "beginbfchar".len();
             if let Some(end) = text[section_start..].find("endbfchar") {
                 let section = &text[section_start..section_start + end];
-                cmap.parse_bfchar_section(section, &mut src_hex_lengths);
+                cmap.parse_bfchar_section(section, &mut src_hex_lengths, &mut bfchar_codes);
                 pos = section_start + end;
             } else {
                 break;
@@ -883,7 +884,7 @@ impl ToUnicodeCMap {
             let section_start = pos + start + "beginbfrange".len();
             if let Some(end) = text[section_start..].find("endbfrange") {
                 let section = &text[section_start..section_start + end];
-                cmap.parse_bfrange_section(section, &mut src_hex_lengths);
+                cmap.parse_bfrange_section(section, &mut src_hex_lengths, &mut bfchar_codes);
                 pos = section_start + end;
             } else {
                 break;
@@ -927,27 +928,29 @@ impl ToUnicodeCMap {
                 warn!("usecmap={} could not be loaded", name);
             }
         }
-        cmap.repair_digit_between_digits();
+        cmap.repair_digit_between_digits(&bfchar_codes);
         cmap.refresh_gap_fills();
 
         Some(cmap)
     }
 
-    /// Rewrite an entry that sits between two digits in code order and
-    /// reads as something else. A subset font whose digit glyphs take
-    /// consecutive codes can carry one wrong ToUnicode entry: the glyph of
-    /// `1` between those of `0` and `2` written as `(`. An entry is
-    /// rewritten to the digit between its neighbours when it is explicit
-    /// (a `bfchar` entry, not inside a range), reads as one character that
-    /// is not a digit, and the entries one code before and after it each
-    /// read as one ASCII digit, the second two above the first.
-    fn repair_digit_between_digits(&mut self) {
-        let digit = |map: &HashMap<u16, String>, code: u16| -> Option<u8> {
-            let mut chars = map.get(&code)?.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) if c.is_ascii_digit() => Some(c as u8 - b'0'),
-                _ => None,
-            }
+    /// Rewrite the one wrong entry of a digit table. A subset font whose
+    /// digit glyphs take ten consecutive codes can carry one wrong ToUnicode
+    /// entry: the glyph of `1` between those of `0` and `2` written as `(`.
+    /// A code is rewritten to the digit its place in the table gives it
+    /// only when the other nine codes of the table `0`..`9` are all
+    /// explicit `bfchar` entries reading as those digits, in order, and the
+    /// code is itself an explicit `bfchar` entry, outside every range,
+    /// reading as one character that is not a digit. A shorter run proves
+    /// nothing, since a font that numbers its codes in first-use order can
+    /// map `0.2` to three consecutive codes. `bfchar_codes` holds the codes
+    /// set by `bfchar` entries and not overwritten by a `bfrange` array.
+    fn repair_digit_between_digits(&mut self, bfchar_codes: &HashSet<u16>) {
+        let reads_as = |map: &HashMap<u16, String>, code: u16, digit: u8| -> bool {
+            bfchar_codes.contains(&code)
+                && map
+                    .get(&code)
+                    .is_some_and(|text| text.as_bytes() == [b'0' + digit])
         };
         let mut repairs = Vec::new();
         for (&code, text) in &self.char_map {
@@ -956,22 +959,27 @@ impl ToUnicodeCMap {
                 (chars.next(), chars.next()),
                 (Some(c), None) if !c.is_ascii_digit()
             );
-            if !single_non_digit || code == 0 || code == u16::MAX {
+            if !single_non_digit || !bfchar_codes.contains(&code) {
                 continue;
             }
-            if self
-                .ranges
-                .iter()
-                .any(|&(start, end, _)| (start..=end).contains(&code))
-            {
-                continue;
-            }
-            if let (Some(before), Some(after)) = (
-                digit(&self.char_map, code - 1),
-                digit(&self.char_map, code + 1),
-            ) {
-                if after == before + 2 {
-                    repairs.push((code, (b'0' + before + 1) as char));
+            for digit in 0..10u8 {
+                let Some(first) = code.checked_sub(u16::from(digit)) else {
+                    break;
+                };
+                if first.checked_add(9).is_none() {
+                    continue;
+                }
+                let is_table = (0..10u8)
+                    .filter(|&d| d != digit)
+                    .all(|d| reads_as(&self.char_map, first + u16::from(d), d));
+                if is_table
+                    && !self
+                        .ranges
+                        .iter()
+                        .any(|&(start, end, _)| (start..=end).contains(&code))
+                {
+                    repairs.push((code, (b'0' + digit) as char));
+                    break;
                 }
             }
         }
@@ -981,7 +989,12 @@ impl ToUnicodeCMap {
     }
 
     /// Parse a bfchar section: <src> <dst> pairs
-    fn parse_bfchar_section(&mut self, section: &str, src_hex_lengths: &mut Vec<usize>) {
+    fn parse_bfchar_section(
+        &mut self,
+        section: &str,
+        src_hex_lengths: &mut Vec<usize>,
+        bfchar_codes: &mut HashSet<u16>,
+    ) {
         // Match pairs of hex values: <XXXX> <YYYY>
         let mut chars = section.chars().peekable();
 
@@ -1037,12 +1050,18 @@ impl ToUnicodeCMap {
                 (parse_hex_u16(&src_hex), hex_to_unicode_string(&dst_hex))
             {
                 self.char_map.insert(src, dst);
+                bfchar_codes.insert(src);
             }
         }
     }
 
     /// Parse a bfrange section: <start> <end> <base> or <start> <end> [<u1> <u2> ...] triplets
-    fn parse_bfrange_section(&mut self, section: &str, src_hex_lengths: &mut Vec<usize>) {
+    fn parse_bfrange_section(
+        &mut self,
+        section: &str,
+        src_hex_lengths: &mut Vec<usize>,
+        bfchar_codes: &mut HashSet<u16>,
+    ) {
         let mut chars = section.chars().peekable();
 
         loop {
@@ -1144,6 +1163,7 @@ impl ToUnicodeCMap {
                         chars.next(); // consume >
                         if let Some(unicode_str) = hex_to_unicode_string(&hex) {
                             self.char_map.insert(cid, unicode_str);
+                            bfchar_codes.remove(&cid);
                         }
                         if cid >= end {
                             // Skip remaining entries and closing bracket
@@ -3837,7 +3857,9 @@ mod tests {
     fn digit_between_two_digits_written_as_another_char_reads_as_the_digit() {
         let cmap = ToUnicodeCMap::parse(
             b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
-              4 beginbfchar\n<009A> <0030>\n<009B> <0028>\n<009C> <0032>\n<009D> <0033>\nendbfchar\n",
+              10 beginbfchar\n<009A> <0030>\n<009B> <0028>\n<009C> <0032>\n<009D> <0033>\n\
+              <009E> <0034>\n<009F> <0035>\n<00A0> <0036>\n<00A1> <0037>\n<00A2> <0038>\n\
+              <00A3> <0039>\nendbfchar\n",
         )
         .unwrap();
         assert_eq!(cmap.lookup(0x9A), Some("0".to_string()));
@@ -3876,6 +3898,36 @@ mod tests {
                    2 beginbfchar\n<0010> <0030>\n<0012> <0032>\nendbfchar\n\
                    1 beginbfrange\n<0011> <0011> <0028>\nendbfrange\n";
         let c = ToUnicodeCMap::parse(src.as_bytes()).unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_needs_the_whole_digit_table() {
+        // A font numbering codes in first-use order can map `0.2` to three
+        // consecutive codes. The period stays a period.
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              3 beginbfchar\n<0010> <0030>\n<0011> <002E>\n<0012> <0032>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some(".".to_string()));
+        // Nine digits of the table, with the tenth code missing.
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              9 beginbfchar\n<0010> <0030>\n<0011> <0028>\n<0012> <0032>\n<0013> <0033>\n\
+              <0014> <0034>\n<0015> <0035>\n<0016> <0036>\n<0017> <0037>\n<0018> <0038>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_leaves_bfrange_array_entries_alone() {
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              1 beginbfrange\n<0010> <0019> [<0030> <0028> <0032> <0033> <0034> <0035> <0036> <0037> <0038> <0039>]\nendbfrange\n",
+        )
+        .unwrap();
         assert_eq!(c.lookup(0x11), Some("(".to_string()));
     }
 
