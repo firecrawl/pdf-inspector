@@ -28,6 +28,19 @@ version and date. Earlier releases are described in their
   dictionary is not; a bare CFF program is not measured; a simple font whose
   kashida glyph is named by a `/Differences` entry is not covered; the fast
   page-detection mode does not apply it.
+- Arabic text set in a simple (non-Type0) font whose ToUnicode map reads a
+  code as U+FFFD, as InDesign writes the dotted first piece of a letter it
+  split over two glyphs, no longer shows a Latin letter for that code
+  (`الûشخüصية` is now `الشخصية`, related to
+  [firecrawl/firecrawl#5931](https://github.com/firecrawl/firecrawl/issues/5931)).
+  The code is read as no text, and the font's `/Differences` names, fallback
+  CMap and printable-byte guess no longer read it, only when the font's
+  ToUnicode map reads at least eight Arabic letters and the entry is U+FFFD
+  alone; fonts without Arabic letters and every other entry read as before.
+  A run of nothing but such codes adds neither an item nor a word space.
+  Known limitations: only the primary ToUnicode map is consulted, and the
+  first piece's glyph is not measured, so a U+FFFD entry of an Arabic simple
+  font that shows a real letter is dropped as well.
 
 ## [1.27.1] - 2026-11-24
 

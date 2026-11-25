@@ -2626,7 +2626,25 @@ pub(crate) fn extract_text_from_operand(
                 // path.
                 if entry.primary.code_byte_length == 1 || is_simple_font {
                     let encoding_map = font_encodings.get(current_font);
+                    // A code of a simple Arabic font whose ToUnicode entry
+                    // is U+FFFD alone shows the first piece of a letter the
+                    // producer split over two glyphs (the dots), which has
+                    // no text of its own: the code reads as nothing, and
+                    // neither the Differences, the fallback CMap nor the
+                    // byte guess below may read it as a Latin letter.
+                    let arabic_cmap = std::cell::OnceCell::new();
+                    let reads_nothing = |b: u8| {
+                        is_simple_font
+                            && matches!(
+                                entry.primary.lookup_code(u16::from(b)),
+                                CodeMapping::Text(ref s) if s == "\u{FFFD}"
+                            )
+                            && *arabic_cmap.get_or_init(|| entry.primary.reads_arabic_letters())
+                    };
                     let decode_byte = |b: u8| -> Option<String> {
+                        if reads_nothing(b) {
+                            return None;
+                        }
                         let code = b as u16;
                         // 1. Primary CMap. An entry whose destination is a
                         // control character maps the code to no text (what
@@ -2783,6 +2801,11 @@ pub(crate) fn extract_text_from_operand(
                     }
                     if !decoded.is_empty() {
                         return Some(decoded);
+                    }
+                    // A run of nothing but such codes shows no text: it is
+                    // empty, not a failed decode.
+                    if !bytes.is_empty() && bytes.iter().all(|&b| reads_nothing(b)) {
+                        return Some(String::new());
                     }
                     return None;
                 }
@@ -5516,7 +5539,7 @@ mod tests {
     /// `indirect_encoding`) — the way a subsetter writes a font whose
     /// codes are its glyph indices. Returns the document, the ToUnicode
     /// object number and the page.
-    fn simple_font_doc(
+    pub(super) fn simple_font_doc(
         bfchar: &str,
         program: Option<Vec<u8>>,
         program_filter: Option<&[u8]>,
@@ -5751,7 +5774,7 @@ mod tests {
 
     /// `bytes` shown through the font of [`simple_font_doc`], with the
     /// encoding cache the page would hold for it.
-    fn decode_simple_font_string(
+    pub(super) fn decode_simple_font_string(
         bfchar: &str,
         program: Option<Vec<u8>>,
         encoding: Option<Object>,
@@ -7218,6 +7241,10 @@ mod stale_cmap_tests;
 #[cfg(test)]
 #[path = "kashida_tests.rs"]
 mod kashida_tests;
+
+#[cfg(test)]
+#[path = "simple_fffd_tests.rs"]
+mod simple_fffd_tests;
 
 #[cfg(test)]
 #[path = "blank_glyph_tests.rs"]
