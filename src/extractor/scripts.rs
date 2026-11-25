@@ -436,7 +436,7 @@ fn is_plain_text_piece(items: &[TextItem], glyphs: &[usize], anchor: &TextItem) 
         && chars.all(|c| {
             is_bracket(c)
                 || (c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
-                || (has_bracket && c.is_ascii_digit())
+                || (has_bracket && c.is_numeric())
         })
 }
 
@@ -491,7 +491,7 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     if run.plain
         && !glyphs
             .iter()
-            .any(|&g| items[g].text.contains(|c: char| c.is_ascii_digit()))
+            .any(|&g| items[g].text.contains(char::is_numeric))
     {
         glyphs.reverse();
     }
@@ -517,7 +517,7 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let left = anchor.x.min(run_left);
     anchor.width = anchor_right.max(run_right) - left;
     anchor.x = left;
-    let brackets_only = run.plain && mapped.chars().all(|c| is_bracket(c) || c.is_ascii_digit());
+    let brackets_only = run.plain && mapped.chars().all(|c| is_bracket(c) || c.is_numeric());
     if run.anchor_on_left && !run.plain {
         anchor.text.push_str(&mapped);
     } else if brackets_only && !run.anchor_on_left {
@@ -1347,6 +1347,49 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "¹المادة الأولى:");
+    }
+
+    #[test]
+    fn arabic_indic_numbered_bracket_run_beside_arabic_heading_fuses_as_suffix() {
+        for num in ["(١)", "(۱)"] {
+            let items = vec![
+                make_item_fs(num, 159.8416, 208.9678, 8.9199, 6.996),
+                make_item_fs("المادة الأولى:", 168.7574, 204.9718, 72.198, 14.0),
+            ];
+            let merged = merge_subscript_items(items);
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].text, format!("المادة الأولى:{num}"));
+            assert_eq!(merged[0].baseline_shift, 0.0);
+        }
+    }
+
+    #[test]
+    fn arabic_indic_numbered_bracket_glyphs_keep_x_order() {
+        for digit in ["٢", "۲"] {
+            let items = vec![
+                make_item_fs("(", 159.0, 208.9678, 3.0, 6.996),
+                make_item_fs(digit, 162.0, 208.9678, 3.0, 6.996),
+                make_item_fs(")", 165.0, 208.9678, 3.0, 6.996),
+                make_item_fs("المادة الأولى:", 168.7574, 204.9718, 72.198, 14.0),
+            ];
+            assert_eq!(
+                texts(&merge_subscript_items(items)),
+                vec![format!("المادة الأولى:({digit})")]
+            );
+        }
+    }
+
+    #[test]
+    fn raised_arabic_indic_digit_beside_arabic_heading_is_still_a_footnote() {
+        let items = vec![
+            make_item_fs("١", 164.7574, 208.9678, 4.0, 6.996),
+            make_item_fs("المادة الأولى:", 168.7574, 204.9718, 72.198, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "١");
+        assert!(merged[0].baseline_shift > 0.0);
+        assert_eq!(merged[1].text, "المادة الأولى:");
     }
 
     #[test]

@@ -13,7 +13,7 @@ version and date. Earlier releases are described in their
 
 - Arabic and Hebrew headings no longer come out with `<sup>` markers such as
   `## مادة الأولى:())<sup>ال</sup>`. Small Arabic or Hebrew letters and
-  bracket pieces, including a bracketed number such as `(1)`, that touch a larger Arabic or Hebrew item are now part
+  bracket pieces, including a bracketed number such as `(1)` or `(١)`, that touch a larger Arabic or Hebrew item are now part
   of that word, so the heading keeps its text, its size, and its `##`. The
   letters are placed in right-to-left order, after any opening punctuation,
   and brackets on the left of the word stay at its end. A bare raised digit is
