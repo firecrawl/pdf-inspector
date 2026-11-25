@@ -251,6 +251,29 @@ fn repair_control_destinations<'p>(
 
 /// The fewest Arabic letters a CMap reads for it to be an Arabic font's.
 const ARABIC_CMAP_MIN_ENTRIES: usize = 8;
+/// The Unicode blocks of the Arabic script.
+const ARABIC_BLOCKS: [std::ops::RangeInclusive<u32>; 4] = [
+    0x0600..=0x06FF,
+    0x0750..=0x077F,
+    0xFB50..=0xFDFF,
+    0xFE70..=0xFEFF,
+];
+
+/// How many of the `len` code points from `first` on lie in an Arabic block.
+fn arabic_letters_in_span(first: u32, len: u32) -> usize {
+    let last = first.saturating_add(len - 1);
+    ARABIC_BLOCKS
+        .iter()
+        .map(|block| {
+            let (lo, hi) = (first.max(*block.start()), last.min(*block.end()));
+            if lo <= hi {
+                (hi - lo + 1) as usize
+            } else {
+                0
+            }
+        })
+        .sum()
+}
 /// How far below the baseline a kashida glyph may reach, in em.
 const KASHIDA_MAX_BELOW_BASELINE: f32 = 0.03;
 /// How high a kashida glyph may rise above the baseline, in em.
@@ -289,11 +312,17 @@ fn repair_kashida_destinations<'p>(
     };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
     let mut changed = false;
+    // Measuring a glyph reads its whole outline, and a CIDToGIDMap can send
+    // every code to one glyph: each glyph is measured once.
+    let mut verdicts: HashMap<u16, bool> = HashMap::new();
     for code in codes {
-        let is_kashida = glyphs
-            .glyph_of(cid_to_gid.as_deref(), code)
-            .is_some_and(|gid| glyphs.is_kashida(gid));
-        if is_kashida {
+        let Some(gid) = glyphs.glyph_of(cid_to_gid.as_deref(), code) else {
+            continue;
+        };
+        if *verdicts
+            .entry(gid)
+            .or_insert_with(|| glyphs.is_kashida(gid))
+        {
             target.char_map.insert(code, String::new());
             changed = true;
         }
@@ -301,6 +330,30 @@ fn repair_kashida_destinations<'p>(
     if changed {
         target.refresh_gap_fills();
     }
+}
+
+/// Whether a font of `fonts` other than `font_dict` has the ToUnicode stream
+/// `obj_num` too, with a font program that is not `font_dict`'s (or that
+/// cannot be told apart from it). The CMap built from the stream is kept
+/// once for all the fonts that share it, so what only `font_dict`'s own
+/// glyphs justify must not change it then.
+fn shares_tounicode_across_programs(
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    obj_num: u32,
+) -> bool {
+    let program = crate::extractor::fonts::get_font_file2_obj_num(doc, font_dict);
+    fonts.values().any(|other| {
+        !std::ptr::eq(*other, font_dict)
+            && other
+                .get(b"ToUnicode")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+                .is_some_and(|r| r.0 == obj_num)
+            && (program.is_none()
+                || crate::extractor::fonts::get_font_file2_obj_num(doc, other) != program)
+    })
 }
 
 /// Give a font's CMaps their roles in a [`CMapEntry`]. `primary` is the
@@ -502,10 +555,9 @@ impl<'a> ProgramGlyphs<'a> {
             return false;
         };
         let em = f32::from(face.units_per_em());
-        let (width, height) = (
-            f32::from(bbox.x_max - bbox.x_min),
-            f32::from(bbox.y_max - bbox.y_min),
-        );
+        // Widened first: the spread of i16 coordinates can exceed an i16.
+        let width = (i32::from(bbox.x_max) - i32::from(bbox.x_min)) as f32;
+        let height = (i32::from(bbox.y_max) - i32::from(bbox.y_min)) as f32;
         advance > 0
             && bbox.x_min <= 0
             && i32::from(bbox.x_max) >= i32::from(advance)
@@ -722,6 +774,10 @@ struct EntryBuild {
     /// Whether the repair of the control destinations may read the
     /// program: its reading, and its outlines.
     program_repair: bool,
+    /// Whether the kashida entries may be emptied: the glyphs are read in
+    /// this font's program, so not when another font with another program
+    /// shares the ToUnicode stream (see [`shares_tounicode_across_programs`]).
+    kashida_repair: bool,
 }
 
 /// When a font's embedded program is read for the fallback of its CMap
@@ -796,7 +852,7 @@ fn font_cmap_entry(
     }
     // The kashida entries are read from the ToUnicode CMap's own codes, so
     // only it is repaired, not its subset remap (whose codes are renumbered).
-    if build.program_repair {
+    if build.program_repair && build.kashida_repair {
         repair_kashida_destinations(&mut primary, font_dict, doc, || program.bytes());
     }
     cmap_entry(
@@ -892,6 +948,7 @@ pub(crate) fn build_cmap_entry_from_stream(
                 promote: true,
                 program_fallback: ProgramFallback::Always,
                 program_repair: true,
+                kashida_repair: true,
             },
         ));
     }
@@ -1295,14 +1352,10 @@ impl ToUnicodeCMap {
     }
 
     /// Whether the CMap is that of an Arabic-script font: at least
-    /// [`ARABIC_CMAP_MIN_ENTRIES`] of its single-character destinations are
-    /// Arabic letters, and they are at least a third of all the
-    /// destinations that are not U+FFFD.
+    /// [`ARABIC_CMAP_MIN_ENTRIES`] of its single-character destinations,
+    /// direct or in a range, are Arabic letters, and they are at least a
+    /// third of all the destinations that are not U+FFFD.
     pub(crate) fn is_arabic_script(&self) -> bool {
-        let is_arabic = |ch: char| {
-            matches!(ch, '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}'
-                | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}')
-        };
         let (mut arabic, mut total) = (0usize, 0usize);
         for text in self
             .char_map
@@ -1312,8 +1365,14 @@ impl ToUnicodeCMap {
             total += 1;
             let mut chars = text.chars();
             if let (Some(ch), None) = (chars.next(), chars.next()) {
-                arabic += usize::from(is_arabic(ch));
+                arabic += usize::from(arabic_letters_in_span(u32::from(ch), 1) > 0);
             }
+        }
+        // A range is counted by its span, not code by code.
+        for &(start, end, base) in self.ranges.iter().filter(|r| r.0 <= r.1) {
+            let len = u32::from(end - start) + 1;
+            total += (len - u32::from(base == 0xFFFD)) as usize;
+            arabic += arabic_letters_in_span(base, len);
         }
         arabic >= ARABIC_CMAP_MIN_ENTRIES && arabic * 3 >= total
     }
@@ -3513,6 +3572,9 @@ impl FontCMaps {
                             ProgramFallback::WhenSparse
                         },
                         program_repair: !skip_truetype_fallback,
+                        kashida_repair: !shares_tounicode_across_programs(
+                            fonts, font_dict, doc, obj_num,
+                        ),
                     },
                 );
                 by_obj_num.insert(obj_num, entry);

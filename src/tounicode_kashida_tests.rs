@@ -1,7 +1,7 @@
 //! A kashida glyph that a ToUnicode CMap reads as U+FFFD is dropped from the
 //! text, and no other U+FFFD entry is.
 
-use super::*;
+use super::{ProgramGlyphs, ToUnicodeCMap};
 use lopdf::{dictionary, Document, Object, Stream};
 
 const FFFD: char = '\u{FFFD}';
@@ -17,7 +17,7 @@ const LATIN_ENTRIES: &str = "<0010><0061>\n<0011><0062>\n<0012><0063>\n<0013><00
 /// 3 a hyphen (flat, but at mid height), 4 a low stroke inside its advance,
 /// 5 a tall bar that spans its advance. Each is `(x_min, y_min, x_max,
 /// y_max, advance)` in 1000 units per em.
-const GLYPHS: &[(i16, i16, i16, i16, u16)] = &[
+const GLYPHS: &[Glyph] = &[
     (50, 0, 450, 600, 500),
     (-10, 0, 260, 70, 250),
     (0, 250, 250, 320, 250),
@@ -25,79 +25,114 @@ const GLYPHS: &[(i16, i16, i16, i16, u16)] = &[
     (-10, 0, 260, 600, 250),
 ];
 
-/// A TrueType font of rectangular-box glyphs (`.notdef` first, then `glyphs`):
-/// a triangle whose bounding box is the box, which is all that is read.
-fn boxed_truetype(glyphs: &[(i16, i16, i16, i16, u16)]) -> Vec<u8> {
-    let num_glyphs = glyphs.len() as u16 + 1;
-    let mut glyf = Vec::new();
-    let mut loca: Vec<u8> = vec![0; 4];
-    loca.extend(0u32.to_be_bytes()); // .notdef has no outline
-    for &(x_min, y_min, x_max, y_max, _) in glyphs {
-        let mut g = Vec::new();
-        g.extend(1i16.to_be_bytes());
-        for v in [x_min, y_min, x_max, y_max] {
-            g.extend(v.to_be_bytes());
-        }
-        g.extend(2u16.to_be_bytes()); // endPtsOfContours
-        g.extend(0u16.to_be_bytes()); // no instructions
-        g.extend([1u8, 1, 1]); // on-curve, i16 deltas
-        for v in [x_min, x_max - x_min, 0] {
-            g.extend(v.to_be_bytes());
-        }
-        for v in [y_min, 0, y_max - y_min] {
-            g.extend(v.to_be_bytes());
-        }
-        while g.len() % 4 != 0 {
-            g.push(0);
-        }
-        glyf.extend(g);
+/// A glyph: `(x_min, y_min, x_max, y_max, advance)`.
+type Glyph = (i16, i16, i16, i16, u16);
+
+/// A table of `len` zero bytes with `fields` written at their offsets.
+fn table(len: usize, fields: &[(usize, &[u8])]) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    for &(at, field) in fields {
+        bytes[at..at + field.len()].copy_from_slice(field);
+    }
+    bytes
+}
+
+/// The outline of a box: a path along its bottom edge, then up its right,
+/// in steps of a third of a side so that no step overflows an i16 whatever
+/// the box, then `repeats` more points on the last one. That path spans the
+/// box, which is what the glyph's bounding box is measured from.
+fn box_outline(&(x_min, y_min, x_max, y_max, _): &Glyph, repeats: usize) -> Vec<u8> {
+    let at =
+        |from: i16, to: i16, k: i32| i32::from(from) + (i32::from(to) - i32::from(from)) * k / 3;
+    let mut points: Vec<(i32, i32)> = (0..=3)
+        .map(|k| (at(x_min, x_max, k), i32::from(y_min)))
+        .collect();
+    points.extend((1..=3).map(|k| (i32::from(x_max), at(y_min, y_max, k))));
+    points.extend(std::iter::repeat_n(points[points.len() - 1], repeats));
+    let deltas = |axis: fn(&(i32, i32)) -> i32| -> Vec<u8> {
+        let mut last = 0;
+        points
+            .iter()
+            .flat_map(|p| {
+                let step = i16::try_from(axis(p) - last).expect("a step fits an i16");
+                last = axis(p);
+                step.to_be_bytes()
+            })
+            .collect()
+    };
+    let mut glyph: Vec<u8> = [1i16, x_min, y_min, x_max, y_max]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect();
+    glyph.extend((points.len() as u16 - 1).to_be_bytes()); // endPtsOfContours
+    glyph.extend(0u16.to_be_bytes()); // no instructions
+    glyph.extend(vec![1u8; points.len()]); // on-curve, i16 deltas
+    glyph.extend(deltas(|p| p.0));
+    glyph.extend(deltas(|p| p.1));
+    glyph.resize(glyph.len().next_multiple_of(4), 0);
+    glyph
+}
+
+/// A TrueType font of box-shaped glyphs (`.notdef` first, then `glyphs`),
+/// each outline of `repeats` points more than its box needs.
+fn boxed_truetype_of(glyphs: &[Glyph], repeats: usize) -> Vec<u8> {
+    let count = (glyphs.len() as u16 + 1).to_be_bytes();
+    let (mut glyf, mut loca) = (Vec::new(), vec![0u8; 8]);
+    for glyph in glyphs {
+        glyf.extend(box_outline(glyph, repeats));
         loca.extend((glyf.len() as u32).to_be_bytes());
     }
-    let mut head = vec![0u8; 54];
-    head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-    head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
-    head[18..20].copy_from_slice(&1000u16.to_be_bytes());
-    head[50..52].copy_from_slice(&1i16.to_be_bytes());
-    let mut hhea = vec![0u8; 36];
-    hhea[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-    hhea[34..36].copy_from_slice(&num_glyphs.to_be_bytes());
-    let mut maxp = vec![0u8; 32];
-    maxp[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-    maxp[4..6].copy_from_slice(&num_glyphs.to_be_bytes());
-    let mut hmtx = Vec::new();
-    hmtx.extend(600u16.to_be_bytes());
-    hmtx.extend(0i16.to_be_bytes());
-    for &(.., advance) in glyphs {
-        hmtx.extend(advance.to_be_bytes());
-        hmtx.extend(0i16.to_be_bytes());
-    }
-    let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
-        (b"glyf", glyf),
-        (b"head", head),
-        (b"hhea", hhea),
-        (b"hmtx", hmtx),
-        (b"loca", loca),
-        (b"maxp", maxp),
+    let advances: Vec<u8> = [600]
+        .into_iter()
+        .chain(glyphs.iter().map(|g| g.4))
+        .flat_map(|advance: u16| [advance.to_be_bytes(), [0, 0]].concat())
+        .collect();
+    let tables = [
+        (*b"glyf", glyf),
+        (
+            *b"head",
+            table(
+                54,
+                &[
+                    (0, &[0, 1, 0, 0]),
+                    (12, &[0x5F, 0x0F, 0x3C, 0xF5]),
+                    (18, &[3, 0xE8]),
+                    (51, &[1]),
+                ],
+            ),
+        ),
+        (*b"hhea", table(36, &[(0, &[0, 1, 0, 0]), (34, &count)])),
+        (*b"hmtx", advances),
+        (*b"loca", loca),
+        (*b"maxp", table(32, &[(0, &[0, 1, 0, 0]), (4, &count)])),
     ];
-    tables.sort_by_key(|(tag, _)| **tag);
-    let mut font = Vec::new();
-    font.extend(0x0001_0000u32.to_be_bytes());
-    font.extend((tables.len() as u16).to_be_bytes());
-    font.extend([0u8; 6]);
-    let mut offset = 12 + 16 * tables.len();
+    let mut font = [
+        &[0u8, 1, 0, 0][..],
+        &(tables.len() as u16).to_be_bytes(),
+        &[0; 6],
+    ]
+    .concat();
     let mut body = Vec::new();
     for (tag, data) in &tables {
-        font.extend(*tag);
-        font.extend(0u32.to_be_bytes());
-        font.extend((offset as u32).to_be_bytes());
-        font.extend((data.len() as u32).to_be_bytes());
-        let padded = data.len().div_ceil(4) * 4;
+        let offset = (12 + 16 * tables.len() + body.len()) as u32;
+        font.extend(
+            [
+                &tag[..],
+                &[0; 4],
+                &offset.to_be_bytes(),
+                &(data.len() as u32).to_be_bytes(),
+            ]
+            .concat(),
+        );
         body.extend(data);
-        body.extend(std::iter::repeat_n(0u8, padded - data.len()));
-        offset += padded;
+        body.resize(body.len().next_multiple_of(4), 0);
     }
     font.extend(body);
     font
+}
+
+fn boxed_truetype(glyphs: &[Glyph]) -> Vec<u8> {
+    boxed_truetype_of(glyphs, 0)
 }
 
 /// The CMap text: `entries` plus codes 1..=5 (the glyphs above) read as
@@ -109,44 +144,69 @@ fn cmap_text(entries: &str) -> String {
     )
 }
 
-/// A one-page document with an Identity-H CIDFontType2 on the boxed font,
-/// whose ToUnicode is `tounicode`, showing each of the hex strings `shows` as a TJ array
-/// (a `> n <` inside one is a gap between two strings), one line each.
-fn type0_document(tounicode: &str, shows: &[&str]) -> Vec<u8> {
+/// What a document of Type0 fonts is built from.
+struct Fonts<'a> {
+    /// The TrueType program of each font, `/F1`, `/F2` and so on.
+    programs: &'a [Vec<u8>],
+    /// The ToUnicode CMap all of them share.
+    tounicode: &'a str,
+    /// A CIDToGIDMap stream for each of them, else the identity.
+    cid_to_gid: Option<Vec<u8>>,
+}
+
+/// A one-page document of Identity-H CIDFontType2 fonts, each on its boxed
+/// program with the one ToUnicode stream, showing each `(font, hex string)`
+/// of `shows` as a TJ array (a `> n <` inside one is a gap between two
+/// strings), one line each.
+fn type0_document_of(fonts: &Fonts, shows: &[(usize, &str)]) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
-    let font_file = doc.add_object(Stream::new(dictionary! {}, boxed_truetype(GLYPHS)));
-    let descriptor = doc.add_object(dictionary! {
-        "Type" => "FontDescriptor", "FontName" => "ABCDEF+Synthetic", "Flags" => 4,
-        "FontFile2" => font_file,
-    });
-    let cid_font = doc.add_object(dictionary! {
-        "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "ABCDEF+Synthetic",
-        "CIDSystemInfo" => dictionary! {
-            "Registry" => Object::string_literal("Adobe"),
-            "Ordering" => Object::string_literal("Identity"), "Supplement" => 0,
-        },
-        "CIDToGIDMap" => "Identity", "FontDescriptor" => descriptor, "DW" => 500,
-    });
-    let to_unicode = doc.add_object(Stream::new(dictionary! {}, tounicode.as_bytes().to_vec()));
-    let font = doc.add_object(dictionary! {
-        "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "ABCDEF+Synthetic",
-        "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid_font)],
-        "ToUnicode" => to_unicode,
-    });
+    let to_unicode = doc.add_object(Stream::new(
+        dictionary! {},
+        fonts.tounicode.as_bytes().to_vec(),
+    ));
+    let map = fonts
+        .cid_to_gid
+        .clone()
+        .map_or(Object::Name(b"Identity".to_vec()), |bytes| {
+            Object::Reference(doc.add_object(Stream::new(dictionary! {}, bytes)))
+        });
+    let mut resources = dictionary! {};
+    // Equal programs are the one stream, as fonts that share a program have it.
+    let mut files = std::collections::HashMap::new();
+    for (i, program) in fonts.programs.iter().enumerate() {
+        let font_file = *files
+            .entry(program)
+            .or_insert_with(|| doc.add_object(Stream::new(dictionary! {}, program.clone())));
+        let descriptor = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor", "FontName" => "ABCDEF+Synthetic", "Flags" => 4,
+            "FontFile2" => font_file,
+        });
+        let cid_font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "ABCDEF+Synthetic",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"), "Supplement" => 0,
+            },
+            "CIDToGIDMap" => map.clone(), "FontDescriptor" => descriptor, "DW" => 500,
+        });
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "ABCDEF+Synthetic",
+            "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid_font)],
+            "ToUnicode" => to_unicode,
+        });
+        resources.set(format!("F{}", i + 1), font);
+    }
+    let shown: String = shows
+        .iter()
+        .map(|(font, hex)| format!("/F{font} 12 Tf [<{hex}>] TJ T*\n"))
+        .collect();
     let content = doc.add_object(Stream::new(
         dictionary! {},
-        format!(
-            "BT /F1 12 Tf 14 TL 1 0 0 1 40 700 Tm {} ET",
-            shows
-                .iter()
-                .map(|hex| format!("[<{hex}>] TJ T*"))
-                .collect::<String>()
-        )
-        .into_bytes(),
+        format!("BT 14 TL 1 0 0 1 40 700 Tm {shown} ET").into_bytes(),
     ));
     let page = doc.add_object(dictionary! {
         "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
-        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        "Resources" => dictionary! { "Font" => resources },
         "Contents" => content,
     });
     let pages = doc.add_object(
@@ -162,6 +222,19 @@ fn type0_document(tounicode: &str, shows: &[&str]) -> Vec<u8> {
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).unwrap();
     bytes
+}
+
+/// A document of the one font on [`GLYPHS`], showing each hex string.
+fn type0_document(tounicode: &str, shows: &[&str]) -> Vec<u8> {
+    let shows: Vec<(usize, &str)> = shows.iter().map(|hex| (1, *hex)).collect();
+    type0_document_of(
+        &Fonts {
+            programs: &[boxed_truetype(GLYPHS)],
+            tounicode,
+            cid_to_gid: None,
+        },
+        &shows,
+    )
 }
 
 fn text_of(bytes: &[u8]) -> String {
@@ -255,4 +328,148 @@ fn a_kashida_shaped_glyph_of_a_font_that_is_not_arabic_is_left_alone() {
     let bytes = type0_document(&cmap_text(LATIN_ENTRIES), &["00010002000100020001"]);
     let text = text_of(&bytes);
     assert_eq!(count(&text, FFFD), 2, "{text:?}");
+}
+
+/// The CMap text of [`cmap_text`], its eight letters given as the one range
+/// of eight codes from `<0010>` that starts at `first`.
+fn ranged_cmap_text(first: &str) -> String {
+    cmap_text("").replace(
+        "endbfchar",
+        &format!("endbfchar\n1 beginbfrange\n<0010><0017><{first}>\nendbfrange"),
+    )
+}
+
+#[test]
+fn letters_given_as_a_range_make_an_arabic_script_cmap() {
+    let arabic = ToUnicodeCMap::parse(ranged_cmap_text("0627").as_bytes()).unwrap();
+    let latin = ToUnicodeCMap::parse(ranged_cmap_text("0061").as_bytes()).unwrap();
+    assert!(
+        arabic.char_map.keys().all(|&code| code < 6),
+        "{:?}",
+        arabic.char_map
+    );
+    assert!(arabic.is_arabic_script());
+    assert!(!latin.is_arabic_script());
+    // Seven letters (six and the one in the entries) are too few, whatever their encoding.
+    let short = ToUnicodeCMap::parse(
+        cmap_text("")
+            .replace(
+                "endbfchar",
+                "endbfchar\n1 beginbfrange\n<0010><0015><0627>\nendbfrange",
+            )
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(!short.is_arabic_script());
+}
+
+#[test]
+fn a_huge_range_of_letters_is_counted_without_being_walked() {
+    let cmap = ToUnicodeCMap::parse(
+        b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+1 beginbfrange\n<0000><FFFF><0600>\nendbfrange",
+    )
+    .unwrap();
+    // Only 0x100 + 0x80 of the 65,536 code points are Arabic: a third is not.
+    assert!(!cmap.is_arabic_script());
+    let cmap = ToUnicodeCMap::parse(
+        b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+1 beginbfrange\n<0000><00FF><0600>\nendbfrange",
+    )
+    .unwrap();
+    assert!(cmap.is_arabic_script());
+}
+
+#[test]
+fn a_kashida_of_an_arabic_font_given_as_ranges_is_dropped() {
+    let bytes = type0_document(&ranged_cmap_text("0627"), &["00100002001100020012"]);
+    let text = text_of(&bytes);
+    assert_eq!(count(&text, FFFD), 0, "{text:?}");
+    assert_eq!(count(&text, '\u{627}'), 1, "{text:?}");
+}
+
+/// The same four letters on a font whose glyph 2 is a hyphen and glyph 3
+/// the kashida: the one shared CMap reads code 2 as U+FFFD for both.
+fn hyphen_first_glyphs() -> Vec<Glyph> {
+    let mut glyphs = GLYPHS.to_vec();
+    glyphs.swap(1, 2);
+    glyphs
+}
+
+#[test]
+fn a_cmap_shared_with_a_font_of_another_program_keeps_its_replacements() {
+    let fonts = Fonts {
+        programs: &[
+            boxed_truetype(GLYPHS),
+            boxed_truetype(&hyphen_first_glyphs()),
+        ],
+        tounicode: &cmap_text(ARABIC_ENTRIES),
+        cid_to_gid: None,
+    };
+    // Font 2 shows its hyphen at code 2, which only font 1 reads as a kashida.
+    let text = text_of(&type0_document_of(
+        &fonts,
+        &[(2, "000100020001"), (1, "000100020001")],
+    ));
+    assert_eq!(count(&text, FFFD), 2, "{text:?}");
+}
+
+#[test]
+fn a_cmap_shared_with_a_font_of_the_same_program_is_still_repaired() {
+    let fonts = Fonts {
+        programs: &[boxed_truetype(GLYPHS), boxed_truetype(GLYPHS)],
+        tounicode: &cmap_text(ARABIC_ENTRIES),
+        cid_to_gid: None,
+    };
+    let text = text_of(&type0_document_of(
+        &fonts,
+        &[(2, "000100020001"), (1, "000100020001")],
+    ));
+    assert_eq!(count(&text, FFFD), 0, "{text:?}");
+}
+
+#[test]
+fn a_glyph_spanning_the_whole_coordinate_range_is_measured_without_overflow() {
+    // The spread of these i16 coordinates is 65,535: more than an i16 holds.
+    let extreme: &[Glyph] = &[
+        (i16::MIN, 0, i16::MAX, 70, 250),
+        (-10, i16::MIN, 260, i16::MAX, 250),
+        (i16::MIN, i16::MIN, i16::MAX, i16::MAX, 250),
+    ];
+    let data = boxed_truetype(extreme);
+    let glyphs = ProgramGlyphs::parse(&data).unwrap();
+    let verdicts: Vec<bool> = (1..=3).map(|gid| glyphs.is_kashida(gid)).collect();
+    assert_eq!(verdicts, vec![true, false, false]);
+}
+
+#[test]
+fn many_codes_sent_to_one_large_glyph_measure_it_once() {
+    // 65,000 replacement codes, all read through a CIDToGIDMap as glyph 2,
+    // a kashida of 20,000 points: measured once, not 65,000 times.
+    let mut tounicode = cmap_text(ARABIC_ENTRIES).replace("endbfchar", "");
+    tounicode.push_str("endbfchar\n");
+    for chunk in (0x100u32..0x100 + 65_000).collect::<Vec<_>>().chunks(100) {
+        tounicode.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for code in chunk {
+            tounicode.push_str(&format!("<{code:04X}><FFFD>\n"));
+        }
+        tounicode.push_str("endbfchar\n");
+    }
+    let map: Vec<u8> = (0..=u16::MAX)
+        .flat_map(|cid| [0, if cid < 0x10 { 1 } else { 2 }])
+        .collect();
+    let fonts = Fonts {
+        programs: &[boxed_truetype_of(GLYPHS, 20_000)],
+        tounicode: &tounicode,
+        cid_to_gid: Some(map),
+    };
+    let bytes = type0_document_of(&fonts, &[(1, "0010010001000100")]);
+    let started = std::time::Instant::now();
+    let text = text_of(&bytes);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(count(&text, FFFD), 0, "{text:?}");
 }
