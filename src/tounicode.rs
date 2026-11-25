@@ -6,8 +6,10 @@ use log::{debug, warn};
 use lopdf::{Document, Object, ObjectId};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::iter::Peekable;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+use std::str::Chars;
 
 use crate::glyph_names::glyph_name_to_string;
 
@@ -831,6 +833,7 @@ impl ToUnicodeCMap {
         let text = String::from_utf8_lossy(content);
         let mut cmap = ToUnicodeCMap::new();
         let mut src_hex_lengths: Vec<usize> = Vec::new();
+        let mut bfchar_codes: HashSet<u16> = HashSet::new();
         let mut use_cmap_name: Option<String> = None;
 
         // Parse begincodespacerange ... endcodespacerange to determine byte width
@@ -870,7 +873,7 @@ impl ToUnicodeCMap {
             let section_start = pos + start + "beginbfchar".len();
             if let Some(end) = text[section_start..].find("endbfchar") {
                 let section = &text[section_start..section_start + end];
-                cmap.parse_bfchar_section(section, &mut src_hex_lengths);
+                cmap.parse_bfchar_section(section, &mut src_hex_lengths, &mut bfchar_codes);
                 pos = section_start + end;
             } else {
                 break;
@@ -883,7 +886,7 @@ impl ToUnicodeCMap {
             let section_start = pos + start + "beginbfrange".len();
             if let Some(end) = text[section_start..].find("endbfrange") {
                 let section = &text[section_start..section_start + end];
-                cmap.parse_bfrange_section(section, &mut src_hex_lengths);
+                cmap.parse_bfrange_section(section, &mut src_hex_lengths, &mut bfchar_codes);
                 pos = section_start + end;
             } else {
                 break;
@@ -927,13 +930,73 @@ impl ToUnicodeCMap {
                 warn!("usecmap={} could not be loaded", name);
             }
         }
+        cmap.repair_digit_between_digits(&bfchar_codes);
         cmap.refresh_gap_fills();
 
         Some(cmap)
     }
 
+    /// Rewrite the one wrong entry of a digit table. A subset font whose
+    /// digit glyphs take ten consecutive codes can carry one wrong ToUnicode
+    /// entry: the glyph of `1` between those of `0` and `2` written as `(`.
+    /// A code is rewritten to the digit its place in the table gives it
+    /// only when the other nine codes of the table `0`..`9` are all
+    /// explicit `bfchar` entries reading as those digits, in order, and the
+    /// code is itself an explicit `bfchar` entry, outside every range,
+    /// reading as one character that is not a digit. A shorter run proves
+    /// nothing, since a font that numbers its codes in first-use order can
+    /// map `0.2` to three consecutive codes. `bfchar_codes` holds the codes
+    /// set by `bfchar` entries and not overwritten by a `bfrange` array.
+    fn repair_digit_between_digits(&mut self, bfchar_codes: &HashSet<u16>) {
+        let reads_as = |map: &HashMap<u16, String>, code: u16, digit: u8| -> bool {
+            bfchar_codes.contains(&code)
+                && map
+                    .get(&code)
+                    .is_some_and(|text| text.as_bytes() == [b'0' + digit])
+        };
+        let mut repairs = Vec::new();
+        for (&code, text) in &self.char_map {
+            let mut chars = text.chars();
+            let single_non_digit = matches!(
+                (chars.next(), chars.next()),
+                (Some(c), None) if !c.is_ascii_digit()
+            );
+            if !single_non_digit || !bfchar_codes.contains(&code) {
+                continue;
+            }
+            for digit in 0..10u8 {
+                let Some(first) = code.checked_sub(u16::from(digit)) else {
+                    break;
+                };
+                if first.checked_add(9).is_none() {
+                    continue;
+                }
+                let is_table = (0..10u8)
+                    .filter(|&d| d != digit)
+                    .all(|d| reads_as(&self.char_map, first + u16::from(d), d));
+                if is_table
+                    && !self
+                        .ranges
+                        .iter()
+                        .any(|&(start, end, _)| (start..=end).contains(&code))
+                {
+                    repairs.push((code, (b'0' + digit) as char));
+                    break;
+                }
+            }
+        }
+        for (code, ch) in repairs {
+            self.char_map.insert(code, ch.to_string());
+        }
+    }
+
     /// Parse a bfchar section: <src> <dst> pairs
-    fn parse_bfchar_section(&mut self, section: &str, src_hex_lengths: &mut Vec<usize>) {
+    fn parse_bfchar_section(
+        &mut self,
+        section: &str,
+        src_hex_lengths: &mut Vec<usize>,
+        bfchar_codes: &mut HashSet<u16>,
+    ) {
         // Match pairs of hex values: <XXXX> <YYYY>
         let mut chars = section.chars().peekable();
 
@@ -989,34 +1052,27 @@ impl ToUnicodeCMap {
                 (parse_hex_u16(&src_hex), hex_to_unicode_string(&dst_hex))
             {
                 self.char_map.insert(src, dst);
+                bfchar_codes.insert(src);
             }
         }
     }
 
     /// Parse a bfrange section: <start> <end> <base> or <start> <end> [<u1> <u2> ...] triplets
-    fn parse_bfrange_section(&mut self, section: &str, src_hex_lengths: &mut Vec<usize>) {
+    fn parse_bfrange_section(
+        &mut self,
+        section: &str,
+        src_hex_lengths: &mut Vec<usize>,
+        bfchar_codes: &mut HashSet<u16>,
+    ) {
         let mut chars = section.chars().peekable();
 
         loop {
-            // Skip whitespace
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            skip_whitespace(&mut chars);
 
             // Look for opening <
-            if chars.peek() != Some(&'<') {
+            let Some(start_hex) = read_angle_hex(&mut chars) else {
                 break;
-            }
-            chars.next(); // consume <
-
-            // Read start hex
-            let mut start_hex = String::new();
-            while chars.peek().is_some_and(|&c| c != '>') {
-                if let Some(c) = chars.next() {
-                    start_hex.push(c);
-                }
-            }
-            chars.next(); // consume >
+            };
 
             // Track source hex length
             let trimmed_start = start_hex.trim();
@@ -1024,40 +1080,17 @@ impl ToUnicodeCMap {
                 src_hex_lengths.push(trimmed_start.len());
             }
 
-            // Skip whitespace
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            skip_whitespace(&mut chars);
 
             // Read end hex
-            if chars.peek() != Some(&'<') {
+            let Some(end_hex) = read_angle_hex(&mut chars) else {
                 continue;
-            }
-            chars.next();
-            let mut end_hex = String::new();
-            while chars.peek().is_some_and(|&c| c != '>') {
-                if let Some(c) = chars.next() {
-                    end_hex.push(c);
-                }
-            }
-            chars.next();
+            };
 
-            // Skip whitespace
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            skip_whitespace(&mut chars);
 
             // Read base - could be <hex> or [array]
-            if chars.peek() == Some(&'<') {
-                chars.next();
-                let mut base_hex = String::new();
-                while chars.peek().is_some_and(|&c| c != '>') {
-                    if let Some(c) = chars.next() {
-                        base_hex.push(c);
-                    }
-                }
-                chars.next();
-
+            if let Some(base_hex) = read_angle_hex(&mut chars) {
                 // Store range mapping
                 if let (Some(start), Some(end), Some(base)) = (
                     parse_hex_u16(&start_hex),
@@ -1067,58 +1100,47 @@ impl ToUnicodeCMap {
                     self.ranges.push((start, end, base));
                 }
             } else if chars.peek() == Some(&'[') {
-                // Array format: [<unicode1> <unicode2> ...]
-                // Each entry maps to start_cid + index
                 chars.next(); // consume [
-                if let (Some(start), Some(end)) =
-                    (parse_hex_u16(&start_hex), parse_hex_u16(&end_hex))
-                {
-                    let mut cid = start;
-                    loop {
-                        // Skip whitespace
-                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                            chars.next();
-                        }
-                        if chars.peek() == Some(&']') {
-                            chars.next();
-                            break;
-                        }
-                        if chars.peek() != Some(&'<') {
-                            break;
-                        }
-                        chars.next(); // consume <
-                        let mut hex = String::new();
-                        while chars.peek().is_some_and(|&c| c != '>') {
-                            if let Some(c) = chars.next() {
-                                hex.push(c);
-                            }
-                        }
-                        chars.next(); // consume >
-                        if let Some(unicode_str) = hex_to_unicode_string(&hex) {
-                            self.char_map.insert(cid, unicode_str);
-                        }
-                        if cid >= end {
-                            // Skip remaining entries and closing bracket
-                            while chars.peek().is_some_and(|&c| c != ']') {
-                                chars.next();
-                            }
-                            if chars.peek() == Some(&']') {
-                                chars.next();
-                            }
-                            break;
-                        }
-                        cid = cid.saturating_add(1);
+                match (parse_hex_u16(&start_hex), parse_hex_u16(&end_hex)) {
+                    (Some(start), Some(end)) => {
+                        self.parse_bfrange_array(&mut chars, start, end, bfchar_codes);
                     }
-                } else {
                     // Couldn't parse start/end, skip the array
-                    while chars.peek().is_some_and(|&c| c != ']') {
-                        chars.next();
-                    }
-                    if chars.peek() == Some(&']') {
-                        chars.next();
-                    }
+                    _ => skip_past_closing_bracket(&mut chars),
                 }
             }
+        }
+    }
+
+    /// Parse the entries of a bfrange array `[<u1> <u2> ...]` after its opening
+    /// bracket. Each entry maps to `start + index`.
+    fn parse_bfrange_array(
+        &mut self,
+        chars: &mut Peekable<Chars<'_>>,
+        start: u16,
+        end: u16,
+        bfchar_codes: &mut HashSet<u16>,
+    ) {
+        let mut cid = start;
+        loop {
+            skip_whitespace(chars);
+            if chars.peek() == Some(&']') {
+                chars.next();
+                break;
+            }
+            let Some(hex) = read_angle_hex(chars) else {
+                break;
+            };
+            if let Some(unicode_str) = hex_to_unicode_string(&hex) {
+                self.char_map.insert(cid, unicode_str);
+                bfchar_codes.remove(&cid);
+            }
+            if cid >= end {
+                // Skip remaining entries and closing bracket
+                skip_past_closing_bracket(chars);
+                break;
+            }
+            cid = cid.saturating_add(1);
         }
     }
 
@@ -3781,9 +3803,124 @@ fn build_fallback_cmap_for_simple(
     program_fallback_cmap(font_dict, doc, Some(&program))
 }
 
+/// Advance past any whitespace.
+fn skip_whitespace(chars: &mut Peekable<Chars<'_>>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
+}
+
+/// If the next character is `<`, consume `<hex>` and return the hex text.
+/// The closing `>` is consumed when present.
+fn read_angle_hex(chars: &mut Peekable<Chars<'_>>) -> Option<String> {
+    if chars.peek() != Some(&'<') {
+        return None;
+    }
+    chars.next(); // consume <
+    let mut hex = String::new();
+    while let Some(c) = chars.next_if(|&c| c != '>') {
+        hex.push(c);
+    }
+    chars.next(); // consume >
+    Some(hex)
+}
+
+/// Skip up to and including the next `]`.
+fn skip_past_closing_bracket(chars: &mut Peekable<Chars<'_>>) {
+    while chars.next_if(|&c| c != ']').is_some() {}
+    chars.next_if_eq(&']');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digit_between_two_digits_written_as_another_char_reads_as_the_digit() {
+        let cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              10 beginbfchar\n<009A> <0030>\n<009B> <0028>\n<009C> <0032>\n<009D> <0033>\n\
+              <009E> <0034>\n<009F> <0035>\n<00A0> <0036>\n<00A1> <0037>\n<00A2> <0038>\n\
+              <00A3> <0039>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(cmap.lookup(0x9A), Some("0".to_string()));
+        assert_eq!(cmap.lookup(0x9B), Some("1".to_string()));
+        assert_eq!(cmap.lookup(0x9C), Some("2".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_leaves_other_entries_alone() {
+        let parse = |entries: &str| {
+            let src = format!(
+                "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+                 beginbfchar\n{entries}endbfchar\n"
+            );
+            ToUnicodeCMap::parse(src.as_bytes()).unwrap()
+        };
+        // Neighbours are not digits.
+        let c = parse("<0010> <0041>\n<0011> <0028>\n<0012> <0043>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        // Neighbours are not two apart.
+        let c = parse("<0010> <0030>\n<0011> <0028>\n<0012> <0033>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        let c = parse("<0010> <0032>\n<0011> <0028>\n<0012> <0030>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+        // The entry is already a digit.
+        let c = parse("<0010> <0030>\n<0011> <0037>\n<0012> <0032>\n");
+        assert_eq!(c.lookup(0x11), Some("7".to_string()));
+        // The entry is not one character.
+        let c = parse("<0010> <0030>\n<0011> <00280029>\n<0012> <0032>\n");
+        assert_eq!(c.lookup(0x11), Some("()".to_string()));
+        // A neighbour is missing.
+        let c = parse("<0010> <0030>\n<0011> <0028>\n");
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_needs_the_whole_digit_table() {
+        // A font numbering codes in first-use order can map `0.2` to three
+        // consecutive codes. The period stays a period.
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              3 beginbfchar\n<0010> <0030>\n<0011> <002E>\n<0012> <0032>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some(".".to_string()));
+        // Nine digits of the table, with the tenth code missing.
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              9 beginbfchar\n<0010> <0030>\n<0011> <0028>\n<0012> <0032>\n<0013> <0033>\n\
+              <0014> <0034>\n<0015> <0035>\n<0016> <0036>\n<0017> <0037>\n<0018> <0038>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_leaves_an_entry_inside_a_range_alone() {
+        // Code 0x11 is a bfchar entry and also lies in a bfrange, with the
+        // other nine codes of the table explicit bfchar digits.
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              10 beginbfchar\n<0010> <0030>\n<0011> <0028>\n<0012> <0032>\n<0013> <0033>\n\
+              <0014> <0034>\n<0015> <0035>\n<0016> <0036>\n<0017> <0037>\n<0018> <0038>\n\
+              <0019> <0039>\nendbfchar\n\
+              1 beginbfrange\n<0011> <0011> <0028>\nendbfrange\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
+
+    #[test]
+    fn digit_repair_leaves_bfrange_array_entries_alone() {
+        let c = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+              1 beginbfrange\n<0010> <0019> [<0030> <0028> <0032> <0033> <0034> <0035> <0036> <0037> <0038> <0039>]\nendbfrange\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookup(0x11), Some("(".to_string()));
+    }
 
     #[test]
     fn builtin_cmaps_are_embedded_in_the_binary() {

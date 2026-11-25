@@ -7,6 +7,18 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A digit that a font's ToUnicode map writes as another character now
+  reads as the digit when the map is a complete table of ten `bfchar`
+  entries for `0` to `9` in order and exactly one entry reads as a
+  non-digit. The article marker `1` in an Arabic heading, written `())`
+  because its glyph mapped to `(` between the glyphs of `0` and `2`,
+  reads `(1)`. Entries set by `bfrange`, and tables with fewer than ten
+  codes, are left as they are (firecrawl/firecrawl#5931).
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
