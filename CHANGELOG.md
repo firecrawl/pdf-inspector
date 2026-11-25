@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Justified text drawn with a stretched text matrix (for example
+  `[14.98 0 0 14 ...]` for a 14 pt line, as InDesign writes it) keeps its
+  real font size instead of the wider axis, so runs of short body lines no
+  longer come out as stray `##` headings. The Saudi Personal Data
+  Protection Law PDF drops from 24 to 14 `##` lines.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.

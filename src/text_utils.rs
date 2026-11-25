@@ -879,14 +879,18 @@ pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
 
 /// Compute effective font size from base size and text matrix
 /// Text matrix is [a, b, c, d, tx, ty] where a,d are scale factors
+///
+/// The size is the vertical scale (the length of the matrix's y basis
+/// vector), which is what the em height is drawn at. A non-uniform matrix
+/// whose x scale exceeds its y scale is horizontal glyph stretching, such
+/// as an InDesign justified line drawn with `[14.98 0 0 14 ...]` at 14 pt;
+/// taking the larger axis would give that line a 14.98 pt size and make it
+/// look like a heading. The horizontal axis only decides when the matrix
+/// has no vertical extent at all.
 pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
-    // The scale factor is typically the magnitude of the transformation
-    // For most PDFs, text_matrix[0] (a) is the horizontal scale
-    // and text_matrix[3] (d) is the vertical scale
     let scale_x = (text_matrix[0].powi(2) + text_matrix[1].powi(2)).sqrt();
     let scale_y = (text_matrix[2].powi(2) + text_matrix[3].powi(2)).sqrt();
-    // Use the larger of the two scales (usually they're equal for non-rotated text)
-    let scale = scale_x.max(scale_y);
+    let scale = if scale_y > 0.0 { scale_y } else { scale_x };
     // A negative `Tf` size turns the glyphs around; their size is still
     // their size (the geometry reads the direction from the advance).
     base_size.abs() * scale
@@ -1412,6 +1416,58 @@ pub(crate) fn should_join_items(
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    #[test]
+    fn effective_font_size_ignores_horizontal_stretch() {
+        let close = |got: f32, want: f32| assert!((got - want).abs() < 1e-3, "{got} != {want}");
+        // Uniform, rotated and mirrored matrices keep their size.
+        close(
+            effective_font_size(1.0, &[14.0, 0.0, 0.0, 14.0, 0.0, 0.0]),
+            14.0,
+        );
+        close(
+            effective_font_size(1.0, &[0.0, 14.0, -14.0, 0.0, 0.0, 0.0]),
+            14.0,
+        );
+        close(
+            effective_font_size(1.0, &[14.0, 0.0, 0.0, -14.0, 0.0, 0.0]),
+            14.0,
+        );
+        close(
+            effective_font_size(-12.0, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            12.0,
+        );
+        // A justified line drawn 107% wide is still a 14 pt line.
+        close(
+            effective_font_size(1.0, &[14.98, 0.0, 0.0, 14.0, 0.0, 0.0]),
+            14.0,
+        );
+        close(
+            effective_font_size(1.0, &[12.88, 0.0, 0.0, 14.0, 0.0, 0.0]),
+            14.0,
+        );
+        // A matrix with no vertical extent falls back to the horizontal one.
+        close(
+            effective_font_size(2.0, &[7.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            14.0,
+        );
+    }
+
+    #[test]
+    fn effective_font_size_keeps_tiny_nonzero_vertical_scale() {
+        let rel =
+            |got: f32, want: f32| assert!((got - want).abs() <= want * 1e-3, "{got} != {want}");
+        // Compressed matrix with a large Tf size: 1e8 * 1e-8 = 1.
+        rel(
+            effective_font_size(1e8, &[1.0, 0.0, 0.0, 1e-8, 0.0, 0.0]),
+            1.0,
+        );
+        // Tiny matrix, huge Tf size, wide horizontal scale must not win.
+        rel(
+            effective_font_size(1e8, &[1e-6, 0.0, 0.0, 1e-8, 0.0, 0.0]),
+            1.0,
+        );
+    }
 
     #[test]
     fn font_weight_reads_full_style_words() {
