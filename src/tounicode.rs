@@ -390,6 +390,12 @@ fn is_arabic_char(ch: char) -> bool {
             .any(|block| block.contains(&u32::from(ch)))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`ToUnicodeCMap::reads_arabic_bytes`] ran on this thread.
+    pub(crate) static ARABIC_BYTE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The fewest Arabic letters a CMap reads for it to be an Arabic font's.
 const ARABIC_CMAP_MIN_ENTRIES: usize = 8;
 /// The Unicode blocks of the Arabic script: Arabic, Supplement, Extended-B
@@ -1366,6 +1372,27 @@ impl ToUnicodeCMap {
             .map(|&(start, end, _)| usize::from(end.saturating_sub(start)) + 1)
             .fold(0usize, usize::saturating_add);
         direct.saturating_add(ranged) >= ARABIC_CMAP_MIN_ENTRIES
+    }
+
+    /// Whether the codes of a byte, 0 to 255, read as at least
+    /// [`ARABIC_CMAP_MIN_ENTRIES`] Arabic letters as the decoder reads them
+    /// ([`Self::lookup_code`]): a direct entry overrides a range, and each
+    /// code counts by its own destination. This decides what a simple font
+    /// shows, so it counts effective readings; the work is bounded by the
+    /// 256 codes, whatever the size of the CMap.
+    pub(crate) fn reads_arabic_bytes(&self) -> bool {
+        #[cfg(test)]
+        ARABIC_BYTE_SCANS.with(|scans| scans.set(scans.get() + 1));
+        (0..=0xFFu16)
+            .filter(|&code| {
+                matches!(
+                    self.lookup_code(code),
+                    CodeMapping::Text(text) if text.chars().next().is_some_and(is_arabic_char)
+                )
+            })
+            .take(ARABIC_CMAP_MIN_ENTRIES)
+            .count()
+            >= ARABIC_CMAP_MIN_ENTRIES
     }
 
     /// Give `codes` — control destinations of this CMap — the text `source`

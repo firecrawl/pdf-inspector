@@ -35,12 +35,20 @@ version and date. Earlier releases are described in their
   [firecrawl/firecrawl#5931](https://github.com/firecrawl/firecrawl/issues/5931)).
   The code is read as no text, and the font's `/Differences` names, fallback
   CMap and printable-byte guess no longer read it, only when the font's
-  ToUnicode map reads at least eight Arabic letters and the entry is U+FFFD
-  alone; fonts without Arabic letters and every other entry read as before.
-  A run of nothing but such codes adds neither an item nor a word space.
-  Known limitations: only the primary ToUnicode map is consulted, and the
-  first piece's glyph is not measured, so a U+FFFD entry of an Arabic simple
-  font that shows a real letter is dropped as well.
+  ToUnicode map reads at least eight of the 256 byte codes as Arabic letters
+  (counted as the decoder reads them, a direct entry over a range) and the
+  entry is U+FFFD alone; fonts without Arabic letters and every other entry
+  read as before. A code the font gives as a space (`/space` in its
+  `/Differences`, or a glyph with no outline and an advance) keeps its space.
+  A run holding such a code is decided: the original bytes are not read
+  again by the encoding, and a run of nothing but such codes adds neither an
+  item nor a word space. The Arabic verdict is found once for each ToUnicode
+  object of a page, not for each string.
+  Known limitations: only the primary ToUnicode map is consulted, the first
+  piece's glyph is not measured, so a U+FFFD entry of an Arabic simple font
+  that shows a real letter is dropped as well, and a font whose ToUnicode
+  stream is inline (no object) is measured for each string that shows such
+  a code (at most 256 lookups).
 
 ## [1.27.1] - 2026-11-24
 

@@ -6,7 +6,7 @@ use super::super::content_stream::extract_page_text_items;
 use super::super::FormWalkBudget;
 use super::tests::{decode_simple_font_string, simple_font_doc};
 use super::FontStyleCache;
-use crate::tounicode::FontCMaps;
+use crate::tounicode::{FontCMaps, ARABIC_BYTE_SCANS};
 use lopdf::{dictionary, Object, Stream};
 
 /// Eight letters on codes 0x21..=0x28, U+FFFD on 0x29, 0x2A and 0x2B, and
@@ -64,6 +64,72 @@ fn a_code_the_cmap_of_a_simple_arabic_font_reads_as_a_letter_is_untouched() {
 fn a_u_fffd_code_with_no_other_name_of_a_simple_arabic_font_is_dropped_too() {
     let text = decode_simple_font_string(&bfchar(ARABIC), None, None, &[0x21, 0x2B, 0x22]);
     assert_eq!(text, "ال");
+}
+
+#[test]
+fn a_dropped_code_beside_an_unreadable_byte_is_not_read_again_by_the_encoding() {
+    // The control byte reads as nothing: the run is decided, and the
+    // Differences do not get the original bytes.
+    assert_eq!(decode(ARABIC, &[0x29, 0x00]), "");
+    assert_eq!(decode(ARABIC, &[0x29, 0x2A, 0x03]), "");
+    assert_eq!(decode(ARABIC, &[0x03, 0x2A]), "");
+    assert_eq!(decode(ARABIC, &[0x21, 0x29, 0x03, 0x2A, 0x22]), "ال");
+}
+
+#[test]
+fn a_u_fffd_code_that_is_a_space_keeps_its_space() {
+    let space = Some(Object::Dictionary(dictionary! {
+        "Type" => "Encoding",
+        "BaseEncoding" => "WinAnsiEncoding",
+        "Differences" => vec![0x29.into(), Object::Name(b"space".to_vec())],
+    }));
+    let text = decode_simple_font_string(&bfchar(ARABIC), None, space, &[0x21, 0x29, 0x22]);
+    assert_eq!(text, "ا ل");
+}
+
+#[test]
+fn a_range_every_code_of_which_a_latin_entry_overrides_is_no_arabic_font() {
+    // Eight Arabic destinations by range, every one overridden by a Latin
+    // direct entry: no code reads as an Arabic letter.
+    let overridden = format!(
+        "{}endbfchar\n1 beginbfrange\n<21> <28> <0627>\nendbfrange\n1 beginbfchar\n",
+        bfchar(LATIN)
+    );
+    let text = decode_simple_font_string(&overridden, None, encoding(), &[0x21, 0x29, 0x2A]);
+    assert_eq!(text, "a\u{FB}\u{FC}");
+}
+
+#[test]
+fn the_arabic_reading_of_a_cmap_is_measured_once_for_all_the_strings_of_a_font() {
+    // 60,000 entries over a two-byte codespace of a simple font, and 5,000
+    // strings each showing the replacement code.
+    let mut bfchar = bfchar(ARABIC);
+    for code in 0x100..0xEA60u32 {
+        bfchar.push_str(&format!("<{code:04X}> <0041>\n"));
+    }
+    let (mut doc, _, page) = simple_font_doc(&bfchar, None, None, encoding(), false);
+    let mut content = b"BT /F1 12 Tf 100 700 Td ".to_vec();
+    for _ in 0..5000 {
+        content.extend_from_slice(b"<29> Tj ");
+    }
+    content.extend_from_slice(b"ET");
+    let contents = doc.add_object(Stream::new(dictionary! {}, content));
+    let page_dict = doc.get_object_mut(page).unwrap().as_dict_mut().unwrap();
+    page_dict.set("Contents", contents);
+    let cmaps = FontCMaps::from_doc(&doc);
+    ARABIC_BYTE_SCANS.with(|scans| scans.set(0));
+    let ((items, _, _), _, _, _) = extract_page_text_items(
+        &doc,
+        page,
+        1,
+        &cmaps,
+        false,
+        &mut FontStyleCache::new(),
+        &mut FormWalkBudget::new(),
+    )
+    .unwrap();
+    assert!(items.is_empty(), "{items:?}");
+    assert_eq!(ARABIC_BYTE_SCANS.with(std::cell::Cell::get), 1);
 }
 
 #[test]

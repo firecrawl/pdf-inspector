@@ -21,6 +21,9 @@ pub(crate) enum CMapChoice {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CMapDecisionCache {
     decisions: HashMap<u32, CMapDecision>,
+    /// Per ToUnicode object: whether a simple font's CMap reads Arabic
+    /// letters (see [`Self::reads_arabic_bytes`]).
+    arabic_bytes: HashMap<u32, bool>,
     /// The coverage recorded since the walker last took it: the decodes of
     /// the show operators under way, summed per font under the font's name
     /// (its `/BaseFont` name, or its resource name without one), in the
@@ -45,6 +48,25 @@ struct CMapDecision {
 impl CMapDecisionCache {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the CMap of a simple font reads Arabic letters
+    /// ([`crate::tounicode::ToUnicodeCMap::reads_arabic_bytes`]), found once for the CMap
+    /// `key` names (the ToUnicode object) and not again for each string.
+    /// A CMap without a key (an inline one) is measured each time; the
+    /// measure is bounded by the 256 codes of a byte.
+    pub(crate) fn reads_arabic_bytes(
+        &mut self,
+        key: Option<u32>,
+        cmap: &crate::tounicode::ToUnicodeCMap,
+    ) -> bool {
+        let Some(key) = key else {
+            return cmap.reads_arabic_bytes();
+        };
+        *self
+            .arabic_bytes
+            .entry(key)
+            .or_insert_with(|| cmap.reads_arabic_bytes())
     }
 
     pub(crate) fn get_choice(&self, obj_num: u32) -> Option<CMapChoice> {
@@ -227,6 +249,19 @@ pub(crate) fn add_kashida_codes(
         info.kashida_codes
             .clone_from(&font_cache.kashida_codes[&key]);
     }
+}
+
+/// Whether `encoding` gives the one-byte code `code` as a space: the name
+/// `/space` (or another blank character) in its Differences, or a glyph with
+/// no outline and an advance.
+fn shows_space(encoding: Option<&FontEncoding>, code: u8) -> bool {
+    encoding.is_some_and(|map| {
+        map.blank_codes.contains(&code)
+            || matches!(
+                differences_reading(map, code),
+                Some(NamedReading::Text(text)) if text.chars().all(char::is_whitespace)
+            )
+    })
 }
 
 /// `bytes`, a string of two-byte codes, without the codes in `kashidas`.
@@ -2618,7 +2653,9 @@ pub(crate) fn extract_text_from_operand(
                 }
                 unjustified.as_slice()
             };
-            let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
+            let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry,
+                                         cache_key: Option<u32>|
+             -> Option<String> {
                 // For single-byte CMaps, and for any CMap of a simple font,
                 // merge CMap + Differences at the byte level: try CMap first,
                 // then Differences, then Latin-1 fallback per byte. This
@@ -2631,21 +2668,21 @@ pub(crate) fn extract_text_from_operand(
                     // producer split over two glyphs (the dots), which has
                     // no text of its own: the code reads as nothing, and
                     // neither the Differences, the fallback CMap nor the
-                    // byte guess below may read it as a Latin letter.
-                    let arabic_cmap = std::cell::OnceCell::new();
-                    let reads_nothing = |b: u8| {
-                        is_simple_font
-                            && matches!(
-                                entry.primary.lookup_code(u16::from(b)),
-                                CodeMapping::Text(ref s) if s == "\u{FFFD}"
-                            )
-                            && *arabic_cmap.get_or_init(|| entry.primary.reads_arabic_letters())
-                    };
-                    let decode_byte = |b: u8| -> Option<String> {
-                        if reads_nothing(b) {
+                    // byte guess below may read it as a Latin letter. Not a
+                    // code the font gives as a space (a Differences name
+                    // or a blank glyph), which keeps its reading.
+                    let suppressed = std::cell::Cell::new(false);
+                    let mut decode_byte = |b: u8| -> Option<String> {
+                        let code = b as u16;
+                        let mapping = entry.primary.lookup_code(code);
+                        if is_simple_font
+                            && matches!(&mapping, CodeMapping::Text(s) if s == "\u{FFFD}")
+                            && !shows_space(encoding_map, b)
+                            && cmap_decisions.reads_arabic_bytes(cache_key, &entry.primary)
+                        {
+                            suppressed.set(true);
                             return None;
                         }
-                        let code = b as u16;
                         // 1. Primary CMap. An entry whose destination is a
                         // control character maps the code to no text (what
                         // the font itself could read of such codes was put
@@ -2655,7 +2692,7 @@ pub(crate) fn extract_text_from_operand(
                         // and a code none of them reads is marked rather
                         // than dropped.
                         let mut control_destination = false;
-                        match entry.primary.lookup_code(code) {
+                        match mapping {
                             CodeMapping::Text(s) if !s.contains('\u{FFFD}') => {
                                 // An entry of a stale CMap that describes
                                 // the slot rather than the glyph reads as
@@ -2802,9 +2839,10 @@ pub(crate) fn extract_text_from_operand(
                     if !decoded.is_empty() {
                         return Some(decoded);
                     }
-                    // A run of nothing but such codes shows no text: it is
-                    // empty, not a failed decode.
-                    if !bytes.is_empty() && bytes.iter().all(|&b| reads_nothing(b)) {
+                    // A run that held such a code is decided: it shows no
+                    // more text than the other codes gave, and the original
+                    // bytes are not read again by the fallbacks.
+                    if suppressed.get() {
                         return Some(String::new());
                     }
                     return None;
@@ -2970,7 +3008,7 @@ pub(crate) fn extract_text_from_operand(
             let mut has_cmap = false;
             if let Some(entry) = inline_cmaps.get(current_font) {
                 has_cmap = true;
-                if let Some(decoded) = decode_with_entry(entry) {
+                if let Some(decoded) = decode_with_entry(entry, None) {
                     return Some(decoded);
                 }
             }
@@ -2979,7 +3017,7 @@ pub(crate) fn extract_text_from_operand(
             if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
                 if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
                     has_cmap = true;
-                    if let Some(decoded) = decode_with_entry(entry) {
+                    if let Some(decoded) = decode_with_entry(entry, Some(obj_num)) {
                         return Some(decoded);
                     }
                 }
