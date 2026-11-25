@@ -243,6 +243,7 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
     let mut runs = Vec::new();
     let mut skipped_brackets: HashSet<usize> = HashSet::new();
     for (_, mut by_y) in pages {
+        let mut page_runs: Vec<(ScriptRun, f32)> = Vec::new();
         by_y.sort_by(|&a, &b| items[a].y.total_cmp(&items[b].y));
         let max_fs = by_y
             .iter()
@@ -286,8 +287,6 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
             if chars > SCRIPT_MAX_RUN_CHARS {
                 continue;
             }
-            let first = &items[chain[0]];
-            let last = &items[*chain.last().unwrap()];
             // The run's size is that of its letters and digits: a sign set
             // from a symbol font can be a design size above them (the minus
             // of an exponent in TeX), which would take the run past the size
@@ -312,34 +311,9 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 largest_fs
             };
 
-            // Nearest anchor wins; on a tie the preceding word does — a
-            // footnote reference belongs to the word before it, not to the
-            // comma after it.
-            let lo = by_y.partition_point(|&i| items[i].y < first.y - window);
-            let mut best: Option<(f32, usize, bool)> = None;
-            for &n in &by_y[lo..] {
-                let body = &items[n];
-                if body.y > first.y + window {
-                    break;
-                }
-                if chain.contains(&n) {
-                    continue;
-                }
-                let Some((gap, on_left)) = script_anchor_gap(first, last, run_fs, body) else {
-                    continue;
-                };
-                let better = match best {
-                    None => true,
-                    Some((best_gap, _, best_left)) => {
-                        gap < best_gap - 0.01
-                            || ((gap - best_gap).abs() <= 0.01 && on_left && !best_left)
-                    }
-                };
-                if better {
-                    best = Some((gap, n, on_left));
-                }
-            }
-            if let Some((_, anchor, anchor_on_left)) = best {
+            if let Some((anchor, anchor_on_left)) =
+                nearest_anchor(items, &by_y, window, &chain, run_fs, &skipped_brackets)
+            {
                 let plain = is_plain_text_piece(items, &chain, &items[anchor]);
                 // Brackets alone ("())") are punctuation of the neighbouring
                 // text, not a marker, even where they cannot rejoin it.
@@ -348,19 +322,73 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                     skipped_brackets.extend(chain);
                     continue;
                 }
-                runs.push(ScriptRun {
-                    glyphs: chain,
-                    anchor,
-                    anchor_on_left,
-                    plain,
-                });
+                page_runs.push((
+                    ScriptRun {
+                        glyphs: chain,
+                        anchor,
+                        anchor_on_left,
+                        plain,
+                    },
+                    run_fs,
+                ));
             }
         }
+        // A skipped bracket is punctuation, so a digit beside it belongs to
+        // the word the bracket belongs to, not to the bracket: look for that
+        // word, and drop the run only where none takes it.
+        for (mut run, run_fs) in page_runs {
+            if skipped_brackets.contains(&run.anchor) {
+                let Some((anchor, on_left)) =
+                    nearest_anchor(items, &by_y, window, &run.glyphs, run_fs, &skipped_brackets)
+                else {
+                    continue;
+                };
+                run.anchor = anchor;
+                run.anchor_on_left = on_left;
+            }
+            runs.push(run);
+        }
     }
-    // A skipped bracket is punctuation, so a digit beside it belongs to the
-    // word the bracket belongs to, not to the bracket.
-    runs.retain(|run| !skipped_brackets.contains(&run.anchor));
     runs
+}
+
+/// Nearest anchor of the glyph run `chain` (x order) at `run_fs`, never one
+/// of `skip`. On a tie the preceding word wins: a footnote reference belongs
+/// to the word before it, not to the comma after it.
+fn nearest_anchor(
+    items: &[TextItem],
+    by_y: &[usize],
+    window: f32,
+    chain: &[usize],
+    run_fs: f32,
+    skip: &HashSet<usize>,
+) -> Option<(usize, bool)> {
+    let first = &items[chain[0]];
+    let last = &items[*chain.last().unwrap()];
+    let lo = by_y.partition_point(|&i| items[i].y < first.y - window);
+    let mut best: Option<(f32, usize, bool)> = None;
+    for &n in &by_y[lo..] {
+        let body = &items[n];
+        if body.y > first.y + window {
+            break;
+        }
+        if chain.contains(&n) || skip.contains(&n) {
+            continue;
+        }
+        let Some((gap, on_left)) = script_anchor_gap(first, last, run_fs, body) else {
+            continue;
+        };
+        let better = match best {
+            None => true,
+            Some((best_gap, _, best_left)) => {
+                gap < best_gap - 0.01 || ((gap - best_gap).abs() <= 0.01 && on_left && !best_left)
+            }
+        };
+        if better {
+            best = Some((gap, n, on_left));
+        }
+    }
+    best.map(|(_, n, on_left)| (n, on_left))
 }
 
 /// The anchor edge a digit-only run may fuse onto: a footnote reference
@@ -443,11 +471,10 @@ fn can_fuse(items: &[TextItem], run: &ScriptRun, glyph_runs: &HashMap<usize, usi
 }
 
 /// Absorb a run into its anchor's text. Digits become super/subscript
-/// characters; plain pieces keep their letters. A plain piece on the right
-/// of its word reads right to left, so it goes at the start of the text
-/// (after any opening punctuation) with its glyphs in reverse x order; one on
-/// the left is already ahead of the word in the stream order of the source
-/// PDFs and goes at the start.
+/// characters; plain pieces keep their letters, in reverse x order since
+/// they read right to left. Letters on either side of their word go at the
+/// start of the text (after any opening punctuation); brackets on its left
+/// close it and go at the end.
 fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let first = &items[run.glyphs[0]];
     // Direction from the baseline offset (y-up): raised → superscript digits
@@ -455,7 +482,9 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     // to plain digits, so downstream text matching is unaffected.
     let raised = first.y > items[run.anchor].y + items[run.anchor].font_size * 0.1;
     let mut glyphs = run.glyphs.clone();
-    if run.plain && run.anchor_on_left {
+    // Arabic/Hebrew glyphs read right to left whichever side of the word the
+    // piece sits on.
+    if run.plain {
         glyphs.reverse();
     }
     let mapped: String = glyphs
@@ -480,8 +509,14 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let left = anchor.x.min(run_left);
     anchor.width = anchor_right.max(run_right) - left;
     anchor.x = left;
+    let brackets_only = run.plain && mapped.chars().all(is_bracket);
     if run.anchor_on_left && !run.plain {
         anchor.text.push_str(&mapped);
+    } else if brackets_only && !run.anchor_on_left {
+        // Brackets left of an RTL word close it ("المادة:())"): they are its
+        // logical suffix, ahead of any trailing space.
+        let at = anchor.text.trim_end().len();
+        anchor.text.insert_str(at, &mapped);
     } else {
         let at = if run.plain {
             anchor.text.find(char::is_alphabetic).unwrap_or(0)
@@ -1166,6 +1201,34 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].font_size, 14.0);
         assert_eq!(merged[0].baseline_shift, 0.0);
+        assert_eq!(merged[0].text, "المادة الثلاثون:()) ");
+    }
+
+    #[test]
+    fn multi_glyph_left_piece_reads_in_logical_order() {
+        // Two single-letter items left of the word, in screen (x) order.
+        let items = vec![
+            make_item_fs("ل", 173.0, 295.9942, 4.0, 6.996),
+            make_item_fs("ا", 177.0, 295.9942, 4.0, 6.996),
+            make_item_fs("مادة", 182.5865, 291.9982, 30.0, 14.0),
+        ];
+        assert_eq!(texts(&merge_subscript_items(items)), vec!["المادة"]);
+    }
+
+    #[test]
+    fn footnote_digit_valid_against_word_survives_a_skipped_bracket() {
+        // The bracket is nearer, but the digit also fits the 10 pt word.
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 10.0),
+            make_item_fs(")", 124.0, 504.0, 2.0, 6.0),
+            make_item_fs("1", 126.0, 505.5, 2.0, 4.2),
+        ];
+        let merged = merge_subscript_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(
+            texts.contains(&"word¹") && texts.contains(&")"),
+            "{texts:?}"
+        );
     }
 
     #[test]
