@@ -1191,7 +1191,7 @@ pub fn fix_bare_struct_names(buf: &[u8]) -> Cow<'_, [u8]> {
                 pos = end;
                 matched = true;
                 debug!(
-                    "fix_bare_struct_names: patched /S {} → /S /{}",
+                    "fix_bare_struct_names: patched /S {} → /S/{}",
                     String::from_utf8_lossy(name),
                     String::from_utf8_lossy(name)
                 );
