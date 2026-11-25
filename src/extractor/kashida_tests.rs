@@ -330,6 +330,13 @@ fn a_run_of_nothing_but_a_kashida_is_no_space_between_letters() {
 
     let text: String = items.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(text, "AA", "{items:?}");
+    // The dropped kashida still advances the position: one item that spans
+    // all three glyphs, each 20 units of 12 point text wide.
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        (items[0].width - 3.0 * 20.0 * 12.0 / 1000.0).abs() < 1e-3,
+        "{items:?}"
+    );
 }
 
 /// A CMap reading each of `chars` from its own code.
@@ -375,4 +382,42 @@ fn letters_of_the_other_arabic_blocks_make_an_arabic_cmap() {
         0x1EE00, 0x1EE01, 0x1EE02, 0x1EE03, 0x1EE05, 0x1EE06, 0x1EE07, 0x1EE08,
     ];
     assert!(cmap_of(&math).reads_arabic_letters());
+}
+
+#[test]
+fn an_odd_length_string_is_read_by_the_byte_not_by_pairs_of_a_kashida() {
+    // Code 0x0100 is a kashida (every code from 0x100 on is sent to glyph 2).
+    // A string of three bytes is read a byte at a time: its first two are
+    // not the code 0x0100, and the letter at code 1 is shown twice.
+    let map: Vec<u16> = (0..=u16::MAX)
+        .map(|cid| if cid < 0x100 { 1 } else { 2 })
+        .collect();
+    let doc = document(&bfchar(&[0x100], ARABIC), program(&GLYPHS), Some(&map));
+    assert_eq!(font_kashida_codes(&doc), vec![0x100]);
+    let text = |bytes: &[u8]| decode_page_font_string_as(&doc.0, "F1", doc.1, doc.2, true, bytes);
+    assert_eq!(text(&[1, 0, 1]), "\u{628}\u{628}");
+    assert_eq!(text(&[0, 1, 1, 0, 0, 1]), "\u{628}\u{628}");
+}
+
+#[test]
+fn a_code_a_direct_entry_overrides_is_not_counted_with_its_range() {
+    // A range of eight Arabic letters whose members are each read as Latin
+    // by an entry of its own: no Arabic letter is read.
+    let overridden: String = (1..=8)
+        .map(|code| format!("<{code:04X}> <0061>\n"))
+        .collect();
+    let cmap = format!(
+        "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+8 beginbfchar\n{overridden}endbfchar\n\
+1 beginbfrange\n<0001><0008><0627>\nendbfrange"
+    );
+    let cmap = ToUnicodeCMap::parse(cmap.as_bytes()).unwrap();
+    assert_eq!(cmap.lookup(1).as_deref(), Some("a"));
+    assert!(!cmap.reads_arabic_letters());
+    // Two members left to the range, and six letters of an entry each.
+    let some = "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+8 beginbfchar\n<0001> <0061>\n<0002> <0062>\n<0021> <0627>\n<0022> <0628>\n<0023> <062A>\n<0024> <062B>\n<0025> <062C>\n<0026> <062D>\nendbfchar\n\
+1 beginbfrange\n<0001><0004><0627>\nendbfrange";
+    let some = ToUnicodeCMap::parse(some.as_bytes()).unwrap();
+    assert!(some.reads_arabic_letters());
 }
