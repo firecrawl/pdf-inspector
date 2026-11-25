@@ -8,6 +8,7 @@
 //! single item flagged with [`TextItem::baseline_shift`]. Line grouping and
 //! rendering (`TextItem::line_y`, `TextLine::text`) consume those results.
 
+use crate::text_utils::is_rtl_char;
 use crate::types::{ItemType, TextItem};
 use std::collections::HashMap;
 
@@ -407,6 +408,10 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             .glyphs
             .iter()
             .all(|&g| items[g].text.chars().all(|c| c.is_ascii_digit()));
+        let numeric_only = run
+            .glyphs
+            .iter()
+            .all(|&g| items[g].text.chars().all(char::is_numeric));
         // Strikeout boundaries block fusion (a struck word must not extend
         // its strike over a live footnote digit, and a struck digit must not
         // lose its own mark). An underlined anchor with an unmarked digit
@@ -421,6 +426,20 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
         });
         let fuse = digit_only
             && digits <= SCRIPT_MAX_FUSED_DIGITS
+            && marks_ok
+            && fusable_anchor_edge(anchor, run.anchor_on_left)
+            && !run_of_glyph.contains_key(&run.anchor);
+
+        // Arabic/Hebrew word fragments (the definite article "al", prefixes)
+        // rendered slightly raised beside a word belong to that word: fuse them
+        // into the anchor instead of emitting a stray <sup>/<sub>, so "المادة"
+        // stays one searchable word rather than "ال" + "مادة".
+        let rtl_letters = run
+            .glyphs
+            .iter()
+            .any(|&g| items[g].text.chars().any(is_rtl_char));
+        let fuse_rtl = !numeric_only
+            && rtl_letters
             && marks_ok
             && fusable_anchor_edge(anchor, run.anchor_on_left)
             && !run_of_glyph.contains_key(&run.anchor);
@@ -443,6 +462,28 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             anchor.legacy_symbol_rewrite |= legacy_symbol_rewrite;
             // The fused item spans the union of word and marker: a kerned
             // marker may end inside the word's advance or start before it.
+            let anchor_right = item_right(anchor);
+            if run.anchor_on_left {
+                anchor.text.push_str(&mapped);
+                anchor.width = anchor_right.max(run_right) - anchor.x;
+            } else {
+                anchor.text = mapped + &anchor.text;
+                let left = anchor.x.min(run_left);
+                anchor.width = anchor_right.max(run_right) - left;
+                anchor.x = left;
+            }
+            for &g in &run.glyphs {
+                remove[g] = true;
+            }
+        } else if fuse_rtl {
+            // Arabic/Hebrew word fragment fused into its anchor word: no
+            // <sup>/<sub>, just concatenation in reading order so "ال" + "مادة"
+            // becomes the single searchable word "المادة".
+            let mapped: String = run.glyphs.iter().map(|&g| items[g].text.as_str()).collect();
+            let run_left = items[run.glyphs[0]].x;
+            let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
+            let anchor = &mut items[run.anchor];
+            anchor.legacy_symbol_rewrite |= legacy_symbol_rewrite;
             let anchor_right = item_right(anchor);
             if run.anchor_on_left {
                 anchor.text.push_str(&mapped);
@@ -926,6 +967,28 @@ mod tests {
         assert_eq!(texts(&merged), vec!["¹Hong Kong"]);
         assert!((merged[0].x - 75.9).abs() < 1e-3);
         assert!((merged[0].width - 50.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rtl_fragment_on_left_is_prepended_in_reading_order() {
+        let items = vec![
+            make_item_fs("ال", 88.0, 504.0, 12.0, 7.0),
+            make_item_fs("مادة", 100.0, 500.0, 40.0, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["المادة"]);
+    }
+
+    #[test]
+    fn arabic_indic_digit_run_stays_a_script() {
+        let items = vec![
+            make_item_fs("مادة", 100.0, 500.0, 40.0, 14.0),
+            make_item_fs("١٢", 140.0, 504.0, 12.0, 7.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["مادة", "١٢"]);
+        assert!(merged[1].is_script());
+        assert!(merged[1].baseline_shift > 0.0);
     }
 
     #[test]
