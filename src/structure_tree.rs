@@ -1183,18 +1183,15 @@ pub fn fix_bare_struct_names(buf: &[u8]) -> Cow<'_, [u8]> {
                 // Must be followed by a delimiter (whitespace, newline, /, >)
                 && (end >= buf.len() || matches!(buf[end], b'\n' | b'\r' | b' ' | b'/' | b'>'))
             {
-                // Found a bare name — lazily allocate output buffer
-                let out = result.get_or_insert_with(|| buf[..after].to_vec());
-                // Append everything from last position up to the bare name
-                if out.len() < after {
-                    out.extend_from_slice(&buf[out.len()..after]);
-                }
-                out.push(b'/');
-                out.extend_from_slice(name);
+                // Found a bare name — lazily allocate output buffer.
+                // Replace the space between /S and the bare name with `/`
+                // in place so byte offsets stay stable (no dropped bytes).
+                let out = result.get_or_insert_with(|| buf.to_vec());
+                out[after - 1] = b'/';
                 pos = end;
                 matched = true;
                 debug!(
-                    "fix_bare_struct_names: patched /S {} → /S /{}",
+                    "fix_bare_struct_names: patched /S {} → /S/{}",
                     String::from_utf8_lossy(name),
                     String::from_utf8_lossy(name)
                 );
@@ -1537,7 +1534,7 @@ mod tests {
         let input = b"/StructTreeRoot /S Code\n/Type /StructElem";
         let fixed = fix_bare_struct_names(input);
         assert!(
-            fixed.windows(b"/S /Code".len()).any(|w| w == b"/S /Code"),
+            fixed.windows(b"/S/Code".len()).any(|w| w == b"/S/Code"),
             "Should fix bare Code: {:?}",
             String::from_utf8_lossy(&fixed)
         );
@@ -1551,8 +1548,23 @@ mod tests {
         let input = b"/StructTreeRoot /S H1\n/foo\n/S P\n/bar";
         let fixed = fix_bare_struct_names(input);
         let s = String::from_utf8_lossy(&fixed);
-        assert!(s.contains("/S /H1"), "Should fix H1: {s}");
-        assert!(s.contains("/S /P"), "Should fix P: {s}");
+        assert!(s.contains("/S/H1"), "Should fix H1: {s}");
+        assert!(s.contains("/S/P"), "Should fix P: {s}");
+
+        // Bare name immediately followed by another /S — old code dropped
+        // the delimiter byte between them (/S P/StructTreeRoot → /S /PStructTreeRoot).
+        let input = b"/StructTreeRoot /S P/StructTreeRoot";
+        let fixed = fix_bare_struct_names(input);
+        let s = String::from_utf8_lossy(&fixed);
+        assert!(
+            s.contains("/S/P/StructTreeRoot"),
+            "Should preserve delimiter byte: {s}"
+        );
+        assert_eq!(
+            fixed.len(),
+            input.len(),
+            "Output must stay same length (in-place replacement): {s}"
+        );
 
         // Unknown name should not be touched
         let input = b"/StructTreeRoot /S FooBar\n";
