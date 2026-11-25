@@ -2039,20 +2039,14 @@ fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
     }
 }
 
-/// A run set below this fraction of the line's largest font size is a
-/// raised or reduced marker (a footnote number such as `(1)` in a heading).
-/// Its brackets are drawn as they look, not typed, so they do not vote. In
-/// the Saudi PDPL PDF the markers are 6.996 pt in 14 pt headings (ratio 0.5)
-/// while every other run of a line is at the line's size.
-const MARKER_SIZE_RATIO: f32 = 0.75;
-
 /// On a visual-order page, whether its brackets are stored under the
 /// character they were typed as (see `bidi::brackets_stored_by_role`),
 /// judged from the glyphs of the page's right-to-left lines. A line that
 /// reads left to right, as the correction itself decides, and a run of
 /// ActualText replacement (`replaced_text`, parallel to `items`) show no
-/// glyphs of the page, so they do not vote; nor do marker-sized runs (see
-/// `MARKER_SIZE_RATIO`).
+/// glyphs of the page, so they do not vote; nor do raised footnote markers such
+/// as a `(1)` set small above a heading's baseline (`scripts::raised_marker_glyphs`).
+/// A small or large run of letters keeps its vote.
 fn pages_storing_brackets_by_role(
     line_groups: &[(u32, f32, Vec<&TextItem>)],
     page_rtl: &HashMap<u32, bool>,
@@ -2069,8 +2063,9 @@ fn pages_storing_brackets_by_role(
             .copied()
             .filter(|item| !replaced.contains(&(*item as *const TextItem)))
             .collect();
-        let largest = screen.iter().map(|i| i.font_size).fold(0.0f32, f32::max);
-        screen.retain(|item| item.font_size >= largest * MARKER_SIZE_RATIO);
+        let marker = scripts::raised_marker_glyphs(&screen);
+        let mut kept = marker.iter().map(|m| !m);
+        screen.retain(|_| kept.next().unwrap_or(true));
         screen.sort_by(|a, b| a.x.total_cmp(&b.x));
         lines_by_page
             .entry(*page)
@@ -5886,12 +5881,18 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
     /// A page with a 14 pt Arabic heading ending in a 7 pt `(1)` marker and
     /// a 12 pt footnote whose pair is stored by role (`)m(`).
     fn marker_and_footnote_page(marker_size: f32) -> Vec<TextItem> {
+        marker_run_and_footnote_page("(1)", marker_size)
+    }
+
+    /// The same page with `small_run` set at `size` and raised 2 pt against
+    /// the heading's left edge, where a footnote marker stands.
+    fn marker_run_and_footnote_page(small_run: &str, size: f32) -> Vec<TextItem> {
         let mut heading = make_merge_item("\u{0645}\u{0627}\u{062F}\u{0629}", 300.0, 40.0);
         heading.y = 700.0;
         heading.font_size = 14.0;
-        let mut marker = make_merge_item("(1)", 260.0, 10.0);
-        marker.y = 701.0;
-        marker.font_size = marker_size;
+        let mut marker = make_merge_item(small_run, 290.0, 10.0);
+        marker.y = 702.0;
+        marker.font_size = size;
         let mut note = make_merge_item(
             "\u{0639}\u{062F}\u{0644}\u{062A} \u{0631}\u{0642}\u{0645}",
             300.0,
@@ -5909,6 +5910,15 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         // the footnote's `)m(`; a tie reads as mirrored.
         let text = visual_line_all_text(marker_and_footnote_page(7.0), 500.0);
         assert!(text.contains("(148/\u{0645})"), "{text:?}");
+    }
+
+    #[test]
+    fn a_small_run_of_letters_keeps_its_vote_beside_a_larger_line() {
+        // A small phrase in brackets, raised like a marker but holding
+        // letters, is a genuine drawn pair and ties the footnote's `)m(`.
+        let page = marker_run_and_footnote_page("(\u{0645}\u{0627})", 7.0);
+        let text = visual_line_all_text(page, 500.0);
+        assert!(text.contains(")148/\u{0645}("), "{text:?}");
     }
 
     #[test]

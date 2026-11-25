@@ -223,6 +223,39 @@ fn script_anchor_gap(
     }
 }
 
+/// Longest marker, in characters, that `raised_marker_glyphs` takes for a
+/// footnote reference: `(12)`, `[3]`, `*`.
+const MARKER_MAX_CHARS: usize = 4;
+
+/// Which items of one text `line` are glyphs of a raised footnote marker: a
+/// run `detect_script_runs` finds small, raised and attached to a larger run
+/// of the line, made of brackets, digits and marker symbols and no letters,
+/// and at most `MARKER_MAX_CHARS` characters long. The glyphs of `(1)` may be
+/// separate runs. The vote on how a page stores its brackets asks this ahead
+/// of `merge_subscript_items`, so a small or large run of letters is not
+/// taken for a marker whatever its size.
+pub(crate) fn raised_marker_glyphs(line: &[&TextItem]) -> Vec<bool> {
+    // A line's padding spaces ("  :نورشعلا ") are not a word boundary
+    // between the marker and its anchor.
+    let items: Vec<TextItem> = line
+        .iter()
+        .map(|item| TextItem {
+            text: item.text.trim().to_string(),
+            ..(*item).clone()
+        })
+        .collect();
+    let mut marker = vec![false; items.len()];
+    for run in detect_script_runs(&items) {
+        let text: String = run.glyphs.iter().map(|&g| items[g].text.trim()).collect();
+        if text.chars().count() <= MARKER_MAX_CHARS && !text.chars().any(char::is_alphabetic) {
+            for &g in &run.glyphs {
+                marker[g] = true;
+            }
+        }
+    }
+    marker
+}
+
 /// Find every super/subscript glyph run and its anchor.
 fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
     // Per page: every participant sorted by y (anchor lookup window) and the
