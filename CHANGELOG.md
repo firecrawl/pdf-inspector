@@ -25,8 +25,7 @@ version and date. Earlier releases are described in their
   measured, once each, in a program within the usual decompression bound.
   Known limitations: only the primary ToUnicode map is read, not its
   renumbered subset remap, and a ToUnicode stream written inline in the font
-  dictionary is not; a bare CFF program is not measured; a simple font whose
-  kashida glyph is named by a `/Differences` entry is not covered; the fast
+  dictionary is not; a bare CFF program is not measured; the fast
   page-detection mode does not apply it.
 - Arabic text set in a simple (non-Type0) font whose ToUnicode map reads a
   code as U+FFFD, as InDesign writes the dotted first piece of a letter it
@@ -39,7 +38,8 @@ version and date. Earlier releases are described in their
   (counted as the decoder reads them, a direct entry over a range) and the
   entry is U+FFFD alone; fonts without Arabic letters and every other entry
   read as before. A code the font gives as a space (`/space` in its
-  `/Differences`, or a glyph with no outline and an advance) keeps its space.
+  `/Differences`, a glyph with no outline and an advance, or the standard
+  space code 0x20 where neither says otherwise) keeps its space.
   A run holding such a code is decided: the original bytes are not read
   again by the encoding, and a run of nothing but such codes adds neither an
   item nor a word space. The Arabic verdict is found once for each ToUnicode

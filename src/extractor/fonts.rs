@@ -252,17 +252,26 @@ pub(crate) fn add_kashida_codes(
     }
 }
 
-/// Whether `encoding` gives the one-byte code `code` as a space: the name
-/// `/space` (or another blank character) in its Differences, or a glyph with
-/// no outline and an advance.
+/// Whether the font gives the one-byte code `code` as a space: the name
+/// `/space` (or another blank character) in its Differences, a glyph with no
+/// outline and an advance, or, where the Differences say nothing of the code,
+/// a space in its base encoding (the standard space code 0x20 when it
+/// declares none).
 fn shows_space(encoding: Option<&FontEncoding>, code: u8) -> bool {
-    encoding.is_some_and(|map| {
-        map.blank_codes.contains(&code)
-            || matches!(
-                differences_reading(map, code),
-                Some(NamedReading::Text(text)) if text.chars().all(char::is_whitespace)
-            )
-    })
+    let Some(map) = encoding else {
+        return code == b' ';
+    };
+    if map.blank_codes.contains(&code) {
+        return true;
+    }
+    match differences_reading(map, code) {
+        Some(NamedReading::Text(text)) => text.chars().all(char::is_whitespace),
+        Some(NamedReading::Unread) => false,
+        None => map
+            .base
+            .and_then(|base| base.char_for(code))
+            .map_or(code == b' ', char::is_whitespace),
+    }
 }
 
 /// `bytes`, a string of two-byte codes, without the codes in `kashidas`
@@ -5596,10 +5605,11 @@ mod tests {
     ) -> (Document, u32, lopdf::ObjectId) {
         use lopdf::Stream;
         let mut doc = Document::with_version("1.4");
+        let count = bfchar.lines().filter(|line| line.starts_with('<')).count();
         let cmap = format!(
             "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
              1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
-             12 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+             {count} beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
              CMapName currentdict /CMap defineresource pop\nend\nend"
         );
         let tounicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));

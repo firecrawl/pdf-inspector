@@ -103,11 +103,24 @@ fn a_range_every_code_of_which_a_latin_entry_overrides_is_no_arabic_font() {
 fn the_arabic_reading_of_a_cmap_is_measured_once_for_all_the_strings_of_a_font() {
     // 60,000 entries over a two-byte codespace of a simple font, and 5,000
     // strings each showing the replacement code.
-    let mut bfchar = bfchar(ARABIC);
+    let (mut doc, tounicode, page) =
+        simple_font_doc(&bfchar(ARABIC), None, None, encoding(), false);
+    let mut entries: String = bfchar(ARABIC)
+        .lines()
+        .map(|line| format!("<00{}\n", &line[1..]))
+        .collect();
     for code in 0x100..0xEA60u32 {
-        bfchar.push_str(&format!("<{code:04X}> <0041>\n"));
+        entries.push_str(&format!("<{code:04X}> <0041>\n"));
     }
-    let (mut doc, _, page) = simple_font_doc(&bfchar, None, None, encoding(), false);
+    let cmap = format!(
+        "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+{} beginbfchar\n{entries}endbfchar",
+        entries.lines().count()
+    );
+    doc.objects.insert(
+        (tounicode, 0),
+        Stream::new(dictionary! {}, cmap.into_bytes()).into(),
+    );
     let mut content = b"BT /F1 12 Tf 100 700 Td ".to_vec();
     for _ in 0..5000 {
         content.extend_from_slice(b"<29> Tj ");
@@ -117,6 +130,14 @@ fn the_arabic_reading_of_a_cmap_is_measured_once_for_all_the_strings_of_a_font()
     let page_dict = doc.get_object_mut(page).unwrap().as_dict_mut().unwrap();
     page_dict.set("Contents", contents);
     let cmaps = FontCMaps::from_doc(&doc);
+    assert_eq!(
+        cmaps
+            .get_by_obj(tounicode)
+            .unwrap()
+            .primary
+            .code_byte_length,
+        2
+    );
     ARABIC_BYTE_SCANS.with(|scans| scans.set(0));
     let ((items, _, _), _, _, _) = extract_page_text_items(
         &doc,
@@ -192,4 +213,29 @@ fn a_run_of_nothing_but_dropped_codes_is_no_item_and_no_space() {
     .unwrap();
     let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
     assert_eq!(texts, ["A", "A"], "{items:?}");
+    // The two dropped codes still advance the position: the second `A`
+    // starts two glyphs (0.6 em of 12 points each) after the first ends.
+    let gap = items[1].x - (items[0].x + items[0].width);
+    assert!((gap - 2.0 * 0.6 * 12.0).abs() < 0.1, "{items:?}");
+}
+
+#[test]
+fn a_u_fffd_code_at_the_standard_space_code_keeps_its_space() {
+    // U+FFFD on 0x20, which the byte guess and the base encoding read as a
+    // space: with no encoding declared, with WinAnsi, and with a Differences
+    // name that is not a letter's. A letter's name drops the code, as for any
+    // other code.
+    let cmap = format!("{}<20> <FFFD>\n", bfchar(ARABIC));
+    let with = |encoding| decode_simple_font_string(&cmap, None, encoding, &[0x21, 0x20, 0x22]);
+    assert_eq!(with(None), "ا ل");
+    assert_eq!(with(Some("WinAnsiEncoding".into())), "ا ل");
+    let named = |name: &[u8]| {
+        Some(Object::Dictionary(dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => "WinAnsiEncoding",
+            "Differences" => vec![0x20.into(), Object::Name(name.to_vec())],
+        }))
+    };
+    assert_eq!(with(named(b"space")), "ا ل");
+    assert_eq!(with(named(b"ucircumflex")), "ال");
 }
