@@ -3248,6 +3248,34 @@ mod tests {
         items
     }
 
+    /// Justified lines drawn with a stretched `Tm` (`[14.98 0 0 14 ...]`) are
+    /// 14 pt text. They must not read as a rare larger size and turn runs of
+    /// short body lines into `##` headings, while a real 20 pt heading stays.
+    #[test]
+    fn horizontally_stretched_body_lines_are_not_headings() {
+        let mut content = String::from("BT /F1 1 Tf 14.5 0 0 20 72 760 Tm (Real Heading) Tj ET\n");
+        let stretches = [14.0, 14.0, 14.98, 14.56, 14.0, 14.42, 12.88, 14.0];
+        for i in 0..40 {
+            let y = 720 - i * 16;
+            let sx = stretches[i as usize % stretches.len()];
+            content.push_str(&format!(
+                "BT /F1 1 Tf {sx} 0 0 14 72 {y} Tm (Short body line number {i}) Tj ET\n"
+            ));
+        }
+        let items = extract_simple_items(content.as_bytes());
+        let body: Vec<_> = items
+            .iter()
+            .filter(|i| i.text.starts_with("Short"))
+            .collect();
+        assert_eq!(body.len(), 40);
+        assert!(body.iter().all(|i| (i.font_size - 14.0).abs() < 1e-3));
+
+        let md = crate::markdown::to_markdown_from_items(items, Default::default());
+        let headings: Vec<_> = md.lines().filter(|l| l.starts_with('#')).collect();
+        assert_eq!(headings.len(), 1, "{md}");
+        assert!(headings[0].contains("Real Heading"), "{md}");
+    }
+
     #[test]
     fn painted_bold_survives_text_objects_and_graphics_state() {
         let items = extract_simple_items(
