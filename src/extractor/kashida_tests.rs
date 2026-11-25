@@ -291,3 +291,88 @@ fn a_code_another_range_maps_to_text_is_not_a_kashida() {
     let text = decode(&doc, "F1", &[0x10, 2, 0x11]);
     assert_eq!(text, "\u{627}\u{640}\u{628}");
 }
+
+#[test]
+fn a_run_of_nothing_but_a_kashida_is_no_space_between_letters() {
+    use super::super::content_stream::extract_page_text_items;
+    use super::super::FormWalkBudget;
+    // Latin letters on either side of the kashida: only a run after a
+    // letter that can end a word is noted as a possible word space.
+    let cmap = format!("<0001> <0041>\n<0002> <FFFD>\n{ARABIC}");
+    let (mut doc, _, page) = document(&cmap, program(&GLYPHS), None);
+    // Narrow glyphs: the kashida's run is a squeezed gap, as a space is.
+    let font = page_fonts_mut(&mut doc, page)
+        .get(b"F1")
+        .unwrap()
+        .as_reference();
+    let font = doc.get_dictionary(font.unwrap()).unwrap();
+    let cid = font.get(b"DescendantFonts").unwrap().as_array().unwrap()[0].as_reference();
+    doc.get_object_mut(cid.unwrap())
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("DW", 20);
+    let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj <0002> Tj <0001> Tj ET".to_vec();
+    let contents = doc.add_object(Stream::new(dictionary! {}, content));
+    let page_dict = doc.get_object_mut(page).unwrap().as_dict_mut().unwrap();
+    page_dict.set("Contents", contents);
+    let cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _, _), _, _, _) = extract_page_text_items(
+        &doc,
+        page,
+        1,
+        &cmaps,
+        false,
+        &mut FontStyleCache::new(),
+        &mut FormWalkBudget::new(),
+    )
+    .unwrap();
+
+    let text: String = items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(text, "AA", "{items:?}");
+}
+
+/// A CMap reading each of `chars` from its own code.
+fn cmap_of(chars: &[u32]) -> ToUnicodeCMap {
+    let entries: String = chars
+        .iter()
+        .enumerate()
+        .map(|(code, &ch)| {
+            let mut units = [0u16; 2];
+            let units = char::from_u32(ch).unwrap().encode_utf16(&mut units);
+            let hex: String = units.iter().map(|unit| format!("{unit:04X}")).collect();
+            format!("<{:04X}> <{hex}>\n", code + 1)
+        })
+        .collect();
+    let cmap = format!(
+        "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+{} beginbfchar\n{entries}endbfchar",
+        chars.len()
+    );
+    ToUnicodeCMap::parse(cmap.as_bytes()).unwrap()
+}
+
+#[test]
+fn arabic_indic_digits_and_punctuation_are_not_arabic_letters() {
+    // Ten digits and the Arabic comma, semicolon, question mark and percent.
+    let symbols: Vec<u32> = (0x660..=0x669)
+        .chain([0x60C, 0x61B, 0x61F, 0x66A])
+        .collect();
+    assert!(!cmap_of(&symbols).reads_arabic_letters());
+    assert!(cmap_of(&(0x627..=0x62E).collect::<Vec<u32>>()).reads_arabic_letters());
+}
+
+#[test]
+fn letters_of_the_other_arabic_blocks_make_an_arabic_cmap() {
+    // Presentation Forms-B, Presentation Forms-A, Extended-A and Extended-B:
+    // eight letters each.
+    for first in [0xFE8F, 0xFB56, 0x8A0, 0x870] {
+        let letters: Vec<u32> = (first..first + 8).collect();
+        assert!(cmap_of(&letters).reads_arabic_letters(), "{first:X}");
+    }
+    // Mathematical Alphabetic Symbols, skipping the unassigned U+1EE04.
+    let math = [
+        0x1EE00, 0x1EE01, 0x1EE02, 0x1EE03, 0x1EE05, 0x1EE06, 0x1EE07, 0x1EE08,
+    ];
+    assert!(cmap_of(&math).reads_arabic_letters());
+}

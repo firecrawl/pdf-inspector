@@ -381,21 +381,28 @@ fn blank_cid_glyph_spaces(
     blanks
 }
 
-/// Whether `ch` is a letter of the Arabic script.
+/// Whether `ch` is a letter of the Arabic script: alphabetic, so not a digit
+/// or a punctuation mark of one of its blocks.
 fn is_arabic_char(ch: char) -> bool {
-    ARABIC_BLOCKS
-        .iter()
-        .any(|block| block.contains(&u32::from(ch)))
+    ch.is_alphabetic()
+        && ARABIC_BLOCKS
+            .iter()
+            .any(|block| block.contains(&u32::from(ch)))
 }
 
 /// The fewest Arabic letters a CMap reads for it to be an Arabic font's.
 const ARABIC_CMAP_MIN_ENTRIES: usize = 8;
-/// The Unicode blocks of the Arabic script.
-const ARABIC_BLOCKS: [std::ops::RangeInclusive<u32>; 4] = [
+/// The Unicode blocks of the Arabic script: Arabic, Supplement, Extended-B
+/// and -A, Presentation Forms-A and -B, Extended-C and the Mathematical
+/// Alphabetic Symbols.
+const ARABIC_BLOCKS: [std::ops::RangeInclusive<u32>; 7] = [
     0x0600..=0x06FF,
     0x0750..=0x077F,
+    0x0870..=0x08FF,
     0xFB50..=0xFDFF,
     0xFE70..=0xFEFF,
+    0x10EC0..=0x10EFF,
+    0x1EE00..=0x1EEFF,
 ];
 /// How far below the baseline a kashida glyph may reach, in percent of an em.
 const KASHIDA_MAX_BELOW_BASELINE_PERCENT: i32 = 3;

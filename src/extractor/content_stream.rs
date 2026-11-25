@@ -1061,12 +1061,16 @@ pub(crate) fn extract_page_text_items_with_options(
                         // works, and a space run hands its word space to the
                         // item it follows.
                         if text.trim().is_empty() {
-                            pending_space = PendingSpace::note(
-                                pending_space.take(),
-                                &items,
-                                &geometry,
-                                page_num,
-                            );
+                            // A run of nothing but kashidas shows no text:
+                            // it is no space either.
+                            if !text.is_empty() {
+                                pending_space = PendingSpace::note(
+                                    pending_space.take(),
+                                    &items,
+                                    &geometry,
+                                    page_num,
+                                );
+                            }
                         } else {
                             if let Some(pending) = pending_space.take() {
                                 pending.resolve(&mut items, &geometry, &text, rendered_size);
@@ -1884,12 +1888,16 @@ pub(crate) fn extract_page_text_items_with_options(
                             horizontal_scale,
                         );
                         if text.trim().is_empty() {
-                            pending_space = PendingSpace::note(
-                                pending_space.take(),
-                                &items,
-                                &geometry,
-                                page_num,
-                            );
+                            // A run of nothing but kashidas shows no text:
+                            // it is no space either.
+                            if !text.is_empty() {
+                                pending_space = PendingSpace::note(
+                                    pending_space.take(),
+                                    &items,
+                                    &geometry,
+                                    page_num,
+                                );
+                            }
                         } else {
                             if let Some(pending) = pending_space.take() {
                                 pending.resolve(&mut items, &geometry, &text, rendered_size);
