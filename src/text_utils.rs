@@ -890,11 +890,7 @@ pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
 pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
     let scale_x = (text_matrix[0].powi(2) + text_matrix[1].powi(2)).sqrt();
     let scale_y = (text_matrix[2].powi(2) + text_matrix[3].powi(2)).sqrt();
-    let scale = if scale_y > f32::EPSILON {
-        scale_y
-    } else {
-        scale_x
-    };
+    let scale = if scale_y > 0.0 { scale_y } else { scale_x };
     // A negative `Tf` size turns the glyphs around; their size is still
     // their size (the geometry reads the direction from the advance).
     base_size.abs() * scale
@@ -1454,6 +1450,22 @@ mod tests {
         close(
             effective_font_size(2.0, &[7.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             14.0,
+        );
+    }
+
+    #[test]
+    fn effective_font_size_keeps_tiny_nonzero_vertical_scale() {
+        let rel =
+            |got: f32, want: f32| assert!((got - want).abs() <= want * 1e-3, "{got} != {want}");
+        // Compressed matrix with a large Tf size: 1e8 * 1e-8 = 1.
+        rel(
+            effective_font_size(1e8, &[1.0, 0.0, 0.0, 1e-8, 0.0, 0.0]),
+            1.0,
+        );
+        // Tiny matrix, huge Tf size, wide horizontal scale must not win.
+        rel(
+            effective_font_size(1e8, &[1e-6, 0.0, 0.0, 1e-8, 0.0, 0.0]),
+            1.0,
         );
     }
 
