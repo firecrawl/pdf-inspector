@@ -1311,7 +1311,8 @@ impl ToUnicodeCMap {
 
     /// The `max` lowest codes whose effective destination is U+FFFD alone:
     /// a direct entry, or the code a range reaches U+FFFD at (the range's
-    /// base need not be U+FFFD) when no direct entry overrides it. Only the
+    /// base need not be U+FFFD) when no direct entry or other range
+    /// overrides it, as [`Self::destination`] resolves them. Only the
     /// entries are walked, not the code space.
     pub(crate) fn replacement_codes(&self, max: usize) -> Vec<u16> {
         let mut codes: Vec<u16> = self
@@ -1325,12 +1326,19 @@ impl ToUnicodeCMap {
                 .checked_sub(base)
                 .and_then(|offset| u16::try_from(u32::from(start) + offset).ok())
                 .filter(|&code| start <= code && code <= end);
-            codes.extend(reached.filter(|&code| !self.char_map.contains_key(&code)));
+            // A direct entry or another range may read the code otherwise.
+            codes.extend(reached.filter(|&code| self.reads_as_replacement(code)));
         }
         codes.sort_unstable();
         codes.dedup();
         codes.truncate(max);
         codes
+    }
+
+    /// Whether the effective destination of `code`, the one the decoder
+    /// uses ([`Self::destination`]), is U+FFFD alone.
+    fn reads_as_replacement(&self, code: u16) -> bool {
+        self.destination(code).as_deref() == Some("\u{FFFD}")
     }
 
     /// Whether the CMap reads at least [`ARABIC_CMAP_MIN_ENTRIES`] codes as

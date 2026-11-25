@@ -276,3 +276,18 @@ fn replacement_codes_are_found_in_entries_and_ranges_only() {
     .unwrap();
     assert_eq!(spanning.replacement_codes(10), vec![0x1D]);
 }
+
+#[test]
+fn a_code_another_range_maps_to_text_is_not_a_kashida() {
+    // The range <0001>-<0004> reaches U+FFFD at code 2, but <0002> is read
+    // as U+0640 by a range of its own: the character is text, not a gap.
+    let cmap = "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+3 beginbfrange\n<0001><0004><FFFC>\n<0002><0002><0640>\n<0010><0017><0627>\nendbfrange\n";
+    let parsed = ToUnicodeCMap::parse(cmap.as_bytes()).unwrap();
+    assert_eq!(parsed.lookup(2).as_deref(), Some("\u{640}"));
+    assert!(parsed.replacement_codes(10).is_empty());
+    let doc = document(cmap, program(&GLYPHS), None);
+    assert!(font_kashida_codes(&doc).is_empty());
+    let text = decode(&doc, "F1", &[0x10, 2, 0x11]);
+    assert_eq!(text, "\u{627}\u{640}\u{628}");
+}
