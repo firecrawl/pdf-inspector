@@ -150,8 +150,11 @@ struct Fonts<'a> {
     programs: &'a [Vec<u8>],
     /// The ToUnicode CMap all of them share.
     tounicode: &'a str,
-    /// A CIDToGIDMap stream for each of them, else the identity.
-    cid_to_gid: Option<Vec<u8>>,
+    /// The CIDToGIDMap stream of each of them in turn; a font without one
+    /// (the list is shorter, or its entry `None`) has the identity.
+    cid_to_gid: Vec<Option<Vec<u8>>>,
+    /// Whether each font has a page of its own, with the strings it shows.
+    page_per_font: bool,
 }
 
 /// A one-page document of Identity-H CIDFontType2 fonts, each on its boxed
@@ -164,16 +167,18 @@ fn type0_document_of(fonts: &Fonts, shows: &[(usize, &str)]) -> Vec<u8> {
         dictionary! {},
         fonts.tounicode.as_bytes().to_vec(),
     ));
-    let map = fonts
-        .cid_to_gid
-        .clone()
-        .map_or(Object::Name(b"Identity".to_vec()), |bytes| {
-            Object::Reference(doc.add_object(Stream::new(dictionary! {}, bytes)))
-        });
-    let mut resources = dictionary! {};
+    let mut resources = Vec::new();
     // Equal programs are the one stream, as fonts that share a program have it.
     let mut files = std::collections::HashMap::new();
     for (i, program) in fonts.programs.iter().enumerate() {
+        let map = fonts
+            .cid_to_gid
+            .get(i)
+            .cloned()
+            .flatten()
+            .map_or(Object::Name(b"Identity".to_vec()), |bytes| {
+                Object::Reference(doc.add_object(Stream::new(dictionary! {}, bytes)))
+            });
         let font_file = *files
             .entry(program)
             .or_insert_with(|| doc.add_object(Stream::new(dictionary! {}, program.clone())));
@@ -194,29 +199,46 @@ fn type0_document_of(fonts: &Fonts, shows: &[(usize, &str)]) -> Vec<u8> {
             "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid_font)],
             "ToUnicode" => to_unicode,
         });
-        resources.set(format!("F{}", i + 1), font);
+        resources.push((format!("F{}", i + 1), font));
     }
-    let shown: String = shows
-        .iter()
-        .map(|(font, hex)| format!("/F{font} 12 Tf [<{hex}>] TJ T*\n"))
-        .collect();
-    let content = doc.add_object(Stream::new(
-        dictionary! {},
-        format!("BT 14 TL 1 0 0 1 40 700 Tm {shown} ET").into_bytes(),
-    ));
-    let page = doc.add_object(dictionary! {
-        "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
-        "Resources" => dictionary! { "Font" => resources },
-        "Contents" => content,
+    // The fonts and the strings of each page: all on one, or one font each.
+    let groups: Vec<Vec<usize>> = if fonts.page_per_font {
+        (1..=resources.len()).map(|font| vec![font]).collect()
+    } else {
+        vec![(1..=resources.len()).collect()]
+    };
+    let mut kids = Vec::new();
+    for group in &groups {
+        let mut page_fonts = dictionary! {};
+        for &font in group {
+            page_fonts.set(resources[font - 1].0.clone(), resources[font - 1].1);
+        }
+        let shown: String = shows
+            .iter()
+            .filter(|(font, _)| group.contains(font))
+            .map(|(font, hex)| format!("/F{font} 12 Tf [<{hex}>] TJ T*\n"))
+            .collect();
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            format!("BT 14 TL 1 0 0 1 40 700 Tm {shown} ET").into_bytes(),
+        ));
+        kids.push(doc.add_object(dictionary! {
+            "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+            "Resources" => dictionary! { "Font" => page_fonts },
+            "Contents" => content,
+        }));
+    }
+    let pages = doc.add_object(dictionary! {
+        "Type" => "Pages", "Count" => kids.len() as i64,
+        "Kids" => kids.iter().map(|&page| Object::Reference(page)).collect::<Vec<_>>(),
     });
-    let pages = doc.add_object(
-        dictionary! { "Type" => "Pages", "Count" => 1, "Kids" => vec![Object::Reference(page)] },
-    );
-    doc.get_object_mut(page)
-        .unwrap()
-        .as_dict_mut()
-        .unwrap()
-        .set("Parent", pages);
+    for &page in &kids {
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Parent", pages);
+    }
     let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
     doc.trailer.set("Root", catalog);
     let mut bytes = Vec::new();
@@ -231,7 +253,8 @@ fn type0_document(tounicode: &str, shows: &[&str]) -> Vec<u8> {
         &Fonts {
             programs: &[boxed_truetype(GLYPHS)],
             tounicode,
-            cid_to_gid: None,
+            cid_to_gid: Vec::new(),
+            page_per_font: false,
         },
         &shows,
     )
@@ -269,6 +292,16 @@ fn replacement_codes_lists_entries_and_range_starts_that_read_u_fffd() {
     )
     .unwrap();
     assert_eq!(cmap.replacement_codes(), vec![2, 9]);
+}
+
+#[test]
+fn a_range_start_overridden_by_a_direct_entry_is_no_replacement_code() {
+    let cmap = ToUnicodeCMap::parse(
+        b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+1 beginbfchar\n<0002><0640>\nendbfchar\n1 beginbfrange\n<0002><0002><FFFD>\nendbfrange",
+    )
+    .unwrap();
+    assert_eq!(cmap.replacement_codes(), Vec::<u16>::new());
 }
 
 #[test]
@@ -364,7 +397,7 @@ fn letters_given_as_a_range_make_an_arabic_script_cmap() {
 }
 
 #[test]
-fn a_huge_range_of_letters_is_counted_without_being_walked() {
+fn a_range_over_the_whole_code_space_is_judged_by_its_share_of_letters() {
     let cmap = ToUnicodeCMap::parse(
         b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
 1 beginbfrange\n<0000><FFFF><0600>\nendbfrange",
@@ -375,6 +408,37 @@ fn a_huge_range_of_letters_is_counted_without_being_walked() {
     let cmap = ToUnicodeCMap::parse(
         b"1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
 1 beginbfrange\n<0000><00FF><0600>\nendbfrange",
+    )
+    .unwrap();
+    assert!(cmap.is_arabic_script());
+}
+
+#[test]
+fn direct_entries_that_override_a_range_are_what_is_counted() {
+    // Eight Arabic letters by range, every one overridden by a Latin letter.
+    let overridden = ToUnicodeCMap::parse(
+        cmap_text(LATIN_ENTRIES)
+            .replace(
+                "endbfchar",
+                "endbfchar\n1 beginbfrange\n<0010><0017><0627>\nendbfrange",
+            )
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(!overridden.is_arabic_script());
+}
+
+#[test]
+fn a_range_that_spans_u_fffd_does_not_count_it() {
+    // Nine letters, and a range of 19 codes with U+FFFD among them: 27 other
+    // destinations is as many as the letters can be a third of.
+    let cmap = ToUnicodeCMap::parse(
+        cmap_text(ARABIC_ENTRIES)
+            .replace(
+                "endbfchar",
+                "endbfchar\n1 beginbfrange\n<0100><0112><FFF0>\nendbfrange",
+            )
+            .as_bytes(),
     )
     .unwrap();
     assert!(cmap.is_arabic_script());
@@ -397,35 +461,57 @@ fn hyphen_first_glyphs() -> Vec<Glyph> {
 }
 
 #[test]
-fn a_cmap_shared_with_a_font_of_another_program_keeps_its_replacements() {
-    let fonts = Fonts {
-        programs: &[
-            boxed_truetype(GLYPHS),
-            boxed_truetype(&hyphen_first_glyphs()),
-        ],
-        tounicode: &cmap_text(ARABIC_ENTRIES),
-        cid_to_gid: None,
-    };
-    // Font 2 shows its hyphen at code 2, which only font 1 reads as a kashida.
-    let text = text_of(&type0_document_of(
-        &fonts,
-        &[(2, "000100020001"), (1, "000100020001")],
-    ));
-    assert_eq!(count(&text, FFFD), 2, "{text:?}");
-}
-
-#[test]
 fn a_cmap_shared_with_a_font_of_the_same_program_is_still_repaired() {
     let fonts = Fonts {
         programs: &[boxed_truetype(GLYPHS), boxed_truetype(GLYPHS)],
         tounicode: &cmap_text(ARABIC_ENTRIES),
-        cid_to_gid: None,
+        cid_to_gid: Vec::new(),
+        page_per_font: false,
     };
     let text = text_of(&type0_document_of(
         &fonts,
         &[(2, "000100020001"), (1, "000100020001")],
     ));
     assert_eq!(count(&text, FFFD), 0, "{text:?}");
+}
+
+#[test]
+fn a_cmap_shared_by_fonts_on_different_pages_is_repaired_for_each_font_alone() {
+    let fonts = Fonts {
+        programs: &[
+            boxed_truetype(GLYPHS),
+            boxed_truetype(&hyphen_first_glyphs()),
+        ],
+        tounicode: &cmap_text(ARABIC_ENTRIES),
+        cid_to_gid: Vec::new(),
+        page_per_font: true,
+    };
+    // Page 1's kashida goes; page 2's hyphen at the same code stays.
+    let text = text_of(&type0_document_of(
+        &fonts,
+        &[(1, "000100020001"), (2, "000100020001")],
+    ));
+    assert_eq!(count(&text, FFFD), 1, "{text:?}");
+}
+
+#[test]
+fn a_cmap_shared_by_fonts_with_different_cid_to_gid_maps_is_repaired_for_each_alone() {
+    // Both fonts have the same program. The second sends CID 2 to glyph 3
+    // (the hyphen) where the first reads the kashida, glyph 2.
+    let map: Vec<u8> = (0..=u16::MAX)
+        .flat_map(|cid| [0, if cid == 2 { 3 } else { cid as u8 }])
+        .collect();
+    let fonts = Fonts {
+        programs: &[boxed_truetype(GLYPHS), boxed_truetype(GLYPHS)],
+        tounicode: &cmap_text(ARABIC_ENTRIES),
+        cid_to_gid: vec![None, Some(map)],
+        page_per_font: false,
+    };
+    let text = text_of(&type0_document_of(
+        &fonts,
+        &[(2, "000100020001"), (1, "000100020001")],
+    ));
+    assert_eq!(count(&text, FFFD), 1, "{text:?}");
 }
 
 #[test]
@@ -461,7 +547,8 @@ fn many_codes_sent_to_one_large_glyph_measure_it_once() {
     let fonts = Fonts {
         programs: &[boxed_truetype_of(GLYPHS, 20_000)],
         tounicode: &tounicode,
-        cid_to_gid: Some(map),
+        cid_to_gid: vec![Some(map)],
+        page_per_font: false,
     };
     let bytes = type0_document_of(&fonts, &[(1, "0010010001000100")]);
     let started = std::time::Instant::now();

@@ -250,7 +250,7 @@ fn repair_control_destinations<'p>(
 }
 
 /// The fewest Arabic letters a CMap reads for it to be an Arabic font's.
-const ARABIC_CMAP_MIN_ENTRIES: usize = 8;
+const ARABIC_CMAP_MIN_ENTRIES: u32 = 8;
 /// The Unicode blocks of the Arabic script.
 const ARABIC_BLOCKS: [std::ops::RangeInclusive<u32>; 4] = [
     0x0600..=0x06FF,
@@ -259,21 +259,13 @@ const ARABIC_BLOCKS: [std::ops::RangeInclusive<u32>; 4] = [
     0xFE70..=0xFEFF,
 ];
 
-/// How many of the `len` code points from `first` on lie in an Arabic block.
-fn arabic_letters_in_span(first: u32, len: u32) -> usize {
-    let last = first.saturating_add(len - 1);
+/// Whether `ch` is a letter of the Arabic script.
+fn is_arabic_char(ch: char) -> bool {
     ARABIC_BLOCKS
         .iter()
-        .map(|block| {
-            let (lo, hi) = (first.max(*block.start()), last.min(*block.end()));
-            if lo <= hi {
-                (hi - lo + 1) as usize
-            } else {
-                0
-            }
-        })
-        .sum()
+        .any(|block| block.contains(&u32::from(ch)))
 }
+
 /// How far below the baseline a kashida glyph may reach, in em.
 const KASHIDA_MAX_BELOW_BASELINE: f32 = 0.03;
 /// How high a kashida glyph may rise above the baseline, in em.
@@ -281,79 +273,64 @@ const KASHIDA_MAX_HEIGHT: f32 = 0.2;
 /// The least width of a kashida glyph, in em.
 const KASHIDA_MIN_WIDTH: f32 = 0.1;
 
-/// Drop the U+FFFD entries of `target` that read a kashida.
+/// The codes of `cmap` that a font reads as kashidas.
 ///
 /// A justified Arabic line is stretched with kashida (tatweel) glyphs, and
 /// some producers (InDesign) give that glyph the destination U+FFFD, so
 /// every stretch shows up as a replacement character in the middle of a
-/// word. A kashida is no part of the text, so such an entry is emptied: the
-/// code reads as nothing. An entry is emptied only when the CMap is that of
-/// an Arabic-script font ([`ToUnicodeCMap::is_arabic_script`]) and the
-/// glyph itself, in `program`, is a kashida ([`ProgramGlyphs::is_kashida`]);
-/// any other U+FFFD entry keeps reading as a decode failure.
-fn repair_kashida_destinations<'p>(
-    target: &mut ToUnicodeCMap,
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-    program: impl FnOnce() -> Option<&'p [u8]>,
-) {
-    let codes = target.replacement_codes();
-    if codes.is_empty() || !target.is_arabic_script() {
-        return;
+/// word. A kashida is no part of the text, so such a code should read as
+/// nothing. A code is one when `cmap` is that of an Arabic-script font
+/// ([`ToUnicodeCMap::is_arabic_script`]), reads it as U+FFFD, and the glyph
+/// the code selects in `font_dict`'s own program, through its own
+/// CIDToGIDMap, is a kashida ([`ProgramGlyphs::is_kashida`]). `cmap` is not
+/// changed: it may be the one cached for every font that shares its stream,
+/// whose glyphs for a code can differ.
+fn kashida_codes(cmap: &ToUnicodeCMap, font_dict: &lopdf::Dictionary, doc: &Document) -> Vec<u16> {
+    let codes = cmap.replacement_codes();
+    if codes.is_empty() || !cmap.is_arabic_script() {
+        return Vec::new();
     }
     let Some(cid_font_dict) = get_descendant_cid_font(font_dict, doc) else {
-        return;
+        return Vec::new();
     };
-    let Some(program) = program() else {
-        return;
+    let Some(program) = embedded_font_program(font_dict, doc) else {
+        return Vec::new();
     };
-    let Some(glyphs) = ProgramGlyphs::parse(program) else {
-        return;
+    let Some(glyphs) = ProgramGlyphs::parse(&program) else {
+        return Vec::new();
     };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
-    let mut changed = false;
     // Measuring a glyph reads its whole outline, and a CIDToGIDMap can send
     // every code to one glyph: each glyph is measured once.
     let mut verdicts: HashMap<u16, bool> = HashMap::new();
-    for code in codes {
-        let Some(gid) = glyphs.glyph_of(cid_to_gid.as_deref(), code) else {
-            continue;
-        };
-        if *verdicts
-            .entry(gid)
-            .or_insert_with(|| glyphs.is_kashida(gid))
-        {
-            target.char_map.insert(code, String::new());
-            changed = true;
-        }
-    }
-    if changed {
-        target.refresh_gap_fills();
-    }
+    codes
+        .into_iter()
+        .filter(|&code| {
+            glyphs
+                .glyph_of(cid_to_gid.as_deref(), code)
+                .is_some_and(|gid| {
+                    *verdicts
+                        .entry(gid)
+                        .or_insert_with(|| glyphs.is_kashida(gid))
+                })
+        })
+        .collect()
 }
 
-/// Whether a font of `fonts` other than `font_dict` has the ToUnicode stream
-/// `obj_num` too, with a font program that is not `font_dict`'s (or that
-/// cannot be told apart from it). The CMap built from the stream is kept
-/// once for all the fonts that share it, so what only `font_dict`'s own
-/// glyphs justify must not change it then.
-fn shares_tounicode_across_programs(
-    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+/// Identifies what decides the glyph of a code of a font with the ToUnicode
+/// stream `obj_num`: the stream, the font program and the CIDToGIDMap. Two
+/// fonts with the same identity have the same kashida codes.
+fn kashida_identity(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
     obj_num: u32,
-) -> bool {
-    let program = crate::extractor::fonts::get_font_file2_obj_num(doc, font_dict);
-    fonts.values().any(|other| {
-        !std::ptr::eq(*other, font_dict)
-            && other
-                .get(b"ToUnicode")
-                .ok()
-                .and_then(|o| o.as_reference().ok())
-                .is_some_and(|r| r.0 == obj_num)
-            && (program.is_none()
-                || crate::extractor::fonts::get_font_file2_obj_num(doc, other) != program)
-    })
+) -> Option<(u32, usize, usize)> {
+    let program = embedded_font_program_stream(font_dict, doc)?;
+    let cid_to_gid = get_descendant_cid_font(font_dict, doc)
+        .and_then(|cid_font| cid_font.get(b"CIDToGIDMap").ok())
+        .and_then(|obj| doc.dereference(obj).ok())
+        .map_or(0, |(_, obj)| std::ptr::from_ref(obj) as usize);
+    Some((obj_num, std::ptr::from_ref(program) as usize, cid_to_gid))
 }
 
 /// Give a font's CMaps their roles in a [`CMapEntry`]. `primary` is the
@@ -774,10 +751,6 @@ struct EntryBuild {
     /// Whether the repair of the control destinations may read the
     /// program: its reading, and its outlines.
     program_repair: bool,
-    /// Whether the kashida entries may be emptied: the glyphs are read in
-    /// this font's program, so not when another font with another program
-    /// shares the ToUnicode stream (see [`shares_tounicode_across_programs`]).
-    kashida_repair: bool,
 }
 
 /// When a font's embedded program is read for the fallback of its CMap
@@ -849,11 +822,6 @@ fn font_cmap_entry(
             font_dict,
             doc,
         );
-    }
-    // The kashida entries are read from the ToUnicode CMap's own codes, so
-    // only it is repaired, not its subset remap (whose codes are renumbered).
-    if build.program_repair && build.kashida_repair {
-        repair_kashida_destinations(&mut primary, font_dict, doc, || program.bytes());
     }
     cmap_entry(
         primary,
@@ -939,7 +907,7 @@ pub(crate) fn build_cmap_entry_from_stream(
     obj_num: u32,
 ) -> Option<CMapEntry> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
-        return Some(font_cmap_entry(
+        let mut entry = font_cmap_entry(
             cmap,
             font_dict,
             doc,
@@ -948,9 +916,12 @@ pub(crate) fn build_cmap_entry_from_stream(
                 promote: true,
                 program_fallback: ProgramFallback::Always,
                 program_repair: true,
-                kashida_repair: true,
             },
-        ));
+        );
+        // The stream is this font's alone, so its CMap can be changed.
+        let kashidas = kashida_codes(&entry.primary, font_dict, doc);
+        entry.primary.read_as_nothing(&kashidas);
+        return Some(entry);
     }
 
     let fallback = build_fallback_cmap_for_type0(font_dict, doc)
@@ -1319,8 +1290,9 @@ impl ToUnicodeCMap {
         codes.into_iter().collect()
     }
 
-    /// The codes whose destination is U+FFFD alone: a direct entry, or the
-    /// first code of a range that starts at it.
+    /// The codes whose effective destination is U+FFFD alone: a direct
+    /// entry, or the first code of a range that starts at it and is not
+    /// overridden by a direct entry.
     pub(crate) fn replacement_codes(&self) -> Vec<u16> {
         let mut codes: std::collections::BTreeSet<u16> = self
             .char_map
@@ -1332,9 +1304,21 @@ impl ToUnicodeCMap {
             self.ranges
                 .iter()
                 .filter(|&&(start, end, base)| start <= end && base == 0xFFFD)
-                .map(|&(start, _, _)| start),
+                .map(|&(start, _, _)| start)
+                .filter(|&start| self.destination(start).as_deref() == Some("\u{FFFD}")),
         );
         codes.into_iter().collect()
+    }
+
+    /// Make each of `codes` read as nothing.
+    fn read_as_nothing(&mut self, codes: &[u16]) {
+        if codes.is_empty() {
+            return;
+        }
+        for &code in codes {
+            self.char_map.insert(code, String::new());
+        }
+        self.refresh_gap_fills();
     }
 
     /// Whether `bytes` is a string of two-byte codes that this CMap reads
@@ -1352,27 +1336,21 @@ impl ToUnicodeCMap {
     }
 
     /// Whether the CMap is that of an Arabic-script font: at least
-    /// [`ARABIC_CMAP_MIN_ENTRIES`] of its single-character destinations,
-    /// direct or in a range, are Arabic letters, and they are at least a
-    /// third of all the destinations that are not U+FFFD.
+    /// [`ARABIC_CMAP_MIN_ENTRIES`] of the codes it reads as one character
+    /// read an Arabic letter, and they are at least a third of all the codes
+    /// it reads as anything but U+FFFD. The codes are those of two bytes at
+    /// most, each counted once by what [`Self::destination`] gives it.
     pub(crate) fn is_arabic_script(&self) -> bool {
-        let (mut arabic, mut total) = (0usize, 0usize);
-        for text in self
-            .char_map
-            .values()
-            .filter(|text| text.as_str() != "\u{FFFD}")
-        {
+        let (mut arabic, mut total) = (0u32, 0u32);
+        for code in 0..=u16::MAX {
+            let Some(text) = self.destination(code).filter(|text| text != "\u{FFFD}") else {
+                continue;
+            };
             total += 1;
             let mut chars = text.chars();
             if let (Some(ch), None) = (chars.next(), chars.next()) {
-                arabic += usize::from(arabic_letters_in_span(u32::from(ch), 1) > 0);
+                arabic += u32::from(is_arabic_char(ch));
             }
-        }
-        // A range is counted by its span, not code by code.
-        for &(start, end, base) in self.ranges.iter().filter(|r| r.0 <= r.1) {
-            let len = u32::from(end - start) + 1;
-            total += (len - u32::from(base == 0xFFFD)) as usize;
-            arabic += arabic_letters_in_span(base, len);
         }
         arabic >= ARABIC_CMAP_MIN_ENTRIES && arabic * 3 >= total
     }
@@ -3433,6 +3411,11 @@ fn build_cmap_from_cid_system_info(
 pub struct FontCMaps {
     /// Map of ToUnicode object number to CMap
     by_obj_num: HashMap<u32, CMapEntry>,
+    /// For a font whose program has kashida codes (see [`kashida_codes`]),
+    /// the key in `by_obj_num` of its own copy of the CMap, in which they
+    /// read as nothing; `None` for an identity that has none. The CMap of
+    /// the shared stream stays as written for the other fonts.
+    kashida_variants: HashMap<(u32, usize, usize), Option<u32>>,
 }
 
 /// Primary CMap plus optional alternative variants.
@@ -3471,7 +3454,7 @@ impl FontCMaps {
         page_filter: Option<&HashSet<u32>>,
         skip_truetype_fallback: bool,
     ) -> Self {
-        let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
+        let mut maps = FontCMaps::default();
 
         for (page_num, &page_id) in doc.get_pages().iter() {
             if let Some(filter) = page_filter {
@@ -3481,20 +3464,15 @@ impl FontCMaps {
             }
             // Page-level fonts (includes inherited parent resources)
             let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
-            Self::collect_cmaps_from_fonts_inner(
-                &fonts,
-                doc,
-                &mut by_obj_num,
-                skip_truetype_fallback,
-            );
+            Self::collect_cmaps_from_fonts_inner(&fonts, doc, &mut maps, skip_truetype_fallback);
 
             if !skip_truetype_fallback {
                 // Fonts inside Form XObjects referenced by this page
-                Self::collect_cmaps_from_xobjects(doc, page_id, &mut by_obj_num);
+                Self::collect_cmaps_from_xobjects(doc, page_id, &mut maps);
             }
         }
 
-        FontCMaps { by_obj_num }
+        maps
     }
 
     /// Parse ToUnicode CMaps from a set of font dictionaries.
@@ -3503,17 +3481,21 @@ impl FontCMaps {
     fn collect_cmaps_from_fonts(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        maps: &mut FontCMaps,
     ) {
-        Self::collect_cmaps_from_fonts_inner(fonts, doc, by_obj_num, false);
+        Self::collect_cmaps_from_fonts_inner(fonts, doc, maps, false);
     }
 
     fn collect_cmaps_from_fonts_inner(
         fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        maps: &mut FontCMaps,
         skip_truetype_fallback: bool,
     ) {
+        let FontCMaps {
+            by_obj_num,
+            kashida_variants,
+        } = maps;
         // First pass: collect ToUnicode CMaps
         for font_dict in fonts.values() {
             let obj_ref = match font_dict
@@ -3526,6 +3508,9 @@ impl FontCMaps {
             };
             let obj_num = obj_ref.0;
             if by_obj_num.contains_key(&obj_num) {
+                if !skip_truetype_fallback {
+                    add_kashida_variant(by_obj_num, kashida_variants, font_dict, doc, obj_num);
+                }
                 continue;
             }
             let stream = match doc.get_object(obj_ref).and_then(Object::as_stream) {
@@ -3572,12 +3557,12 @@ impl FontCMaps {
                             ProgramFallback::WhenSparse
                         },
                         program_repair: !skip_truetype_fallback,
-                        kashida_repair: !shares_tounicode_across_programs(
-                            fonts, font_dict, doc, obj_num,
-                        ),
                     },
                 );
                 by_obj_num.insert(obj_num, entry);
+                if !skip_truetype_fallback {
+                    add_kashida_variant(by_obj_num, kashida_variants, font_dict, doc, obj_num);
+                }
             } else {
                 // ToUnicode present but parse failed; try fallbacks to avoid empty decoding.
                 let fallback = if skip_truetype_fallback {
@@ -3867,11 +3852,7 @@ impl FontCMaps {
     }
 
     /// Walk Form XObjects in a page's resources and collect their font CMaps.
-    fn collect_cmaps_from_xobjects(
-        doc: &Document,
-        page_id: ObjectId,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
-    ) {
+    fn collect_cmaps_from_xobjects(doc: &Document, page_id: ObjectId, maps: &mut FontCMaps) {
         let (resource_dict, resource_ids) = match doc.get_page_resources(page_id) {
             Ok(r) => r,
             Err(_) => return,
@@ -3880,11 +3861,11 @@ impl FontCMaps {
         let mut visited = HashSet::new();
 
         if let Some(resources) = resource_dict {
-            Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+            Self::walk_xobject_fonts(resources, doc, maps, &mut visited);
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
-                Self::walk_xobject_fonts(resources, doc, by_obj_num, &mut visited);
+                Self::walk_xobject_fonts(resources, doc, maps, &mut visited);
             }
         }
     }
@@ -3893,7 +3874,7 @@ impl FontCMaps {
     fn walk_xobject_fonts(
         resources: &lopdf::Dictionary,
         doc: &Document,
-        by_obj_num: &mut HashMap<u32, CMapEntry>,
+        maps: &mut FontCMaps,
         visited: &mut HashSet<ObjectId>,
     ) {
         let xobject_dict = match resources.get(b"XObject") {
@@ -3946,18 +3927,70 @@ impl FontCMaps {
                             fonts.insert(name.clone(), font);
                         }
                     }
-                    Self::collect_cmaps_from_fonts(&fonts, doc, by_obj_num);
+                    Self::collect_cmaps_from_fonts(&fonts, doc, maps);
                 }
                 // Recurse into nested XObjects
-                Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
+                Self::walk_xobject_fonts(form_resources, doc, maps, visited);
             }
         }
+    }
+
+    /// The key of the CMap a font with the ToUnicode stream `obj_num` reads
+    /// its text by: its own copy when its kashidas read as nothing, else
+    /// `obj_num`.
+    pub(crate) fn key_for_font(
+        &self,
+        font_dict: &lopdf::Dictionary,
+        doc: &Document,
+        obj_num: u32,
+    ) -> u32 {
+        if self.kashida_variants.is_empty() {
+            return obj_num;
+        }
+        kashida_identity(font_dict, doc, obj_num)
+            .and_then(|identity| self.kashida_variants.get(&identity).copied().flatten())
+            .unwrap_or(obj_num)
     }
 
     /// Get a CMap by ToUnicode object number
     pub fn get_by_obj(&self, obj_num: u32) -> Option<&CMapEntry> {
         self.by_obj_num.get(&obj_num)
     }
+}
+
+/// Give a font its own copy of the CMap of its ToUnicode stream `obj_num`,
+/// in which its kashida codes read as nothing, when it has any. The copy is
+/// kept under a key above every object number of `doc`, once for each
+/// [`kashida_identity`].
+fn add_kashida_variant(
+    by_obj_num: &mut HashMap<u32, CMapEntry>,
+    variants: &mut HashMap<(u32, usize, usize), Option<u32>>,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    obj_num: u32,
+) {
+    let Some(identity) = kashida_identity(font_dict, doc, obj_num) else {
+        return;
+    };
+    if variants.contains_key(&identity) {
+        return;
+    }
+    let Some(shared) = by_obj_num.get(&obj_num) else {
+        return;
+    };
+    let kashidas = kashida_codes(&shared.primary, font_dict, doc);
+    let mut key = None;
+    if !kashidas.is_empty() {
+        let mut entry = shared.clone();
+        entry.primary.read_as_nothing(&kashidas);
+        // Above `doc.max_id`, so no real object number is taken.
+        let new_key = doc
+            .max_id
+            .saturating_add(1 + u32::try_from(variants.len()).unwrap_or(0));
+        by_obj_num.insert(new_key, entry);
+        key = Some(new_key);
+    }
+    variants.insert(identity, key);
 }
 
 /// For Type0 CID fonts, try to build a fallback CMap from embedded font data

@@ -554,7 +554,10 @@ pub(crate) fn extract_page_text_items_with_options(
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
                 if let Ok(obj_ref) = tounicode.as_reference() {
-                    font_tounicode_refs.insert(resource_name, obj_ref.0);
+                    font_tounicode_refs.insert(
+                        resource_name,
+                        font_cmaps.key_for_font(font_dict, doc, obj_ref.0),
+                    );
                 } else if let Object::Stream(s) = tounicode {
                     let data = s
                         .decompressed_content()

@@ -415,7 +415,10 @@ fn extract_form_xobject_text_inner(
         match font_dict.get(b"ToUnicode") {
             Ok(tounicode) => {
                 if let Ok(obj_ref) = tounicode.as_reference() {
-                    font_tounicode_refs.insert(resource_name, obj_ref.0);
+                    font_tounicode_refs.insert(
+                        resource_name,
+                        font_cmaps.key_for_font(font_dict, doc, obj_ref.0),
+                    );
                 } else if let Object::Stream(s) = tounicode {
                     let data = s
                         .decompressed_content()

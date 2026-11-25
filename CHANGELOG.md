@@ -18,7 +18,12 @@ version and date. Earlier releases are described in their
   Arabic font and the glyph itself is a flat stroke on the baseline that
   spans its advance; any other U+FFFD entry still counts as a decode
   failure. Pages that carried such characters are no longer flagged for
-  OCR because of them.
+  OCR because of them. The check is made for each font against its own
+  program and CIDToGIDMap, so a ToUnicode stream shared by several fonts is
+  never changed for the others. Known limitations: only the ToUnicode map
+  itself is repaired, not its renumbered subset remap; a bare CFF program is
+  not measured; a simple font whose kashida glyph is named by a
+  `/Differences` entry is not covered.
 
 ## [1.27.1] - 2026-11-24
 
