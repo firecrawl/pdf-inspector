@@ -234,26 +234,55 @@ const MARKER_MAX_CHARS: usize = 4;
 /// separate runs. The vote on how a page stores its brackets asks this ahead
 /// of `merge_subscript_items`, so a small or large run of letters is not
 /// taken for a marker whatever its size.
+///
+/// A space between a marker and its anchor is a word boundary
+/// (`script_anchor_gap`), except where it is the line's padding: a heading
+/// typeset `" :نورشعلا "` ahead of its footnote marker. A run found only once
+/// that edge space is ignored counts only if no other item of the line lies
+/// beyond it, so a marker after a real space with more text past it keeps
+/// its vote.
 pub(crate) fn raised_marker_glyphs(line: &[&TextItem]) -> Vec<bool> {
-    // A line's padding spaces ("  :نورشعلا ") are not a word boundary
-    // between the marker and its anchor.
-    let items: Vec<TextItem> = line
-        .iter()
-        .map(|item| TextItem {
-            text: item.text.trim().to_string(),
-            ..(*item).clone()
-        })
-        .collect();
+    let mut items: Vec<TextItem> = line.iter().map(|&item| item.clone()).collect();
     let mut marker = vec![false; items.len()];
-    for run in detect_script_runs(&items) {
+    mark_marker_runs(&items, &mut marker, |_, _| true);
+    for item in &mut items {
+        item.text = item.text.trim().to_string();
+    }
+    let extents: Vec<(f32, f32)> = items.iter().map(|i| (i.x, item_right(i))).collect();
+    mark_marker_runs(&items, &mut marker, |run, glyphs| {
+        let (left, right) = glyphs.iter().fold((f32::MAX, f32::MIN), |(l, r), &g| {
+            (l.min(extents[g].0), r.max(extents[g].1))
+        });
+        extents.iter().enumerate().all(|(i, &(x, end))| {
+            glyphs.contains(&i)
+                || if run.anchor_on_left {
+                    end <= right
+                } else {
+                    x >= left
+                }
+        })
+    });
+    marker
+}
+
+/// Flag the glyphs of every marker-shaped run of `items` that `accept`
+/// allows, given the run and its glyph indices.
+fn mark_marker_runs(
+    items: &[TextItem],
+    marker: &mut [bool],
+    accept: impl Fn(&ScriptRun, &[usize]) -> bool,
+) {
+    for run in detect_script_runs(items) {
         let text: String = run.glyphs.iter().map(|&g| items[g].text.trim()).collect();
-        if text.chars().count() <= MARKER_MAX_CHARS && !text.chars().any(char::is_alphabetic) {
+        if text.chars().count() <= MARKER_MAX_CHARS
+            && !text.chars().any(char::is_alphabetic)
+            && accept(&run, &run.glyphs)
+        {
             for &g in &run.glyphs {
                 marker[g] = true;
             }
         }
     }
-    marker
 }
 
 /// Find every super/subscript glyph run and its anchor.
@@ -904,6 +933,44 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 3);
         assert!(merged.iter().all(|i| !i.is_script()));
+    }
+
+    fn marker_flags(items: &[TextItem]) -> Vec<bool> {
+        let line: Vec<&TextItem> = items.iter().collect();
+        raised_marker_glyphs(&line)
+    }
+
+    #[test]
+    fn marker_after_a_real_space_with_text_beyond_it_is_not_flagged() {
+        // "Total " then a small raised "(1)" then more words: the trailing
+        // space is a word boundary, so "(1)" is no footnote marker of "Total".
+        let items = vec![
+            make_item_fs("Total ", 72.0, 500.0, 30.0, 10.0),
+            make_item_fs("(1)", 102.0, 503.0, 8.0, 6.0),
+            make_item_fs("more", 114.0, 500.0, 24.0, 10.0),
+        ];
+        assert_eq!(marker_flags(&items), vec![false, false, false]);
+    }
+
+    #[test]
+    fn marker_beside_a_padded_heading_at_the_line_edge_is_flagged() {
+        // A heading typeset with a padding space at the edge facing its
+        // marker, the marker the outermost item of the line (PDPL headings).
+        let items = vec![
+            make_item_fs(" :heading", 110.0, 500.0, 40.0, 14.0),
+            make_item_fs("(1)", 100.0, 502.0, 10.0, 7.0),
+        ];
+        assert_eq!(marker_flags(&items), vec![false, true]);
+    }
+
+    #[test]
+    fn attached_marker_is_flagged_without_trimming() {
+        let items = vec![
+            make_item_fs("Total", 72.0, 500.0, 30.0, 10.0),
+            make_item_fs("(1)", 102.0, 503.0, 8.0, 6.0),
+            make_item_fs("more", 114.0, 500.0, 24.0, 10.0),
+        ];
+        assert_eq!(marker_flags(&items), vec![false, true, false]);
     }
 
     #[test]
