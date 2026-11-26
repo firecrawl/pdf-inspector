@@ -2,9 +2,14 @@
 //! text, and no other U+FFFD entry is dropped.
 
 use super::blank_glyph_tests::synthetic_truetype;
-use super::tests::{cid_font_doc, decode_page_font_string_as};
+use super::tests::{
+    cid_font_doc, decode_page_font_string_as, decode_page_font_string_with_coverage,
+};
 use super::{add_kashida_codes, build_font_widths, FontStyleCache};
-use crate::tounicode::{kashida_codes, FontCMaps, ToUnicodeCMap, MAX_KASHIDA_CANDIDATES};
+use crate::tounicode::{
+    kashida_codes, CidDecodeStats, FontCMaps, ToUnicodeCMap, MAX_KASHIDA_CANDIDATES,
+};
+use crate::types::FontLabel;
 use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 
 const FFFD: char = '\u{FFFD}';
@@ -419,6 +424,33 @@ fn kashida_at_code_one() -> (Document, u32, ObjectId) {
     let doc = document(&cmap, program(&GLYPHS), Some(&map));
     assert_eq!(font_kashida_codes(&doc), vec![1]);
     doc
+}
+
+#[test]
+fn an_odd_string_with_only_an_unread_byte_left_counts_that_byte_as_unmapped() {
+    let doc = kashida_at_code_one();
+    let coverage = |bytes: &[u8]| {
+        let (text, coverage) =
+            decode_page_font_string_with_coverage(&doc.0, "F1", doc.1, doc.2, true, bytes);
+        assert_eq!(text, "");
+        coverage
+    };
+    let unread = |codes: u32| {
+        vec![(
+            FontLabel::from("ABCDEF+Subset"),
+            CidDecodeStats {
+                codes,
+                interpolated: 0,
+                unmapped: codes,
+            },
+        )]
+    };
+    // The kashida pair is dropped; the unread byte left over is one
+    // unmapped code, whatever the number of pairs dropped before it.
+    assert_eq!(coverage(&[0, 1, 0]), unread(1));
+    assert_eq!(coverage(&[0, 1, 0, 1, 0]), unread(1));
+    // A run of nothing but kashidas is no text and no coverage.
+    assert!(coverage(&[0, 1, 0, 1]).is_empty());
 }
 
 #[test]

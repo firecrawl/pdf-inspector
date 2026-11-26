@@ -2873,6 +2873,20 @@ pub(crate) fn extract_text_from_operand(
                 let bytes = if bytes.len() % 2 == 1 && !kashidas.is_empty() {
                     paired = without_kashidas(bytes, kashidas);
                     if paired.len() == 1 && bytes.len() > 1 {
+                        // Only the last byte is left of the string, a code
+                        // no CMap read (the byte reading above found none),
+                        // so it is counted as unmapped; the pairs dropped
+                        // were no text and count for nothing.
+                        if unread_byte_stats.is_some() {
+                            cmap_decisions.record_coverage(
+                                font_label,
+                                CidDecodeStats {
+                                    codes: 1,
+                                    interpolated: 0,
+                                    unmapped: 1,
+                                },
+                            );
+                        }
                         return Some(String::new());
                     }
                     paired.as_slice()
@@ -5806,6 +5820,17 @@ mod tests {
         is_cid: bool,
         bytes: &[u8],
     ) -> String {
+        decode_page_font_string_with_coverage(doc, font, tounicode_obj, page_id, is_cid, bytes).0
+    }
+
+    pub(super) fn decode_page_font_string_with_coverage(
+        doc: &Document,
+        font: &str,
+        tounicode_obj: u32,
+        page_id: lopdf::ObjectId,
+        is_cid: bool,
+        bytes: &[u8],
+    ) -> (String, PendingCoverage) {
         let cmaps = FontCMaps::from_doc(doc);
         let fonts = doc.get_page_fonts(page_id).unwrap();
         let (font_encodings, _) =
@@ -5825,6 +5850,7 @@ mod tests {
             &cmaps,
             &mut FontStyleCache::new(),
         );
+        let mut decisions = CMapDecisionCache::new();
         let (text, _) = extract_text_from_operand(
             &Object::String(bytes.to_vec(), lopdf::StringFormat::Hexadecimal),
             font,
@@ -5834,12 +5860,12 @@ mod tests {
             &HashMap::new(),
             &font_encodings,
             &encoding_cache,
-            &mut CMapDecisionCache::new(),
+            &mut decisions,
             &font_widths,
             &build_font_kinds(&fonts),
         )
         .expect("text decoded");
-        text
+        (text, decisions.take_run_coverage())
     }
 
     /// An odd-length string through a Type0 font is read byte by byte
