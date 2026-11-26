@@ -729,10 +729,11 @@ fn extract_page(
     let skipped_invisible = visible.3;
     let visible_alnum = alnum_of(&visible.0 .0);
     let stamp_only = visible_alnum <= STAMP_MAX_ALNUM;
-    if !options.invisible_layer_fallback
-        || !(skipped_invisible || stamp_only)
-        || !crate::detector::page_has_covering_image(doc, page_id)
-    {
+    if !options.invisible_layer_fallback || !(skipped_invisible || stamp_only) {
+        return Ok((visible, None));
+    }
+    let (covers_page, only_hidden_text) = crate::detector::page_scan_layer(doc, page_id);
+    if !covers_page {
         return Ok((visible, None));
     }
     let needs_ocr = |visible, reason| {
@@ -769,10 +770,14 @@ fn extract_page(
         .collect::<Vec<_>>()
         .join("\n");
     // The with-invisible pass also holds the visible items, so this is
-    // what the hidden layer adds.
-    let gained = alnum_of(&layer.0 .0).saturating_sub(visible_alnum);
+    // what the hidden layer adds. This reader resets the render mode at
+    // each `BT` and detection does not, so when detection found every
+    // text-showing operator hidden, the visible pass read part of the
+    // layer and the page shows no text.
+    let shown_alnum = if only_hidden_text { 0 } else { visible_alnum };
+    let gained = alnum_of(&layer.0 .0).saturating_sub(shown_alnum);
     if gained >= crate::OCR_LAYER_MIN_ALNUM
-        && visible_alnum * 4 <= gained
+        && shown_alnum * 4 <= gained
         && !crate::text_quality::is_garbage_text(&text)
         && !crate::text_quality::has_case_shifted_words(&text)
     {

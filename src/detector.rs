@@ -874,10 +874,15 @@ fn resolve_with_shadowing(
     }
 }
 
-/// Whether the images a page's content draws cover the page — see
-/// `PageAnalysis::has_covering_image`.
-pub(crate) fn page_has_covering_image(doc: &Document, page_id: ObjectId) -> bool {
-    content_scan::page_executed_content(doc, page_id).covers_page
+/// Whether the images a page's content draws cover the page, and whether
+/// its only text is a hidden layer under them — see
+/// `PageAnalysis::has_covering_image` and `has_invisible_text_layer`.
+pub(crate) fn page_scan_layer(doc: &Document, page_id: ObjectId) -> (bool, bool) {
+    let executed = content_scan::page_executed_content(doc, page_id);
+    (
+        executed.covers_page,
+        executed.shows_only_a_hidden_text_layer,
+    )
 }
 
 /// Analyze a page's content stream for text operators and images

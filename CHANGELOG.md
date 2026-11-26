@@ -19,7 +19,9 @@ version and date. Earlier releases are described in their
   layer. The layer is kept when it adds at least 40 letters or digits, at
   least four times the page's visible text, and is neither garbage nor
   case-shifted gibberish, like Tesseract's reading of a page scanned upside
-  down. A small stamp over the layer, like an archive's download footer, is
+  down. Text objects that inherit render mode 3 from an earlier one, as
+  Acrobat Paper Capture writes them, count as layer, not visible text.
+  A small stamp over the layer, like an archive's download footer, is
   returned with it. A scan page whose visible text is at most a stamp (160
   letters or digits) and whose layer is not kept is listed in
   `pages_needing_ocr`: with the `invisible_text_layer` reason when it has a

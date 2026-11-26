@@ -3606,6 +3606,28 @@ fn test_read_invisible_text_layer_preserves_positioned_word_boundaries() {
     }
 }
 
+/// Acrobat Paper Capture sets the render mode in the layer's first text
+/// object only; the later ones inherit it. The extractor resets the mode at
+/// `BT` and reads them as visible, but the kept layer still answers the
+/// page's `invisible_text_layer` reason.
+#[test]
+fn test_read_invisible_text_layer_clears_a_paper_capture_layer() {
+    let mut layer = String::from("BT 3 Tr /F1 10 Tf 72 740 Td (Memorandum) Tj ET\n");
+    for line in 0..12 {
+        layer.push_str(&format!(
+            "BT /F1 10 Tf 72 {} Td (Line {line} of the page the scan carries) Tj ET\n",
+            720 - line * 14
+        ));
+    }
+    let mut options = PdfOptions::new();
+    options.detection.read_invisible_text_layer = true;
+    let result =
+        process_pdf_mem_with_options(&make_pdf_with_positioned_layer(&layer), options).unwrap();
+    assert!(result.pages_needing_ocr.is_empty(), "{result:?}");
+    assert!(result.ocr_reasons_by_page.is_empty());
+    assert!(result.markdown.unwrap().contains("Memorandum"));
+}
+
 #[test]
 fn test_read_invisible_text_layer_checks_realistic_glyph_fragments() {
     let mut options = PdfOptions::new();
