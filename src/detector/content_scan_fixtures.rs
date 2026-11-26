@@ -258,7 +258,9 @@ pub(super) fn executed(doc: &Document, page_id: ObjectId, streams: &[&str]) -> (
 /// Every scan through here is run three times — keeping no form runs;
 /// replaying them within the page; and replaying those a first scan of
 /// the page kept, as a later page sharing its forms would — and the
-/// tallies must agree: a replay adds what running the form adds.
+/// tallies must agree: a replay adds what running the form adds. When the
+/// first scan kept a run, the second meets its form again under the same
+/// state, and must replay it.
 pub(super) fn executed_state<'a>(
     doc: &'a Document,
     page_id: ObjectId,
@@ -267,6 +269,7 @@ pub(super) fn executed_state<'a>(
     let plain = executed_state_with(doc, page_id, streams, FormRuns::none());
     let mut first = executed_state_with(doc, page_id, streams, FormRuns::default());
     let kept = std::mem::take(&mut first.form_runs);
+    let (kept_any, replays_before) = (kept.kept > 0, kept.replays);
     let again = executed_state_with(doc, page_id, streams, kept);
     assert!(
         tallies(&first) == tallies(&plain),
@@ -275,6 +278,10 @@ pub(super) fn executed_state<'a>(
     assert!(
         tallies(&again) == tallies(&plain),
         "form runs replayed from an earlier scan changed the page's tallies"
+    );
+    assert!(
+        !kept_any || again.form_runs.replays > replays_before,
+        "a run the first scan kept was not replayed by the second"
     );
     plain
 }

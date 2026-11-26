@@ -22,6 +22,7 @@ use super::{
 };
 use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -276,39 +277,55 @@ pub(super) struct FormScans<'a> {
     walks: HashMap<ObjectId, FormWalk>,
 }
 
+/// How many forms' walks one document's scans keep (see [`FormWalk`]):
+/// past it, a form is walked again on each page that binds it.
+const FORM_WALKS_KEPT_MAX: usize = 4_096;
+
 /// What a form's content holds, read on its own — as
 /// [`scan_content_stream_alone`] reads it, in the form's own resources —
 /// which is the form's alone, whichever page binds it.
+#[derive(Clone)]
 pub(super) struct FormWalk {
     pub(super) counts: ContentCounts,
     pub(super) unique_chars: HashSet<u8>,
     pub(super) font_names: HashSet<Vec<u8>>,
 }
 
+impl FormWalk {
+    fn read(doc: &Document, form: &lopdf::Stream) -> Self {
+        let content = form
+            .decompressed_content()
+            .unwrap_or_else(|_| form.content.clone());
+        let own: Vec<&lopdf::Dictionary> = stream_resources(doc, form).into_iter().collect();
+        let mut unique_chars = HashSet::new();
+        let mut font_names = HashSet::new();
+        let counts =
+            scan_content_stream_alone(doc, &content, &mut unique_chars, &mut font_names, &own);
+        Self {
+            counts,
+            unique_chars,
+            font_names,
+        }
+    }
+}
+
 impl FormScans<'_> {
-    /// The [`FormWalk`] of the form `id`, read the first time it is asked
-    /// for.
+    /// The [`FormWalk`] of the form `id`: read the first time it is asked
+    /// for, and kept while fewer than `FORM_WALKS_KEPT_MAX` are.
     pub(super) fn form_walk(
         &mut self,
         doc: &Document,
         id: ObjectId,
         form: &lopdf::Stream,
-    ) -> &FormWalk {
-        self.walks.entry(id).or_insert_with(|| {
-            let content = form
-                .decompressed_content()
-                .unwrap_or_else(|_| form.content.clone());
-            let own: Vec<&lopdf::Dictionary> = stream_resources(doc, form).into_iter().collect();
-            let mut unique_chars = HashSet::new();
-            let mut font_names = HashSet::new();
-            let counts =
-                scan_content_stream_alone(doc, &content, &mut unique_chars, &mut font_names, &own);
-            FormWalk {
-                counts,
-                unique_chars,
-                font_names,
+    ) -> Cow<'_, FormWalk> {
+        if !self.walks.contains_key(&id) {
+            let walk = FormWalk::read(doc, form);
+            if self.walks.len() >= FORM_WALKS_KEPT_MAX {
+                return Cow::Owned(walk);
             }
-        })
+            self.walks.insert(id, walk);
+        }
+        Cow::Borrowed(&self.walks[&id])
     }
 }
 

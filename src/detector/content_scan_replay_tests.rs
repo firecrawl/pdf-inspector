@@ -233,8 +233,11 @@ fn every_fixture_page_reads_the_same_through_the_forms_kept() {
     fixtures.sort();
     assert!(!fixtures.is_empty());
     for path in fixtures {
-        let Ok((doc, _)) = crate::load_document_from_mem(&std::fs::read(&path).unwrap()) else {
-            continue;
+        let doc = match crate::load_document_from_mem(&std::fs::read(&path).unwrap()) {
+            Ok((doc, _)) => doc,
+            // An encrypted fixture opens only with its password.
+            Err(crate::PdfError::Encrypted) => continue,
+            Err(error) => panic!("{}: {error:?}", path.display()),
         };
         let mut form_scans = FormScans::default();
         for (page, page_id) in doc.get_pages() {
