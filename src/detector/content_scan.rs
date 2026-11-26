@@ -18,10 +18,11 @@ use super::content_resources::{
 };
 use super::{
     collect_text_chars_before, extract_font_name_before_tf, is_pdf_whitespace,
-    preceding_operand_closer,
+    preceding_operand_closer, resolve_font_names_to_ids,
 };
 use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -66,14 +67,16 @@ pub(super) struct ExecutedContent {
 /// image is measured on the visible page box, a form is run in place.
 /// Names resolve in the page's own resources first, then in those it
 /// inherits. Returns what the page executed and the streams' own counts;
-/// the text characters and font names met go to the sets given.
-pub(super) fn scan_page_content(
-    doc: &Document,
+/// the text characters and font names met go to the sets given. The
+/// forms' runs come from, and go to, the document's `form_scans`.
+pub(super) fn scan_page_content<'a>(
+    doc: &'a Document,
     page_id: ObjectId,
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
+    form_scans: &mut FormScans<'a>,
 ) -> (ExecutedContent, ContentCounts) {
-    let (state, counts) = scan_page(doc, page_id, unique_chars, used_font_names);
+    let (state, counts) = scan_page(doc, page_id, unique_chars, used_font_names, form_scans);
     (state.executed(), counts)
 }
 
@@ -81,10 +84,20 @@ pub(super) fn scan_page_content(
 /// alone, without the font, pixel and path analysis of
 /// `analyze_page_content`. For the pages a sample left out, whose OCR
 /// reason is reported all the same.
-pub(super) fn page_executed_content(doc: &Document, page_id: ObjectId) -> ExecutedContent {
-    scan_page(doc, page_id, &mut HashSet::new(), &mut HashSet::new())
-        .0
-        .executed()
+pub(super) fn page_executed_content<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+    form_scans: &mut FormScans<'a>,
+) -> ExecutedContent {
+    scan_page(
+        doc,
+        page_id,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        form_scans,
+    )
+    .0
+    .executed()
 }
 
 /// [`scan_content_stream`] of one stream on its own — the initial
@@ -134,6 +147,7 @@ fn scan_page<'a>(
     page_id: ObjectId,
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
+    form_scans: &mut FormScans<'a>,
 ) -> (ContentScanState<'a>, ContentCounts) {
     let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
     let page_resources = doc.get_page_resources(page_id).ok();
@@ -142,6 +156,7 @@ fn scan_page<'a>(
         .map(|(own, ancestors)| resource_chain(doc, *own, ancestors))
         .unwrap_or_default();
     let mut state = ContentScanState::new(doc, page_box, true);
+    state.form_runs = std::mem::take(&mut form_scans.runs);
     let mut counts = ContentCounts::default();
     for content_id in doc.get_page_contents(page_id) {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
@@ -157,6 +172,7 @@ fn scan_page<'a>(
             ));
         }
     }
+    form_scans.runs = std::mem::take(&mut state.form_runs);
     (state, counts)
 }
 
@@ -241,6 +257,217 @@ const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// Cells per side of the grid the images drawn are tallied on, over the
 /// visible page box: 64 × 64 cells, one row per `u64`.
 const COVERAGE_GRID: usize = 64;
+
+/// How many form runs one document's scans keep for replay (see
+/// [`FormRuns`]), and how many of them one form keeps under one state.
+const FORM_RUNS_KEPT_MAX: usize = 4_096;
+const FORM_RUNS_PER_STATE_MAX: usize = 8;
+
+/// How many images a run may draw and still be kept: a replay adds their
+/// areas one at a time, in the order the run added them.
+const FORM_RUN_IMAGE_AREAS_MAX: usize = 256;
+
+/// What one document's scans learn of its forms, kept from page to page:
+/// a form that page after page binds, or draws, is read once rather than
+/// once a page — as the walk over the forms a page binds reads it, and as
+/// the executed scan runs it, under each state it is drawn in.
+#[derive(Default)]
+pub(super) struct FormScans<'a> {
+    runs: FormRuns<'a>,
+    walks: HashMap<ObjectId, FormWalk>,
+}
+
+/// How many forms' walks one document's scans keep (see [`FormWalk`]):
+/// past it, a form is walked again on each page that binds it.
+const FORM_WALKS_KEPT_MAX: usize = 4_096;
+
+/// What a form's content holds, read on its own — as
+/// [`scan_content_stream_alone`] reads it, in the form's own resources —
+/// which is the form's alone, whichever page binds it.
+#[derive(Clone)]
+pub(super) struct FormWalk {
+    pub(super) counts: ContentCounts,
+    pub(super) unique_chars: HashSet<u8>,
+    /// The fonts its `Tf` operators name, resolved in its own resources:
+    /// no more than those bind, however many names the content uses.
+    pub(super) font_ids: HashSet<ObjectId>,
+}
+
+impl FormWalk {
+    fn read(doc: &Document, form: &lopdf::Stream) -> Self {
+        let content = form
+            .decompressed_content()
+            .unwrap_or_else(|_| form.content.clone());
+        let own = stream_resources(doc, form);
+        let mut unique_chars = HashSet::new();
+        let mut font_names = HashSet::new();
+        let counts = scan_content_stream_alone(
+            doc,
+            &content,
+            &mut unique_chars,
+            &mut font_names,
+            &own.into_iter().collect::<Vec<_>>(),
+        );
+        let mut font_ids = HashSet::new();
+        if let Some(own) = own {
+            resolve_font_names_to_ids(doc, own, &font_names, &mut font_ids);
+        }
+        Self {
+            counts,
+            unique_chars,
+            font_ids,
+        }
+    }
+}
+
+impl FormScans<'_> {
+    /// The [`FormWalk`] of the form `id`: read the first time it is asked
+    /// for, and kept while fewer than `FORM_WALKS_KEPT_MAX` are.
+    pub(super) fn form_walk(
+        &mut self,
+        doc: &Document,
+        id: ObjectId,
+        form: &lopdf::Stream,
+    ) -> Cow<'_, FormWalk> {
+        if !self.walks.contains_key(&id) {
+            let walk = FormWalk::read(doc, form);
+            if self.walks.len() >= FORM_WALKS_KEPT_MAX {
+                return Cow::Owned(walk);
+            }
+            self.walks.insert(id, walk);
+        }
+        Cow::Borrowed(&self.walks[&id])
+    }
+}
+
+/// Form runs kept for replay: a form drawn again under a state it ran
+/// under before adds what it added then, without running again. That is
+/// what running it again would add when the run began and ended with
+/// nothing pending that it could see or leave — no clip-only text in
+/// force or in an open text object, no text object positioned, no path
+/// under construction — went complete, and looked up no pattern, whose
+/// verdicts the page keeps once tested; and when the replay is at no
+/// greater depth, within budgets that admit what the run took, and —
+/// when a name the run looked up resolved in its invoker's resources, or
+/// in none — under an invoker whose resources are the same.
+pub(super) struct FormRuns<'a> {
+    by_state: HashMap<FormRunKey, Vec<FormRun<'a>>>,
+    kept: usize,
+    limit: usize,
+    #[cfg(test)]
+    replays: usize,
+}
+
+impl Default for FormRuns<'_> {
+    fn default() -> Self {
+        Self {
+            by_state: HashMap::new(),
+            kept: 0,
+            limit: FORM_RUNS_KEPT_MAX,
+            #[cfg(test)]
+            replays: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl FormRuns<'_> {
+    /// Runs that keep none: every form drawn is run.
+    pub(super) fn none() -> Self {
+        Self {
+            limit: 0,
+            ..Self::default()
+        }
+    }
+}
+
+impl<'a> FormRuns<'a> {
+    fn is_full(&self) -> bool {
+        self.kept >= self.limit
+    }
+
+    fn keep(&mut self, key: FormRunKey, run: FormRun<'a>) {
+        if self.is_full() {
+            return;
+        }
+        let runs = self.by_state.entry(key).or_default();
+        if runs.len() < FORM_RUNS_PER_STATE_MAX {
+            runs.push(run);
+            self.kept += 1;
+        }
+    }
+}
+
+/// The form, and the state in force where it is drawn, that a run reads:
+/// its numbers by their bits, so that a state that differs in any of them
+/// is another state.
+#[derive(PartialEq, Eq, Hash)]
+struct FormRunKey {
+    form: ObjectId,
+    active_forms: Vec<ObjectId>,
+    page: [u64; 4],
+    clip: [u64; 4],
+    ctm: [u64; 6],
+    font_size: Option<u64>,
+    leading: u64,
+    render_mode: u8,
+    fill_paints_image: bool,
+    stroke_paints_image: bool,
+}
+
+/// What one run of a form added to the scan's tallies.
+struct FormRun<'a> {
+    /// The invoker's resources, when a name the run looked up resolved in
+    /// them, or in none: another invoker's may bind it otherwise.
+    invoker_resources: Option<Vec<&'a lopdf::Dictionary>>,
+    /// The run's `resolved_from_end` less the invoker's scopes, for a run
+    /// recorded around a replay of this one; `None` when it looked up no
+    /// name.
+    resolved_past_invoker: Option<isize>,
+    /// The depth the run began at: complete there, it runs the same at any
+    /// depth up to it.
+    depth: usize,
+    invocations: usize,
+    form_bytes: usize,
+    text_ops: u32,
+    hidden_text_ops: u32,
+    drew_image: bool,
+    drew_image_on_page: bool,
+    covered_cells: [u64; COVERAGE_GRID],
+    image_areas: Vec<f64>,
+}
+
+/// The tallies as a recorded run began, and those the page had: the
+/// latter are set aside for the run's own, and joined again after it.
+struct FormRunRecording {
+    depth: usize,
+    invocations: usize,
+    form_bytes: usize,
+    text_ops: u32,
+    hidden_text_ops: u32,
+    pattern_lookups: usize,
+    outer_incomplete: bool,
+    outer_drew_image: bool,
+    outer_drew_image_on_page: bool,
+    outer_covered_cells: [u64; COVERAGE_GRID],
+    outer_image_areas: Option<Vec<f64>>,
+    outer_resolved_from_end: usize,
+}
+
+/// Whether two resource chains bind the same: the same dictionaries, or
+/// dictionaries of the same entries.
+fn same_resources(a: &[&lopdf::Dictionary], b: &[&lopdf::Dictionary]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| std::ptr::eq(*a, *b) || a == b)
+}
+
+fn box_bits(user_box: &UserBox) -> [u64; 4] {
+    [
+        user_box.x0.to_bits(),
+        user_box.y0.to_bits(),
+        user_box.x1.to_bits(),
+        user_box.y1.to_bits(),
+    ]
+}
 
 /// A form's content as the scan reads it: decompressed, with the masked
 /// copy the operators are read through — kept for the page when the
@@ -378,6 +605,21 @@ struct ContentScanState<'a> {
     /// invoked again.
     form_content: HashMap<ObjectId, Rc<FormContent>>,
     form_content_bytes: usize,
+    /// Form runs kept for replay — the document's, for the scan of one of
+    /// its pages (see [`FormRuns`]).
+    form_runs: FormRuns<'a>,
+    /// Patterns looked up: a recorded run that looked one up is not kept.
+    pattern_lookups: usize,
+    /// While a run is recorded, the areas added to `own_image_area`, in
+    /// order.
+    image_area_log: Option<Vec<f64>>,
+    /// While a run is recorded, how near the end of its resource chain
+    /// the names looked up resolved: the fewest scopes from the end, the
+    /// one binding the name included — a name bound nowhere counts as
+    /// bound in the last. Every chain a run looks names up in ends with
+    /// its invoker's resources, so the run owes them nothing when this
+    /// exceeds their count.
+    resolved_from_end: usize,
 }
 
 impl<'a> ContentScanState<'a> {
@@ -425,6 +667,10 @@ impl<'a> ContentScanState<'a> {
             incomplete: false,
             form_content: HashMap::new(),
             form_content_bytes: 0,
+            form_runs: FormRuns::default(),
+            pattern_lookups: 0,
+            image_area_log: None,
+            resolved_from_end: usize::MAX,
         }
     }
 
@@ -680,8 +926,17 @@ impl<'a> ContentScanState<'a> {
         };
         self.drew_image = true;
         self.drew_image_on_page = true;
-        self.own_image_area += painted.area();
+        self.add_image_area(painted.area());
         self.mark_cells(&painted);
+    }
+
+    /// An image's own area on the page joins `own_image_area` — and the
+    /// log of a run being recorded, for its replays to add in turn.
+    fn add_image_area(&mut self, area: f64) {
+        self.own_image_area += area;
+        if let Some(log) = self.image_area_log.as_mut() {
+            log.push(area);
+        }
     }
 
     /// Whether the clip in force has any extent for a paint to land in.
@@ -714,6 +969,7 @@ impl<'a> ContentScanState<'a> {
         if !self.follow_patterns {
             return false;
         }
+        self.pattern_lookups += 1;
         let Some((id, pattern)) = resolve_pattern(self.doc, resources, name) else {
             return false;
         };
@@ -775,7 +1031,7 @@ impl<'a> ContentScanState<'a> {
         self.painted(Some(on_page));
         self.drew_image_on_page = true;
         let [a, b, c, d, _, _] = self.ctm;
-        self.own_image_area += (a * d - b * c).abs().min(on_page.area());
+        self.add_image_area((a * d - b * c).abs().min(on_page.area()));
         self.mark_cells(&on_page);
     }
 
@@ -816,7 +1072,8 @@ impl<'a> ContentScanState<'a> {
     /// run again; past the invocation budget or the depth cap, or with
     /// content the byte budget does not admit — which is not decoded past
     /// what it admits — the form goes unread and the page's evidence is
-    /// incomplete.
+    /// incomplete. A run kept under the same state is replayed instead
+    /// (see [`FormRuns`]).
     fn form_drawn(
         &mut self,
         id: ObjectId,
@@ -833,6 +1090,184 @@ impl<'a> ContentScanState<'a> {
         }
         self.form_invocations += 1;
 
+        // Drawn under a state it ran under before, the form adds what it
+        // added then; run, it is recorded when nothing pending can make
+        // another run of it differ.
+        let key = self.at_rest().then(|| self.form_run_key(id));
+        if let Some(key) = &key {
+            if self.replay_form_run(key, invoker_resources) {
+                return;
+            }
+        }
+        let recording = match key {
+            Some(key) if !self.form_runs.is_full() => Some((key, self.begin_recording())),
+            _ => None,
+        };
+        self.run_form(id, form, invoker_resources);
+        if let Some((key, recording)) = recording {
+            self.end_recording(key, recording, invoker_resources);
+        }
+    }
+
+    /// Whether nothing is pending that a form's run could see, reveal or
+    /// leave changed — no clip-only text in force or in an open text
+    /// object, no text object positioned, no path under construction —
+    /// in a scan that follows patterns and has not run out of bytes.
+    fn at_rest(&self) -> bool {
+        self.follow_patterns
+            && !self.form_bytes_exceeded
+            && self.pending_clip_text_ops == 0
+            && self.clip_text_ops_open == 0
+            && self.text_position.is_none()
+            && self.path_box.is_none()
+            && !self.clip_pending
+    }
+
+    fn form_run_key(&self, form: ObjectId) -> FormRunKey {
+        FormRunKey {
+            form,
+            active_forms: self.active_forms.clone(),
+            page: box_bits(&self.page),
+            clip: box_bits(&self.clip),
+            ctm: self.ctm.map(f64::to_bits),
+            font_size: self.font_size.map(f64::to_bits),
+            leading: self.leading.to_bits(),
+            render_mode: self.render_mode,
+            fill_paints_image: self.fill_paints_image,
+            stroke_paints_image: self.stroke_paints_image,
+        }
+    }
+
+    /// Adds what a run kept under `key` added, when there is one this
+    /// invocation would run the same (see [`FormRuns`]); whether there was.
+    fn replay_form_run(
+        &mut self,
+        key: &FormRunKey,
+        invoker_resources: &[&'a lopdf::Dictionary],
+    ) -> bool {
+        let runs = std::mem::take(&mut self.form_runs);
+        let depth = self.saved.len();
+        let run = runs.by_state.get(key).and_then(|runs| {
+            runs.iter().find(|run| {
+                depth <= run.depth
+                    && self.form_invocations + run.invocations <= FORM_INVOCATIONS_MAX
+                    && self.executed_form_bytes + run.form_bytes <= self.form_bytes_budget
+                    && run
+                        .invoker_resources
+                        .as_deref()
+                        .is_none_or(|kept| same_resources(kept, invoker_resources))
+            })
+        });
+        if let Some(run) = run {
+            self.form_invocations += run.invocations;
+            self.executed_form_bytes += run.form_bytes;
+            self.executed_text_ops += run.text_ops;
+            self.executed_hidden_text_ops += run.hidden_text_ops;
+            self.drew_image |= run.drew_image;
+            self.drew_image_on_page |= run.drew_image_on_page;
+            for (cells, run_cells) in self.covered_cells.iter_mut().zip(&run.covered_cells) {
+                *cells |= run_cells;
+            }
+            for &area in &run.image_areas {
+                self.add_image_area(area);
+            }
+            if let Some(past) = run.resolved_past_invoker {
+                let from_end = (invoker_resources.len() as isize + past).max(1) as usize;
+                self.resolved_from_end = self.resolved_from_end.min(from_end);
+            }
+        }
+        let replayed = run.is_some();
+        self.form_runs = runs;
+        #[cfg(test)]
+        if replayed {
+            self.form_runs.replays += 1;
+        }
+        replayed
+    }
+
+    /// Sets the page's tallies aside for the run about to be recorded.
+    fn begin_recording(&mut self) -> FormRunRecording {
+        FormRunRecording {
+            depth: self.saved.len(),
+            invocations: self.form_invocations,
+            form_bytes: self.executed_form_bytes,
+            text_ops: self.executed_text_ops,
+            hidden_text_ops: self.executed_hidden_text_ops,
+            pattern_lookups: self.pattern_lookups,
+            outer_incomplete: std::mem::take(&mut self.incomplete),
+            outer_drew_image: std::mem::take(&mut self.drew_image),
+            outer_drew_image_on_page: std::mem::take(&mut self.drew_image_on_page),
+            outer_covered_cells: std::mem::replace(&mut self.covered_cells, [0; COVERAGE_GRID]),
+            outer_image_areas: self.image_area_log.replace(Vec::new()),
+            outer_resolved_from_end: std::mem::replace(&mut self.resolved_from_end, usize::MAX),
+        }
+    }
+
+    /// Keeps the recorded run when a replay of it adds what running it
+    /// again would (see [`FormRuns`]), and joins its tallies to the
+    /// page's.
+    fn end_recording(
+        &mut self,
+        key: FormRunKey,
+        recording: FormRunRecording,
+        invoker_resources: &[&'a lopdf::Dictionary],
+    ) {
+        let image_areas = std::mem::replace(&mut self.image_area_log, recording.outer_image_areas)
+            .unwrap_or_default();
+        if let Some(log) = self.image_area_log.as_mut() {
+            log.extend_from_slice(&image_areas);
+        }
+        let resolved_from_end = self.resolved_from_end;
+        let kept = !self.incomplete
+            && self.pattern_lookups == recording.pattern_lookups
+            && self.at_rest()
+            && image_areas.len() <= FORM_RUN_IMAGE_AREAS_MAX;
+        if kept {
+            let invoker_scopes = invoker_resources.len();
+            let run = FormRun {
+                invoker_resources: (resolved_from_end <= invoker_scopes)
+                    .then(|| invoker_resources.to_vec()),
+                resolved_past_invoker: (resolved_from_end != usize::MAX)
+                    .then(|| resolved_from_end as isize - invoker_scopes as isize),
+                depth: recording.depth,
+                invocations: self.form_invocations - recording.invocations,
+                form_bytes: self.executed_form_bytes - recording.form_bytes,
+                text_ops: self.executed_text_ops - recording.text_ops,
+                hidden_text_ops: self.executed_hidden_text_ops - recording.hidden_text_ops,
+                drew_image: self.drew_image,
+                drew_image_on_page: self.drew_image_on_page,
+                covered_cells: self.covered_cells,
+                image_areas,
+            };
+            self.form_runs.keep(key, run);
+        }
+        self.incomplete |= recording.outer_incomplete;
+        self.drew_image |= recording.outer_drew_image;
+        self.drew_image_on_page |= recording.outer_drew_image_on_page;
+        for (cells, outer) in self
+            .covered_cells
+            .iter_mut()
+            .zip(recording.outer_covered_cells)
+        {
+            *cells |= outer;
+        }
+        self.resolved_from_end = resolved_from_end.min(recording.outer_resolved_from_end);
+    }
+
+    /// A name looked up in a chain of `scopes` resolved in the one at
+    /// `index` — in none when `None`, as though in the last.
+    fn name_resolved(&mut self, scopes: usize, index: Option<usize>) {
+        let from_end = index.map_or(1, |index| scopes - index);
+        self.resolved_from_end = self.resolved_from_end.min(from_end);
+    }
+
+    /// The run [`Self::form_drawn`] makes of a form.
+    fn run_form(
+        &mut self,
+        id: ObjectId,
+        form: &'a lopdf::Stream,
+        invoker_resources: &[&'a lopdf::Dictionary],
+    ) {
         let outer_floor = self.stack_floor;
         self.save();
         let base = self.saved.len();
@@ -900,6 +1335,7 @@ impl<'a> ContentScanState<'a> {
         let doc = self.doc;
         let own = stream_resources(doc, form);
         let asked_the_invoker = Cell::new(false);
+        let resolved_from_end = Cell::new(usize::MAX);
         let masked = mask_strings_comments_and_inline_images(&content, &|name| {
             match own.and_then(|scope| colour_space_bound(doc, scope, name)) {
                 // Bound by the form's own resources, the space reads as
@@ -908,10 +1344,16 @@ impl<'a> ContentScanState<'a> {
                 Some(space) => components_of_colour_space(doc, space, 0),
                 None => {
                     asked_the_invoker.set(true);
-                    colour_space_components(doc, resources, name)
+                    let bound = resources.iter().enumerate().find_map(|(index, scope)| {
+                        colour_space_bound(doc, scope, name).map(|space| (index, space))
+                    });
+                    let from_end = bound.map_or(1, |(index, _)| resources.len() - index);
+                    resolved_from_end.set(resolved_from_end.get().min(from_end));
+                    bound.and_then(|(_, space)| components_of_colour_space(doc, space, 0))
                 }
             }
         });
+        self.resolved_from_end = self.resolved_from_end.min(resolved_from_end.get());
         let content = Rc::new(FormContent { content, masked });
         let bytes = content.content.len() + content.masked.len();
         if !asked_the_invoker.get()
@@ -1204,9 +1646,11 @@ fn scan_masked_content<'a>(
                 if let Some(name) = name_operand_before(ops, i, operand_floor) {
                     operand_floor = i;
                     if state.follow_do {
-                        match resolve_xobject(state.doc, resources, &name) {
-                            Some(XObjectDrawn::Image) => state.image_drawn(),
-                            Some(XObjectDrawn::Form(id, form)) => {
+                        let drawn = resolve_xobject(state.doc, resources, &name);
+                        state.name_resolved(resources.len(), drawn.as_ref().map(|(at, _)| *at));
+                        match drawn {
+                            Some((_, XObjectDrawn::Image)) => state.image_drawn(),
+                            Some((_, XObjectDrawn::Form(id, form))) => {
                                 state.form_drawn(id, form, resources)
                             }
                             None => {}
@@ -1395,6 +1839,9 @@ mod clip_tests;
 #[cfg(test)]
 #[path = "content_scan_fixtures.rs"]
 mod fixtures;
+#[cfg(test)]
+#[path = "content_scan_replay_tests.rs"]
+mod replay_tests;
 #[cfg(test)]
 #[path = "content_scan_tests.rs"]
 mod tests;

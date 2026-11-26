@@ -254,10 +254,68 @@ pub(super) fn executed(doc: &Document, page_id: ObjectId, streams: &[&str]) -> (
 }
 
 /// The scan's state after `streams` ran, in order, as the page's content.
+///
+/// Every scan through here is run three times — keeping no form runs;
+/// replaying them within the page; and replaying those a first scan of
+/// the page kept, as a later page sharing its forms would — and the
+/// tallies must agree: a replay adds what running the form adds. When the
+/// first scan kept a run, the second meets its form again under the same
+/// state, and must replay it.
 pub(super) fn executed_state<'a>(
     doc: &'a Document,
     page_id: ObjectId,
     streams: &[&str],
+) -> ContentScanState<'a> {
+    let plain = executed_state_with(doc, page_id, streams, FormRuns::none());
+    let mut first = executed_state_with(doc, page_id, streams, FormRuns::default());
+    let kept = std::mem::take(&mut first.form_runs);
+    let (kept_any, replays_before) = (kept.kept > 0, kept.replays);
+    let again = executed_state_with(doc, page_id, streams, kept);
+    assert!(
+        tallies(&first) == tallies(&plain),
+        "form runs replayed within the page changed its tallies"
+    );
+    assert!(
+        tallies(&again) == tallies(&plain),
+        "form runs replayed from an earlier scan changed the page's tallies"
+    );
+    assert!(
+        !kept_any || again.form_runs.replays > replays_before,
+        "a run the first scan kept was not replayed by the second"
+    );
+    plain
+}
+
+/// Everything a scan tallies, its image area by its bits.
+#[allow(clippy::type_complexity)]
+pub(super) fn tallies(
+    state: &ContentScanState<'_>,
+) -> (
+    ExecutedContent,
+    [u64; COVERAGE_GRID],
+    u64,
+    bool,
+    bool,
+    usize,
+    u32,
+) {
+    (
+        state.executed(),
+        state.covered_cells,
+        state.own_image_area.to_bits(),
+        state.drew_image,
+        state.incomplete,
+        state.form_invocations,
+        state.pending_clip_text_ops,
+    )
+}
+
+/// [`executed_state`] once, with the form runs given.
+pub(super) fn executed_state_with<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+    streams: &[&str],
+    form_runs: FormRuns<'a>,
 ) -> ContentScanState<'a> {
     let page_box = visible_page_box(doc, page_id).unwrap_or(PageBox::LETTER);
     let (own, ancestors) = doc.get_page_resources(page_id).unwrap();
@@ -270,6 +328,7 @@ pub(super) fn executed_state<'a>(
         )
         .collect();
     let mut state = ContentScanState::new(doc, page_box, true);
+    state.form_runs = form_runs;
     for stream in streams {
         scan_content_stream(
             stream.as_bytes(),

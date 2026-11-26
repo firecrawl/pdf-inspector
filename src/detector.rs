@@ -13,7 +13,7 @@ mod content_geometry;
 mod content_mask;
 mod content_resources;
 mod content_scan;
-use content_scan::ContentCounts;
+use content_scan::{ContentCounts, FormScans};
 
 /// PDF type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,10 +251,12 @@ pub(crate) fn detect_from_document(
     let mut pages_actually_sampled = 0u32;
     // Pages read whose form content ran past the scan's byte budget.
     let mut pages_past_form_budget = 0u32;
+    // The forms the pages share, read once for all of them.
+    let mut form_scans = FormScans::default();
 
     for page_num in &sample_indices {
         if let Some(&page_id) = pages.get(page_num) {
-            let analysis = analyze_page_content(doc, page_id);
+            let analysis = analyze_page_content_with(doc, page_id, &mut form_scans);
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} executed_text_ops={} hidden_text_ops={} images={} image_count={} template={} covering_image={} form_bytes={} form_bytes_exceeded={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -439,7 +441,7 @@ pub(crate) fn detect_from_document(
                     // Cache the fresh analysis so the reason-classification pass
                     // below sees the real signals (vector_text, etc.) instead of
                     // defaulting to "scanned".
-                    let a = analyze_page_content(doc, page_id);
+                    let a = analyze_page_content_with(doc, page_id, &mut form_scans);
                     analysis_cache.insert(page_num, a.clone());
                     a
                 } else {
@@ -493,7 +495,7 @@ pub(crate) fn detect_from_document(
                 continue;
             }
             if let Some(&page_id) = pages.get(&page_num) {
-                let analysis = analyze_page_content(doc, page_id);
+                let analysis = analyze_page_content_with(doc, page_id, &mut form_scans);
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
@@ -520,7 +522,8 @@ pub(crate) fn detect_from_document(
             Some(analysis) => page_ocr_reasons(analysis),
             None => match pages.get(&page_num) {
                 Some(&page_id) => {
-                    let executed = content_scan::page_executed_content(doc, page_id);
+                    let executed =
+                        content_scan::page_executed_content(doc, page_id, &mut form_scans);
                     if executed.form_bytes_exceeded {
                         pages_past_form_budget += 1;
                         log::debug!(
@@ -615,6 +618,7 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
 
 /// Page content analysis result
 #[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct PageAnalysis {
     text_operator_count: u32,
     /// Text-showing operators the page executes: in its own content and in
@@ -868,6 +872,16 @@ fn resolve_with_shadowing(
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
+    analyze_page_content_with(doc, page_id, &mut FormScans::default())
+}
+
+/// [`analyze_page_content`] reading the page's forms through
+/// `form_scans`, the document's: a form the pages share is read once.
+fn analyze_page_content_with<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+    form_scans: &mut FormScans<'a>,
+) -> PageAnalysis {
     let mut counts = ContentCounts::default();
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
@@ -887,8 +901,13 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // The page's content streams, read as one and followed through `Do`
     // (see `content_scan`), with the raw font names they use.
     let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-    let (executed, page_counts) =
-        content_scan::scan_page_content(doc, page_id, &mut all_unique_chars, &mut page_font_names);
+    let (executed, page_counts) = content_scan::scan_page_content(
+        doc,
+        page_id,
+        &mut all_unique_chars,
+        &mut page_font_names,
+        form_scans,
+    );
     counts.add(page_counts);
 
     // Resolve font names against the page's resource dictionaries,
@@ -917,6 +936,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
+                form_scans,
             ));
         }
         for resource_id in resource_ids {
@@ -929,6 +949,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
+                    form_scans,
                 ));
             }
         }
@@ -1781,6 +1802,7 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
+    form_scans: &mut FormScans<'_>,
 ) -> ContentCounts {
     let mut counts = ContentCounts::default();
 
@@ -1808,26 +1830,19 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream.
                     // Every form bound is counted here, invoked or not, as
                     // the text and font tallies always have been; what the
                     // page executes is followed from its own content, so
-                    // this scan follows no `Do`.
-                    let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
-                    let own_resources: Vec<&lopdf::Dictionary> =
-                        content_resources::stream_resources(doc, stream)
-                            .into_iter()
-                            .collect();
-                    counts.add(content_scan::scan_content_stream_alone(
-                        doc,
-                        &content,
-                        unique_chars,
-                        &mut xobj_font_names,
-                        &own_resources,
-                    ));
+                    // this scan follows no `Do`. What it finds is the
+                    // form's alone, read once for every page binding it.
+                    let walk = form_scans.form_walk(doc, obj_id, stream);
+                    counts.add(walk.counts);
+                    unique_chars.extend(&walk.unique_chars);
+                    // Its font names, resolved against the XObject's own
+                    // resource dict (P1 fix: scoped resolution, not global
+                    // name-based lookup).
+                    used_font_ids.extend(&walk.font_ids);
 
                     // Resolve the Form XObject's /Resources — handle both inline
                     // dicts and indirect references (P2 fix: indirect refs were
@@ -1843,9 +1858,6 @@ fn scan_xobjects_in_resources(
                     };
 
                     if let Some(res) = xobj_res {
-                        // Resolve font names against the XObject's own resource dict
-                        // (P1 fix: scoped resolution, not global name-based lookup)
-                        resolve_font_names_to_ids(doc, res, &xobj_font_names, used_font_ids);
                         // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
                         // Recurse into nested XObjects
@@ -1856,6 +1868,7 @@ fn scan_xobjects_in_resources(
                             unique_chars,
                             used_font_ids,
                             font_map,
+                            form_scans,
                         ));
                     }
                 }

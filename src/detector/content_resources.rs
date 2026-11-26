@@ -111,12 +111,14 @@ pub(super) enum XObjectDrawn<'a> {
     Form(ObjectId, &'a lopdf::Stream),
 }
 
+/// What a `Do` operand names, and the index in `resources` of the scope
+/// binding it.
 pub(super) fn resolve_xobject<'a>(
     doc: &'a Document,
     resources: &[&'a lopdf::Dictionary],
     name: &[u8],
-) -> Option<XObjectDrawn<'a>> {
-    for scope in resources {
+) -> Option<(usize, XObjectDrawn<'a>)> {
+    for (index, scope) in resources.iter().enumerate() {
         let xobjects = match scope.get(b"XObject").ok() {
             Some(Object::Dictionary(dict)) => dict,
             Some(Object::Reference(id)) => match doc.get_dictionary(*id) {
@@ -141,8 +143,8 @@ pub(super) fn resolve_xobject<'a>(
             _ => None,
         };
         return match subtype {
-            Some(b"Image") => Some(XObjectDrawn::Image),
-            Some(b"Form") => Some(XObjectDrawn::Form(id, stream)),
+            Some(b"Image") => Some((index, XObjectDrawn::Image)),
+            Some(b"Form") => Some((index, XObjectDrawn::Form(id, stream))),
             _ => None,
         };
     }
