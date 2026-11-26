@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::fonts::{resolve_array, resolve_dict};
 use super::get_number;
+use crate::text_utils::decode_pdf_text_string;
 
 /// Upper bound on the number of form-field nodes visited during a single
 /// `extract_form_fields` pass. A crafted PDF can chain thousands of distinct
@@ -306,7 +307,7 @@ pub(crate) fn walk_form_fields(
         .get(b"T")
         .ok()
         .and_then(|o| o.as_str().ok())
-        .map(|s| String::from_utf8_lossy(s).to_string())
+        .map(decode_pdf_text_string)
         .unwrap_or_default();
 
     let full_name = if parent_name.is_empty() {
@@ -379,7 +380,7 @@ pub(crate) fn walk_form_fields(
             // Text or Choice field — value is a string or array of strings
             match value {
                 Object::String(s, _) => {
-                    let s = String::from_utf8_lossy(s).to_string();
+                    let s = decode_pdf_text_string(s);
                     if s.is_empty() {
                         return;
                     }
@@ -390,7 +391,7 @@ pub(crate) fn walk_form_fields(
                         .iter()
                         .filter_map(|o| {
                             if let Object::String(s, _) = o {
-                                Some(String::from_utf8_lossy(s).to_string())
+                                Some(decode_pdf_text_string(s))
                             } else {
                                 None
                             }
@@ -519,6 +520,33 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].page, 2);
         assert_eq!(items[0].text, "customer: Alice");
+    }
+
+    #[test]
+    fn utf16be_field_name_and_value_are_decoded() {
+        let utf16be = |s: &str| {
+            let mut bytes = vec![0xFE, 0xFF];
+            bytes.extend(s.encode_utf16().flat_map(u16::to_be_bytes));
+            Object::String(bytes, lopdf::StringFormat::Hexadecimal)
+        };
+        let mut doc = Document::new();
+        let field_id = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => utf16be("straße"),
+            "V" => utf16be("Raiffeisenstraße 1"),
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(field_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let items = extract_form_fields(&doc, &HashMap::new());
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "straße: Raiffeisenstraße 1");
     }
 
     #[test]

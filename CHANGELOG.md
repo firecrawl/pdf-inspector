@@ -7,6 +7,15 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## Unreleased
+
+### Fixed
+
+- AcroForm field names and text or choice values are decoded as PDF text
+  strings, so a UTF-16BE value with the `FE FF` byte order mark reads as
+  text instead of its raw bytes with a NUL before every ASCII letter and
+  U+FFFD for the mark and each non-ASCII byte.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
