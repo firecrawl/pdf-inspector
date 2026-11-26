@@ -759,6 +759,7 @@ mod tests {
             is_cid: false,
             units_scale: 0.001,
             wmode: 0,
+            kashida_codes: Vec::new(),
         }
     }
 

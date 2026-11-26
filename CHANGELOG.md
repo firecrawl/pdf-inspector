@@ -7,6 +7,30 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Justified Arabic text from PDFs whose ToUnicode map reads the kashida
+  (tatweel) glyph as U+FFFD, as InDesign writes it, no longer shows a
+  replacement character for every stretch in a word (`الش���خصية` is now
+  `الشخصية`). A code of an Identity-H Type0 font is dropped from the text
+  only when its CMap reads at least eight Arabic letters and the glyph the
+  code selects in the font's own TrueType program is a flat stroke on the
+  baseline that spans its advance; any other U+FFFD entry still counts as a
+  decode failure. Pages that carried such characters are no longer flagged
+  for OCR because of them. The CMaps are not changed, so a ToUnicode stream
+  shared by several fonts reads right for each of them. The work is bounded:
+  the lowest 256 U+FFFD codes of at most 64 fonts per document are
+  measured, once each, in a program within the usual decompression bound.
+  Known limitations: only the primary ToUnicode map is read, not its
+  renumbered subset remap, and a ToUnicode stream written inline in the font
+  dictionary is not; a bare CFF program is not measured; a simple font whose
+  kashida glyph is named by a `/Differences` entry is not covered; the fast
+  page-detection mode does not apply it; a malformed string of an odd
+  number of bytes is read a byte at a time, so its kashidas are dropped only
+  when no byte is read and the string falls back to pairs.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use super::content_stream::{estimated_string_advance_ts, PendingSpace};
 use super::fonts::{
-    build_font_encodings, build_font_kinds, build_font_widths, build_type3_scales,
-    build_type3_y_flips, compute_string_width_ts, extract_text_from_operand,
+    add_kashida_codes, build_font_encodings, build_font_kinds, build_font_widths,
+    build_type3_scales, build_type3_y_flips, compute_string_width_ts, extract_text_from_operand,
     get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache, FontStyleCache,
 };
 use super::geometry::{
@@ -381,7 +381,8 @@ fn extract_form_xobject_text_inner(
         build_font_encodings(doc, &form_fonts, font_cmaps, style_cache);
 
     // Build font width info for the form
-    let font_widths = build_font_widths(doc, &form_fonts, style_cache);
+    let mut font_widths = build_font_widths(doc, &form_fonts, style_cache);
+    add_kashida_codes(&mut font_widths, doc, &form_fonts, font_cmaps, style_cache);
     let font_kinds = build_font_kinds(&form_fonts);
     let type3_scales = build_type3_scales(doc, &form_fonts);
     let type3_y_flips = build_type3_y_flips(doc, &form_fonts);

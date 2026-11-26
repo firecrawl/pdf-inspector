@@ -195,6 +195,57 @@ pub(crate) fn build_font_widths(
     widths
 }
 
+/// Give each Type0 font of `fonts` the codes that show kashidas its ToUnicode
+/// CMap reads as U+FFFD ([`crate::tounicode::kashida_codes`]), found once for
+/// each font identity of the document and not at all in the fast mode.
+pub(crate) fn add_kashida_codes(
+    widths: &mut PageFontWidths,
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    cmaps: &FontCMaps,
+    font_cache: &mut FontStyleCache,
+) {
+    if cmaps.is_fast() {
+        return;
+    }
+    for (font_name, font_dict) in fonts {
+        let Some(info) = widths.get_mut(String::from_utf8_lossy(font_name).as_ref()) else {
+            continue;
+        };
+        let Some(key) = crate::tounicode::kashida_key(font_dict, doc) else {
+            continue;
+        };
+        if !font_cache.kashida_codes.contains_key(&key) {
+            if font_cache.kashida_codes.len() >= crate::tounicode::MAX_KASHIDA_FONTS {
+                continue;
+            }
+            let codes = cmaps.get_by_obj(key.0).map_or_else(Vec::new, |entry| {
+                crate::tounicode::kashida_codes(&entry.primary, font_dict, doc)
+            });
+            font_cache.kashida_codes.insert(key, codes);
+        }
+        info.kashida_codes
+            .clone_from(&font_cache.kashida_codes[&key]);
+    }
+}
+
+/// `bytes`, a string of two-byte codes, without the codes in `kashidas`
+/// (sorted, as [`crate::tounicode::kashida_codes`] returns them). A last
+/// byte that is no pair is kept.
+fn without_kashidas(bytes: &[u8], kashidas: &[u16]) -> Vec<u8> {
+    bytes
+        .chunks(2)
+        .filter(|code| match code {
+            [high, low] => kashidas
+                .binary_search(&u16::from_be_bytes([*high, *low]))
+                .is_err(),
+            _ => true,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
 /// Whether each of `fonts` is composite, by its `/Subtype`
 /// (see [`PageFontKinds`]).
 pub(crate) fn build_font_kinds(
@@ -501,6 +552,7 @@ fn base14_fallback_widths(
         is_cid: false,
         units_scale: 0.001,
         wmode: 0,
+        kashida_codes: Vec::new(),
     })
 }
 
@@ -608,6 +660,7 @@ pub(crate) fn parse_simple_font_widths(
         is_cid: false,
         units_scale,
         wmode: 0,
+        kashida_codes: Vec::new(),
     })
 }
 
@@ -674,6 +727,7 @@ pub(crate) fn parse_type0_widths(
         is_cid: true,
         units_scale: 0.001, // CID fonts use standard 1000-unit system
         wmode,
+        kashida_codes: Vec::new(),
     })
 }
 
@@ -2143,6 +2197,10 @@ pub(crate) struct FontStyleCache {
     /// `type1_builtin_encoding`), `None` when it cannot be read, so a font
     /// shared across pages is parsed once.
     builtin_encodings_by_font_file: HashMap<ObjectId, Option<BuiltinEncoding>>,
+    /// The kashida codes of each font identity measured so far (see
+    /// `add_kashida_codes`); a document's first `MAX_KASHIDA_FONTS`
+    /// identities are measured, once.
+    kashida_codes: HashMap<crate::tounicode::KashidaKey, Vec<u16>>,
 }
 
 impl FontStyleCache {
@@ -2550,6 +2608,22 @@ pub(crate) fn extract_text_from_operand(
         .unwrap_or(current_font);
     let result = (|| -> Option<String> {
         if let Object::String(bytes, _) = obj {
+            // The kashidas of a justified line are no text.
+            let kashidas = font_widths
+                .get(current_font)
+                .map_or(&[][..], |info| info.kashida_codes.as_slice());
+            let unjustified;
+            // An odd-length string is read a byte at a time first, so its
+            // kashidas are dropped only where it is read in pairs (below).
+            let bytes = if kashidas.is_empty() || bytes.len() % 2 == 1 {
+                bytes.as_slice()
+            } else {
+                unjustified = without_kashidas(bytes, kashidas);
+                if unjustified.is_empty() && !bytes.is_empty() {
+                    return Some(String::new());
+                }
+                unjustified.as_slice()
+            };
             let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
                 // For single-byte CMaps, and for any CMap of a simple font,
                 // merge CMap + Differences at the byte level: try CMap first,
@@ -2791,6 +2865,34 @@ pub(crate) fn extract_text_from_operand(
                         unread_byte_stats = Some(byte_stats);
                     }
                 }
+                // An odd-length string no byte of which a CMap read is read
+                // in pairs here, its last byte left over: the pairs are
+                // those of the string from its start, and the kashidas
+                // among them are dropped as in an even string.
+                let paired;
+                let bytes = if bytes.len() % 2 == 1 && !kashidas.is_empty() {
+                    paired = without_kashidas(bytes, kashidas);
+                    if paired.len() == 1 && bytes.len() > 1 {
+                        // Only the last byte is left of the string, a code
+                        // no CMap read (the byte reading above found none),
+                        // so it is counted as unmapped; the pairs dropped
+                        // were no text and count for nothing.
+                        if unread_byte_stats.is_some() {
+                            cmap_decisions.record_coverage(
+                                font_label,
+                                CidDecodeStats {
+                                    codes: 1,
+                                    interpolated: 0,
+                                    unmapped: 1,
+                                },
+                            );
+                        }
+                        return Some(String::new());
+                    }
+                    paired.as_slice()
+                } else {
+                    bytes
+                };
                 // Each reading keeps the CMap it came through, so the one
                 // taken joins the characters of its codes by that CMap's own
                 // code boundaries (see `CidDecode::joined`), and carries its
@@ -3568,6 +3670,7 @@ mod tests {
                 is_cid: true,
                 units_scale: 0.001,
                 wmode: 0,
+                kashida_codes: Vec::new(),
             },
         );
         widths
@@ -4687,6 +4790,7 @@ mod tests {
             is_cid,
             units_scale: 0.001,
             wmode: 0,
+            kashida_codes: Vec::new(),
         }
     }
 
@@ -5590,7 +5694,7 @@ mod tests {
     /// bytes left as they are) and maps CIDs to glyphs through `cid_to_gid`
     /// as a CIDToGIDMap stream, or one to one without it. Returns the
     /// document, the ToUnicode object number and the page.
-    fn cid_font_doc(
+    pub(super) fn cid_font_doc(
         bfchar: &str,
         program: Vec<u8>,
         program_filter: Option<&[u8]>,
@@ -5599,12 +5703,13 @@ mod tests {
     ) -> (Document, u32, lopdf::ObjectId) {
         use lopdf::Stream;
         let mut doc = Document::with_version("1.5");
+        let count = bfchar.lines().filter(|line| line.starts_with('<')).count();
         let cmap = format!(
             "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
              /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
              /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
              1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
-             4 beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
+             {count} beginbfchar\n{bfchar}\nendbfchar\nendcmap\n\
              CMapName currentdict /CMap defineresource pop\nend\nend"
         );
         let tounicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
@@ -5707,7 +5812,7 @@ mod tests {
 
     /// [`decode_page_font_string`] through `font`, one of the fonts of
     /// `page_id`, all of which are read for their encodings.
-    fn decode_page_font_string_as(
+    pub(super) fn decode_page_font_string_as(
         doc: &Document,
         font: &str,
         tounicode_obj: u32,
@@ -5715,6 +5820,17 @@ mod tests {
         is_cid: bool,
         bytes: &[u8],
     ) -> String {
+        decode_page_font_string_with_coverage(doc, font, tounicode_obj, page_id, is_cid, bytes).0
+    }
+
+    pub(super) fn decode_page_font_string_with_coverage(
+        doc: &Document,
+        font: &str,
+        tounicode_obj: u32,
+        page_id: lopdf::ObjectId,
+        is_cid: bool,
+        bytes: &[u8],
+    ) -> (String, PendingCoverage) {
         let cmaps = FontCMaps::from_doc(doc);
         let fonts = doc.get_page_fonts(page_id).unwrap();
         let (font_encodings, _) =
@@ -5727,6 +5843,14 @@ mod tests {
         font_tounicode_refs.insert(font.to_string(), tounicode_obj);
         let mut font_widths: PageFontWidths = HashMap::new();
         font_widths.insert(font.to_string(), make_font_info(&[], 1000, is_cid));
+        add_kashida_codes(
+            &mut font_widths,
+            doc,
+            &fonts,
+            &cmaps,
+            &mut FontStyleCache::new(),
+        );
+        let mut decisions = CMapDecisionCache::new();
         let (text, _) = extract_text_from_operand(
             &Object::String(bytes.to_vec(), lopdf::StringFormat::Hexadecimal),
             font,
@@ -5736,12 +5860,12 @@ mod tests {
             &HashMap::new(),
             &font_encodings,
             &encoding_cache,
-            &mut CMapDecisionCache::new(),
+            &mut decisions,
             &font_widths,
             &build_font_kinds(&fonts),
         )
         .expect("text decoded");
-        text
+        (text, decisions.take_run_coverage())
     }
 
     /// An odd-length string through a Type0 font is read byte by byte
@@ -7137,6 +7261,10 @@ end",
 #[cfg(test)]
 #[path = "stale_cmap_tests.rs"]
 mod stale_cmap_tests;
+
+#[cfg(test)]
+#[path = "kashida_tests.rs"]
+mod kashida_tests;
 
 #[cfg(test)]
 #[path = "blank_glyph_tests.rs"]
