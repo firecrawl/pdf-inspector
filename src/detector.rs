@@ -1839,6 +1839,10 @@ fn scan_xobjects_in_resources(
                     let walk = form_scans.form_walk(doc, obj_id, stream);
                     counts.add(walk.counts);
                     unique_chars.extend(&walk.unique_chars);
+                    // Its font names, resolved against the XObject's own
+                    // resource dict (P1 fix: scoped resolution, not global
+                    // name-based lookup).
+                    used_font_ids.extend(&walk.font_ids);
 
                     // Resolve the Form XObject's /Resources — handle both inline
                     // dicts and indirect references (P2 fix: indirect refs were
@@ -1854,9 +1858,6 @@ fn scan_xobjects_in_resources(
                     };
 
                     if let Some(res) = xobj_res {
-                        // Resolve font names against the XObject's own resource dict
-                        // (P1 fix: scoped resolution, not global name-based lookup)
-                        resolve_font_names_to_ids(doc, res, &walk.font_names, used_font_ids);
                         // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
                         // Recurse into nested XObjects

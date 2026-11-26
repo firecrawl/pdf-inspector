@@ -18,7 +18,7 @@ use super::content_resources::{
 };
 use super::{
     collect_text_chars_before, extract_font_name_before_tf, is_pdf_whitespace,
-    preceding_operand_closer,
+    preceding_operand_closer, resolve_font_names_to_ids,
 };
 use crate::extractor::{visible_page_box, PageBox};
 use lopdf::{Document, Object, ObjectId};
@@ -288,7 +288,9 @@ const FORM_WALKS_KEPT_MAX: usize = 4_096;
 pub(super) struct FormWalk {
     pub(super) counts: ContentCounts,
     pub(super) unique_chars: HashSet<u8>,
-    pub(super) font_names: HashSet<Vec<u8>>,
+    /// The fonts its `Tf` operators name, resolved in its own resources:
+    /// no more than those bind, however many names the content uses.
+    pub(super) font_ids: HashSet<ObjectId>,
 }
 
 impl FormWalk {
@@ -296,15 +298,24 @@ impl FormWalk {
         let content = form
             .decompressed_content()
             .unwrap_or_else(|_| form.content.clone());
-        let own: Vec<&lopdf::Dictionary> = stream_resources(doc, form).into_iter().collect();
+        let own = stream_resources(doc, form);
         let mut unique_chars = HashSet::new();
         let mut font_names = HashSet::new();
-        let counts =
-            scan_content_stream_alone(doc, &content, &mut unique_chars, &mut font_names, &own);
+        let counts = scan_content_stream_alone(
+            doc,
+            &content,
+            &mut unique_chars,
+            &mut font_names,
+            &own.into_iter().collect::<Vec<_>>(),
+        );
+        let mut font_ids = HashSet::new();
+        if let Some(own) = own {
+            resolve_font_names_to_ids(doc, own, &font_names, &mut font_ids);
+        }
         Self {
             counts,
             unique_chars,
-            font_names,
+            font_ids,
         }
     }
 }
