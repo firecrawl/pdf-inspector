@@ -7,6 +7,51 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Justified Arabic text from PDFs whose ToUnicode map reads the kashida
+  (tatweel) glyph as U+FFFD, as InDesign writes it, no longer shows a
+  replacement character for every stretch in a word (`الش���خصية` is now
+  `الشخصية`). A code of an Identity-H Type0 font is dropped from the text
+  only when its CMap reads at least eight Arabic letters and the glyph the
+  code selects in the font's own TrueType program is a flat stroke on the
+  baseline that spans its advance; any other U+FFFD entry still counts as a
+  decode failure. Pages that carried such characters are no longer flagged
+  for OCR because of them. The CMaps are not changed, so a ToUnicode stream
+  shared by several fonts reads right for each of them. The work is bounded:
+  the lowest 256 U+FFFD codes of at most 64 fonts per document are
+  measured, once each, in a program within the usual decompression bound.
+  Known limitations: only the primary ToUnicode map is read, not its
+  renumbered subset remap, and a ToUnicode stream written inline in the font
+  dictionary is not; a bare CFF program is not measured; the fast
+  page-detection mode does not apply it; a malformed string of an odd
+  number of bytes is read a byte at a time, so its kashidas are dropped only
+  when no byte is read and the string falls back to pairs.
+- Arabic text set in a simple (non-Type0) font whose ToUnicode map reads a
+  code as U+FFFD, as InDesign writes the dotted first piece of a letter it
+  split over two glyphs, no longer shows a Latin letter for that code
+  (`الûشخüصية` is now `الشخصية`, related to
+  [firecrawl/firecrawl#5931](https://github.com/firecrawl/firecrawl/issues/5931)).
+  The code is read as no text, and the font's `/Differences` names, fallback
+  CMap and printable-byte guess no longer read it, only when the font's
+  ToUnicode map reads at least eight of the 256 byte codes as Arabic letters
+  (counted as the decoder reads them, a direct entry over a range) and the
+  entry is U+FFFD alone; fonts without Arabic letters and every other entry
+  read as before. A code the font gives as a space (`/space` in its
+  `/Differences`, a glyph with no outline and an advance, or the standard
+  space code 0x20 where neither says otherwise) keeps its space.
+  A run holding such a code is decided: the original bytes are not read
+  again by the encoding, and a run of nothing but such codes adds neither an
+  item nor a word space. The Arabic verdict is found once for each ToUnicode
+  object of a page, not for each string.
+  Known limitations: only the primary ToUnicode map is consulted, the first
+  piece's glyph is not measured, so a U+FFFD entry of an Arabic simple font
+  that shows a real letter is dropped as well, and a font whose ToUnicode
+  stream is inline (no object) is measured once for each string that shows
+  such a code (at most 256 lookups), not for each code.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.

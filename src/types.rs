@@ -183,6 +183,10 @@ pub(crate) struct FontWidthInfo {
     pub(crate) units_scale: f32,
     /// Writing mode: 0 = horizontal (default), 1 = vertical
     pub(crate) wmode: u8,
+    /// The codes of a Type0 font that show kashidas (justification strokes)
+    /// its ToUnicode CMap reads as U+FFFD; they are no text and decode to
+    /// nothing (see `crate::tounicode::kashida_codes`).
+    pub(crate) kashida_codes: Vec<u16>,
 }
 
 /// Glyphs a width table has to carry, all sharing one advance, before it

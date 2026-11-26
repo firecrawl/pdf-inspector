@@ -359,17 +359,7 @@ fn blank_cid_glyph_spaces(
         return Vec::new();
     };
     let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
-    // The glyph a CID selects: through the charset of a CID-keyed CFF
-    // program; else through the CIDToGIDMap, when the map has one for it —
-    // a CID past the map's end, or sent to glyph 0, has no glyph of its
-    // own, and its code stays what the CMap says of it; else the CID itself.
-    let glyph_of = |cid: u16| -> Option<u16> {
-        match (&glyphs.charset, cid_to_gid.as_ref()) {
-            (Some(by_cid), _) => by_cid.get(&cid).copied(),
-            (None, None) => Some(cid),
-            (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
-        }
-    };
+    let glyph_of = |cid: u16| glyphs.glyph_of(cid_to_gid.as_deref(), cid);
     let mut with_glyph = 0usize;
     let blanks: Vec<(u16, String)> = codes
         .iter()
@@ -389,6 +379,120 @@ fn blank_cid_glyph_spaces(
         return Vec::new();
     }
     blanks
+}
+
+/// Whether `ch` is a letter of the Arabic script: alphabetic, so not a digit
+/// or a punctuation mark of one of its blocks.
+fn is_arabic_char(ch: char) -> bool {
+    ch.is_alphabetic()
+        && ARABIC_BLOCKS
+            .iter()
+            .any(|block| block.contains(&u32::from(ch)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`ToUnicodeCMap::reads_arabic_bytes`] ran on this thread.
+    pub(crate) static ARABIC_BYTE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The fewest Arabic letters a CMap reads for it to be an Arabic font's.
+const ARABIC_CMAP_MIN_ENTRIES: usize = 8;
+/// The Unicode blocks of the Arabic script: Arabic, Supplement, Extended-B
+/// and -A, Presentation Forms-A and -B, Extended-C and the Mathematical
+/// Alphabetic Symbols.
+const ARABIC_BLOCKS: [std::ops::RangeInclusive<u32>; 7] = [
+    0x0600..=0x06FF,
+    0x0750..=0x077F,
+    0x0870..=0x08FF,
+    0xFB50..=0xFDFF,
+    0xFE70..=0xFEFF,
+    0x10EC0..=0x10EFF,
+    0x1EE00..=0x1EEFF,
+];
+/// How far below the baseline a kashida glyph may reach, in percent of an em.
+const KASHIDA_MAX_BELOW_BASELINE_PERCENT: i32 = 3;
+/// How high a kashida glyph may rise above the baseline, in percent of an em.
+const KASHIDA_MAX_HEIGHT_PERCENT: i32 = 20;
+/// The least width of a kashida glyph, in percent of an em.
+const KASHIDA_MIN_WIDTH_PERCENT: i32 = 10;
+/// The most codes of one font that are measured. A font's kashidas are a
+/// handful; the lowest codes that read U+FFFD are the ones looked at.
+pub(crate) const MAX_KASHIDA_CANDIDATES: usize = 256;
+/// The most fonts of a document that are measured.
+pub(crate) const MAX_KASHIDA_FONTS: usize = 64;
+
+/// What decides which codes of a font are kashidas: its ToUnicode stream,
+/// its font program and its CIDToGIDMap (`None` for the identity).
+pub(crate) type KashidaKey = (u32, ObjectId, Option<ObjectId>);
+
+/// The [`KashidaKey`] of an Identity-H or Identity-V Type0 font with an
+/// embedded program and a ToUnicode stream; `None` for any other font.
+pub(crate) fn kashida_key(font_dict: &lopdf::Dictionary, doc: &Document) -> Option<KashidaKey> {
+    let to_unicode = font_dict.get(b"ToUnicode").ok()?.as_reference().ok()?;
+    let cid_font = identity_type0_descendant(font_dict, doc)?;
+    let program = font_program_ref(cid_font, doc)?;
+    let cid_to_gid = match cid_font.get(b"CIDToGIDMap").ok() {
+        None => None,
+        Some(Object::Name(name)) if name.as_slice() == b"Identity" => None,
+        Some(Object::Reference(map)) => Some(*map),
+        Some(_) => return None,
+    };
+    Some((to_unicode.0, program, cid_to_gid))
+}
+
+/// The codes of a Type0 font that show kashidas though `cmap`, its ToUnicode
+/// CMap, reads them as U+FFFD.
+///
+/// A justified Arabic line is stretched with kashida (tatweel) glyphs, and
+/// some producers (InDesign) give that glyph the destination U+FFFD, so
+/// every stretch shows up as a replacement character in the middle of a
+/// word. A kashida is no part of the text, so the font reads such a code as
+/// nothing. A code is one when the font's CMap reads at least
+/// [`ARABIC_CMAP_MIN_ENTRIES`] Arabic letters (the glyphs of a Latin font are
+/// not measured), reads the code as U+FFFD, and the glyph the code selects in
+/// the font's own program, through its own CIDToGIDMap, is a kashida
+/// ([`ProgramGlyphs::is_kashida`]). `cmap` is not changed: the stream is
+/// shared by fonts whose glyphs for a code can differ.
+///
+/// The work is bounded: the CMap is walked by its entries, not its code
+/// space, at most [`MAX_KASHIDA_CANDIDATES`] codes are measured, each glyph
+/// once, in a program that is not decompressed past the bound every
+/// font reader keeps ([`crate::MAX_STREAM_DECOMPRESSED_BYTES`]).
+pub(crate) fn kashida_codes(
+    cmap: &ToUnicodeCMap,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Vec<u16> {
+    let candidates = cmap.replacement_codes(MAX_KASHIDA_CANDIDATES);
+    if candidates.is_empty() || !cmap.reads_arabic_letters() {
+        return Vec::new();
+    }
+    let measured = || -> Option<Vec<u16>> {
+        let cid_font = identity_type0_descendant(font_dict, doc)?;
+        let program = program_bytes(
+            font_program_stream(cid_font, doc)?,
+            Some(crate::MAX_STREAM_DECOMPRESSED_BYTES),
+        )?;
+        let glyphs = ProgramGlyphs::parse(&program)?;
+        let cid_to_gid = get_cid_to_gid_map(cid_font, doc);
+        let mut verdicts: HashMap<u16, bool> = HashMap::new();
+        Some(
+            candidates
+                .into_iter()
+                .filter(|&code| {
+                    glyphs
+                        .glyph_of(cid_to_gid.as_deref(), code)
+                        .is_some_and(|gid| {
+                            *verdicts
+                                .entry(gid)
+                                .or_insert_with(|| glyphs.is_kashida(gid))
+                        })
+                })
+                .collect(),
+        )
+    };
+    measured().unwrap_or_default()
 }
 
 /// The glyphs of a CIDFont's embedded program, as far as a blank among
@@ -428,6 +532,45 @@ impl<'a> ProgramGlyphs<'a> {
             .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
             .map(|cff| cff_cid_to_gid(&cff));
         Some(Self { outlines, charset })
+    }
+
+    /// The glyph a CID selects: through the charset of a CID-keyed CFF
+    /// program; else through the CIDToGIDMap, when the map has one for it —
+    /// a CID past the map's end, or sent to glyph 0, has no glyph of its
+    /// own, and its code stays what the CMap says of it; else the CID itself.
+    fn glyph_of(&self, cid_to_gid: Option<&[u16]>, cid: u16) -> Option<u16> {
+        match (&self.charset, cid_to_gid) {
+            (Some(by_cid), _) => by_cid.get(&cid).copied(),
+            (None, None) => Some(cid),
+            (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
+        }
+    }
+
+    /// Whether glyph `gid` is a kashida (tatweel): a flat stroke on the
+    /// baseline that reaches both edges of its advance, so that it joins the
+    /// letters on either side. Only an sfnt's glyphs are measured.
+    fn is_kashida(&self, gid: u16) -> bool {
+        let Outlines::Sfnt(face) = &self.outlines else {
+            return false;
+        };
+        let glyph = ttf_parser::GlyphId(gid);
+        let (Some(bbox), Some(advance)) = (
+            face.glyph_bounding_box(glyph),
+            face.glyph_hor_advance(glyph),
+        ) else {
+            return false;
+        };
+        // In i32: the spread of i16 coordinates can exceed an i16.
+        let em = i32::from(face.units_per_em());
+        let width = i32::from(bbox.x_max) - i32::from(bbox.x_min);
+        let height = i32::from(bbox.y_max) - i32::from(bbox.y_min);
+        advance > 0
+            && bbox.x_min <= 0
+            && i32::from(bbox.x_max) >= i32::from(advance)
+            && i32::from(bbox.y_min) * 100 >= -KASHIDA_MAX_BELOW_BASELINE_PERCENT * em
+            && i32::from(bbox.y_max) * 100 <= KASHIDA_MAX_HEIGHT_PERCENT * em
+            && width * 100 >= KASHIDA_MIN_WIDTH_PERCENT * em
+            && width > height
     }
 
     /// Whether the program has a glyph at `gid`: an index below its glyph
@@ -500,15 +643,22 @@ fn font_program_stream<'a>(
     font: &'a lopdf::Dictionary,
     doc: &'a Document,
 ) -> Option<&'a lopdf::Stream> {
+    doc.get_object(font_program_ref(font, doc)?)
+        .ok()?
+        .as_stream()
+        .ok()
+}
+
+/// The object id of the program [`font_program_stream`] reads.
+fn font_program_ref(font: &lopdf::Dictionary, doc: &Document) -> Option<ObjectId> {
     let descriptor = match font.get(b"FontDescriptor").ok()? {
         Object::Reference(r) => doc.get_dictionary(*r).ok()?,
         Object::Dictionary(d) => d,
         _ => return None,
     };
-    let font_file = [&b"FontFile2"[..], &b"FontFile3"[..]]
+    [&b"FontFile2"[..], &b"FontFile3"[..]]
         .into_iter()
-        .find_map(|key| descriptor.get(key).ok().and_then(|o| o.as_reference().ok()))?;
-    doc.get_object(font_file).ok()?.as_stream().ok()
+        .find_map(|key| descriptor.get(key).ok().and_then(|o| o.as_reference().ok()))
 }
 
 /// The bytes of a program's `stream`, decompressed — or as the stream holds
@@ -1172,6 +1322,90 @@ impl ToUnicodeCMap {
         codes.into_iter().collect()
     }
 
+    /// The `max` lowest codes whose effective destination is U+FFFD alone:
+    /// a direct entry, or the code a range reaches U+FFFD at (the range's
+    /// base need not be U+FFFD) when no direct entry or other range
+    /// overrides it, as [`Self::destination`] resolves them. Only the
+    /// entries are walked, not the code space.
+    pub(crate) fn replacement_codes(&self, max: usize) -> Vec<u16> {
+        let mut codes: Vec<u16> = self
+            .char_map
+            .iter()
+            .filter(|(_, text)| text.as_str() == "\u{FFFD}")
+            .map(|(&code, _)| code)
+            .collect();
+        for &(start, end, base) in &self.ranges {
+            let reached = 0xFFFDu32
+                .checked_sub(base)
+                .and_then(|offset| u16::try_from(u32::from(start) + offset).ok())
+                .filter(|&code| start <= code && code <= end);
+            // A direct entry or another range may read the code otherwise.
+            codes.extend(reached.filter(|&code| self.reads_as_replacement(code)));
+        }
+        codes.sort_unstable();
+        codes.dedup();
+        codes.truncate(max);
+        codes
+    }
+
+    /// Whether the effective destination of `code`, the one the decoder
+    /// uses ([`Self::destination`]), is U+FFFD alone.
+    fn reads_as_replacement(&self, code: u16) -> bool {
+        self.destination(code).as_deref() == Some("\u{FFFD}")
+    }
+
+    /// Whether the CMap reads at least [`ARABIC_CMAP_MIN_ENTRIES`] codes as
+    /// Arabic letters, counted over its entries: a direct entry by its first
+    /// character, a range whose base is an Arabic letter by its length less
+    /// the codes a direct entry overrides (those count by the entry).
+    pub(crate) fn reads_arabic_letters(&self) -> bool {
+        let is_arabic = |text: &String| text.chars().next().is_some_and(is_arabic_char);
+        let arabic_range =
+            |&&(_, _, base): &&(u16, u16, u32)| char::from_u32(base).is_some_and(is_arabic_char);
+        let direct = self
+            .char_map
+            .values()
+            .filter(|text| is_arabic(text))
+            .count();
+        let ranged = self
+            .ranges
+            .iter()
+            .filter(arabic_range)
+            .map(|&(start, end, _)| usize::from(end.saturating_sub(start)) + 1)
+            .fold(0usize, usize::saturating_add);
+        // The range a code reads through, found as `destination` finds it.
+        let overridden = self
+            .char_map
+            .keys()
+            .filter(|&&code| {
+                self.range_of(code)
+                    .is_some_and(|range| arabic_range(&range))
+            })
+            .count();
+        direct.saturating_add(ranged.saturating_sub(overridden)) >= ARABIC_CMAP_MIN_ENTRIES
+    }
+
+    /// Whether the codes of a byte, 0 to 255, read as at least
+    /// [`ARABIC_CMAP_MIN_ENTRIES`] Arabic letters as the decoder reads them
+    /// ([`Self::lookup_code`]): a direct entry overrides a range, and each
+    /// code counts by its own destination. This decides what a simple font
+    /// shows, so it counts effective readings; the work is bounded by the
+    /// 256 codes, whatever the size of the CMap.
+    pub(crate) fn reads_arabic_bytes(&self) -> bool {
+        #[cfg(test)]
+        ARABIC_BYTE_SCANS.with(|scans| scans.set(scans.get() + 1));
+        (0..=0xFFu16)
+            .filter(|&code| {
+                matches!(
+                    self.lookup_code(code),
+                    CodeMapping::Text(text) if text.chars().next().is_some_and(is_arabic_char)
+                )
+            })
+            .take(ARABIC_CMAP_MIN_ENTRIES)
+            .count()
+            >= ARABIC_CMAP_MIN_ENTRIES
+    }
+
     /// Give `codes` — control destinations of this CMap — the text `source`
     /// has for them: the font's own reading of the same codes. Every other
     /// entry is left alone, and a code `source` cannot read stays a
@@ -1195,35 +1429,29 @@ impl ToUnicodeCMap {
             return Some(s.clone());
         }
 
-        // Binary search through sorted ranges
+        let &(start, _, base) = self.range_of(cid)?;
+        char::from_u32(base + u32::from(cid - start)).map(|c| c.to_string())
+    }
+
+    /// The range `cid` is read through, the one [`Self::destination`] uses
+    /// when no direct entry holds the code: of the sorted ranges, the one
+    /// at the position a bisection for the code ends at, else the one before
+    /// it (a range that starts before the code), whichever covers the code
+    /// and has a character for it. Every reading of a range goes through
+    /// here, so two ranges that share a start are never read differently.
+    fn range_of(&self, cid: u16) -> Option<&(u16, u16, u32)> {
         let idx = self
             .ranges
             .binary_search_by(|&(start, _, _)| start.cmp(&cid))
             .unwrap_or_else(|i| i);
-
-        // Check the range at idx (where start == cid)
-        if idx < self.ranges.len() {
-            let (start, end, base) = self.ranges[idx];
-            if cid >= start && cid <= end {
-                let unicode = base + (cid - start) as u32;
-                if let Some(c) = char::from_u32(unicode) {
-                    return Some(c.to_string());
-                }
-            }
-        }
-
-        // Check the range before idx (cid may fall within a range that starts before it)
-        if idx > 0 {
-            let (start, end, base) = self.ranges[idx - 1];
-            if cid >= start && cid <= end {
-                let unicode = base + (cid - start) as u32;
-                if let Some(c) = char::from_u32(unicode) {
-                    return Some(c.to_string());
-                }
-            }
-        }
-
-        None
+        let at = |slot: usize| {
+            self.ranges.get(slot).filter(|&&(start, end, base)| {
+                cid >= start
+                    && cid <= end
+                    && char::from_u32(base + u32::from(cid - start)).is_some()
+            })
+        };
+        at(idx).or_else(|| idx.checked_sub(1).and_then(at))
     }
 
     /// Per-byte CMap lookup without Latin-1 fallback.
@@ -3227,6 +3455,9 @@ fn build_cmap_from_cid_system_info(
 pub struct FontCMaps {
     /// Map of ToUnicode object number to CMap
     by_obj_num: HashMap<u32, CMapEntry>,
+    /// Whether the collection skipped what reads font programs (see
+    /// [`FontCMaps::from_doc_pages_fast`]).
+    fast: bool,
 }
 
 /// Primary CMap plus optional alternative variants.
@@ -3288,7 +3519,10 @@ impl FontCMaps {
             }
         }
 
-        FontCMaps { by_obj_num }
+        FontCMaps {
+            by_obj_num,
+            fast: skip_truetype_fallback,
+        }
     }
 
     /// Parse ToUnicode CMaps from a set of font dictionaries.
@@ -3743,6 +3977,11 @@ impl FontCMaps {
                 Self::walk_xobject_fonts(form_resources, doc, by_obj_num, visited);
             }
         }
+    }
+
+    /// Whether the collection was the fast one, which reads no font programs.
+    pub(crate) fn is_fast(&self) -> bool {
+        self.fast
     }
 
     /// Get a CMap by ToUnicode object number
