@@ -11,15 +11,11 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
-- A simple font's ToUnicode CMap of fewer than ten entries keeps its say
-  for the codes the embedded program does not read. Such a CMap yields to
-  the program's own reading, and its entries were then dropped, so a code
-  whose glyph the program does not name read as its byte value: a
-  heading set by macOS Quartz in a small subset of Times New Roman Bold
-  read `CÔNG TY` as `CÔ!G TY` and `phẩm` as `ph'm`. The CMap's entry is
-  now read before the base encoding, an unreadable `/Differences` name
-  and that guess, and a code it maps to a control character
-  reads as U+FFFD.
+- A simple font's sparse ToUnicode CMap supplies mapped characters when
+  the embedded font has no readable glyph name, while readable glyph names
+  remain in use. For mapped codes, it takes precedence over a base encoding
+  and an unreadable `/Differences` name; mapped control destinations read
+  as U+FFFD.
 
 ## [1.27.1] - 2026-11-24
 
