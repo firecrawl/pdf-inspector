@@ -11,6 +11,12 @@ version and date. Earlier releases are described in their
 
 Changes since 1.27.0.
 
+### Added
+
+- `raster_coverage_by_page` in Rust and Python results: approximate drawn-image
+  coverage for pages analyzed by the selected scan strategy, independent of
+  page classification and OCR recommendations.
+
 ### Fixed
 
 - `extract_math_latex_in_regions_mem` reads TeX math-italic and symbol
