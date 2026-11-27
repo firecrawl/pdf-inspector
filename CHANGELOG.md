@@ -7,6 +7,14 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- A sparse ToUnicode CMap fills gaps in a simple font's embedded glyph
+  names. The regression example decodes to `coee`, then to `xoee` when
+  the embedded font names the first glyph `x`.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.
