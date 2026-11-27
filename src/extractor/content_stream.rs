@@ -37,7 +37,7 @@ use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 /// Some PDF generators (e.g. PD4ML) embed comments in content streams that
 /// confuse lopdf's `Content::decode` parser.  Comments inside string literals
 /// (parentheses) are NOT stripped — only top-level comments.
-fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
+pub(crate) fn strip_pdf_comments(data: &[u8]) -> Vec<u8> {
     // Quick check: if no '%' present, return as-is (common case)
     if !data.contains(&b'%') {
         return data.to_vec();

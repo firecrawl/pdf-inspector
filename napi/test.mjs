@@ -13,6 +13,7 @@ import {
   extractStructureElements,
   extractTextInRegions,
   extractTablesInRegions,
+  extractMathLatexInRegions,
   detectVectorGridInRegion,
   extractPagesMarkdown,
   extractPagesMarkdownAsync,
@@ -199,6 +200,35 @@ assert.equal(regionResults[0].regions.length, 1);
 assert.equal(typeof regionResults[0].regions[0].text, 'string');
 assert.equal(typeof regionResults[0].regions[0].needsOcr, 'boolean');
 console.log('  extractTextInRegions: OK');
+
+// --- extractMathLatexInRegions ---
+console.log('Testing extractMathLatexInRegions...');
+const mathResults = extractMathLatexInRegions(
+  fixture,
+  [{ page: 0, regions: [[0, 0, 600, 100], [0, 0, 1, 1]] }],
+  { frame: 'display' },
+);
+assert.equal(mathResults.length, 1);
+assert.equal(mathResults[0].page, 0);
+assert.equal(mathResults[0].regions.length, 2);
+for (const region of mathResults[0].regions) {
+  assert.ok(['pass', 'no_glyphs', 'invisible', 'unmapped', 'non_math_fonts'].includes(region.gate));
+  assert.equal(typeof region.latex, 'string');
+  assert.equal(typeof region.glyphs, 'number');
+}
+assert.equal(mathResults[0].regions[1].gate, 'no_glyphs');
+assert.equal(mathResults[0].regions[1].latex, '');
+assert.throws(() => extractMathLatexInRegions(fixture, [], { frame: 'page' }), /unknown frame "page"/);
+// x^2 + y_i set in TeX math fonts (tests/math_latex.rs writes the fixture).
+const mathFixture = readFileSync('../tests/fixtures/math_scripts.pdf');
+const [scripts] = extractMathLatexInRegions(
+  mathFixture,
+  [{ page: 0, regions: [[95, 88, 140, 106], [300, 200, 350, 220]] }],
+  { frame: 'display', boldWeightThreshold: 50 },
+);
+assert.deepEqual(scripts.regions[0], { latex: 'x^2+y_i', gate: 'pass', glyphs: 5 });
+assert.deepEqual(scripts.regions[1], { latex: '', gate: 'no_glyphs', glyphs: 0 });
+console.log('  extractMathLatexInRegions: OK');
 
 // --- coordinate frame: positions and regions share the visible page box ---
 console.log('Testing visible page box coordinate frame...');
