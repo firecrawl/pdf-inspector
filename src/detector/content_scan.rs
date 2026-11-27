@@ -127,6 +127,24 @@ fn resource_chain<'a>(
         .collect()
 }
 
+#[cfg(not(test))]
+fn page_content_bytes_budget() -> usize {
+    crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES
+}
+
+#[cfg(test)]
+fn page_content_bytes_budget() -> usize {
+    PAGE_CONTENT_BYTES_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static PAGE_CONTENT_BYTES_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The scan of the page's content streams, followed through `Do`, and
 /// the streams' own counts.
 fn scan_page<'a>(
@@ -143,11 +161,14 @@ fn scan_page<'a>(
         .unwrap_or_default();
     let mut state = ContentScanState::new(doc, page_box, true);
     let mut counts = ContentCounts::default();
+    let mut remaining_bytes = page_content_bytes_budget();
     for content_id in doc.get_page_contents(page_id) {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = stream
-                .decompressed_content()
-                .unwrap_or_else(|_| stream.content.clone());
+            let Some(content) = decoded_within(stream, remaining_bytes) else {
+                state.incomplete = true;
+                break;
+            };
+            remaining_bytes = remaining_bytes.saturating_sub(content.len());
             counts.add(scan_content_stream(
                 &content,
                 unique_chars,

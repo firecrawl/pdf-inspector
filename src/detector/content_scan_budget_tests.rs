@@ -238,3 +238,111 @@ fn a_form_past_the_budget_is_refused_before_it_is_decoded() {
         assert_eq!(state.executed_form_bytes, cell.len());
     }
 }
+
+/// The page-content byte budget set for the test's thread, restored
+/// when dropped.
+struct PageContentBytesBudget(Option<usize>);
+
+impl PageContentBytesBudget {
+    fn set(bytes: usize) -> Self {
+        Self(PAGE_CONTENT_BYTES_OVERRIDE.with(|budget| budget.replace(Some(bytes))))
+    }
+}
+
+impl Drop for PageContentBytesBudget {
+    fn drop(&mut self) {
+        PAGE_CONTENT_BYTES_OVERRIDE.with(|budget| budget.set(self.0));
+    }
+}
+
+/// A page whose content streams inflate past the decompression budget is
+/// marked incomplete and the remaining streams go unread; within the
+/// budget the content is read and counted in full.
+#[test]
+fn page_content_decompression_stays_within_the_byte_budget() {
+    let text = "BT /F1 12 Tf 100 700 Td (Hello World) Tj ET\n";
+    let padding = "% a long comment line to make stream compress well\n".repeat(20);
+    let content = format!("{text}{padding}");
+    let (mut doc, page_id, content_id) = synthetic_page(false, false, &[]);
+    set_page_content(&mut doc, content_id, &content);
+
+    let stream = match doc.objects.get_mut(&content_id) {
+        Some(Object::Stream(s)) => s,
+        _ => unreachable!(),
+    };
+    stream.compress().unwrap();
+    assert!(stream.content.len() < content.len());
+
+    // Below the uncompressed size: stream exceeds budget and is refused.
+    {
+        let _budget = PageContentBytesBudget::set(content.len() - 1);
+        let (state, counts) = scan_page(&doc, page_id, &mut HashSet::new(), &mut HashSet::new());
+        assert!(state.incomplete);
+        assert_eq!(counts.text_ops, 0);
+    }
+
+    // At or above the uncompressed size: stream fits and is scanned.
+    {
+        let _budget = PageContentBytesBudget::set(content.len());
+        let (state, counts) = scan_page(&doc, page_id, &mut HashSet::new(), &mut HashSet::new());
+        assert!(!state.incomplete);
+        assert_eq!(counts.text_ops, 1);
+    }
+
+    // Across multiple content streams: the budget is shared.
+    let text2 = "BT /F1 12 Tf 100 680 Td (Second Stream) Tj ET\n";
+    let content2 = format!("{text2}{padding}");
+    let mut s2 = lopdf::Stream::new(lopdf::dictionary! {}, content2.as_bytes().to_vec());
+    s2.compress().unwrap();
+    let content2_id = doc.add_object(Object::Stream(s2));
+
+    // Point page's /Contents to an array of both content streams.
+    let page_dict = doc.get_dictionary_mut(page_id).unwrap();
+    page_dict.set(
+        "Contents",
+        Object::Array(vec![
+            Object::Reference(content_id),
+            Object::Reference(content2_id),
+        ]),
+    );
+
+    // Budget fits first stream but not second: first is read, second is refused.
+    {
+        let _budget = PageContentBytesBudget::set(content.len() + content2.len() - 1);
+        let (state, counts) = scan_page(&doc, page_id, &mut HashSet::new(), &mut HashSet::new());
+        assert!(state.incomplete);
+        assert_eq!(counts.text_ops, 1);
+    }
+
+    // Budget fits both streams: both are read.
+    {
+        let _budget = PageContentBytesBudget::set(content.len() + content2.len());
+        let (state, counts) = scan_page(&doc, page_id, &mut HashSet::new(), &mut HashSet::new());
+        assert!(!state.incomplete);
+        assert_eq!(counts.text_ops, 2);
+    }
+}
+
+/// A content stream that inflates past the 64 MiB page decompression bound
+/// is refused without exhausting memory, leaving the page marked incomplete.
+#[test]
+fn page_content_decompression_bomb_is_refused_at_bound() {
+    let limit = crate::extractor::content_decode::MAX_PAGE_CONTENT_BYTES;
+    let (mut doc, page_id, content_id) = synthetic_page(false, false, &[]);
+    // 65 MiB of spaces compresses to ~66 KB
+    let bomb_data = vec![b' '; limit + 1024 * 1024];
+    doc.objects.insert(
+        content_id,
+        Object::Stream(lopdf::Stream::new(lopdf::dictionary! {}, bomb_data)),
+    );
+    let stream = match doc.objects.get_mut(&content_id) {
+        Some(Object::Stream(s)) => s,
+        _ => unreachable!(),
+    };
+    stream.compress().unwrap();
+    assert!(stream.content.len() < 100 * 1024);
+
+    let (state, counts) = scan_page(&doc, page_id, &mut HashSet::new(), &mut HashSet::new());
+    assert!(state.incomplete);
+    assert_eq!(counts.text_ops, 0);
+}
