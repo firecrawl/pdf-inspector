@@ -5502,6 +5502,18 @@ endbfrange
     }
 
     #[test]
+    fn cidtogidmap_without_filter_enforces_limit_boundary() {
+        let raw_bytes = vec![0x00, 0x01, 0x00, 0x02];
+        let stream = lopdf::Stream::new(lopdf::Dictionary::new(), raw_bytes.clone());
+
+        assert!(cid_to_gid_stream_data(&stream, raw_bytes.len() - 1).is_none());
+        assert_eq!(
+            cid_to_gid_stream_data(&stream, raw_bytes.len()),
+            Some(raw_bytes)
+        );
+    }
+
+    #[test]
     fn a_cmap_entry_reads_as_its_ligature_through_a_program() {
         // A CMap writes a ligature glyph's text as its letters or as the
         // ligature's code point, and a program's cmap sends it the
