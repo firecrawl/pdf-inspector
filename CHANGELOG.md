@@ -11,11 +11,9 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
-- A simple font's sparse ToUnicode CMap supplies mapped characters when
-  the embedded font has no readable glyph name, while readable glyph names
-  remain in use. For mapped codes, it takes precedence over a base encoding
-  and an unreadable `/Differences` name; mapped control destinations read
-  as U+FFFD.
+- A sparse ToUnicode CMap fills gaps in a simple font's embedded glyph
+  names. The regression example decodes to `coee`, then to `xoee` when
+  the embedded font names the first glyph `x`.
 
 ## [1.27.1] - 2026-11-24
 
