@@ -1431,6 +1431,46 @@ mod tests {
     }
 
     #[test]
+    fn short_page_keeps_both_fragments_of_the_second_row() {
+        let mut lines = Vec::new();
+        for page in 1..=6 {
+            lines.push(make_line(
+                "Chapter notes running header",
+                10.0,
+                page,
+                760.0,
+                None,
+            ));
+            lines.push(make_line("Monthly bulletin", 10.0, page, 720.0, None));
+            let mut counter = make_line(&format!("Page {page}"), 10.0, page, 720.0, None);
+            counter.items[0].x = 400.0;
+            lines.push(counter);
+            for row in 0..7 {
+                lines.push(make_line(
+                    &format!("body {page} row {row}"),
+                    10.0,
+                    page,
+                    680.0 - row as f32 * 40.0,
+                    None,
+                ));
+            }
+        }
+
+        let result = strip_repeated_lines(lines, 6);
+        for page in 1..=6 {
+            let fragments: Vec<_> = result
+                .iter()
+                .filter(|l| l.page == page && l.y == 720.0)
+                .map(|l| l.text())
+                .collect();
+            assert_eq!(
+                fragments,
+                ["Monthly bulletin".to_string(), format!("Page {page}")]
+            );
+        }
+    }
+
+    #[test]
     fn offset_column_baselines_stay_one_sparse_page() {
         // Six logical rows, each with a second column 0.05pt lower. Counting
         // those baselines separately yields twelve rows and the fixed zone
